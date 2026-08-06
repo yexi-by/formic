@@ -82,6 +82,38 @@ impl AuditEntry {
     }
 }
 
+/// 单元的运行统计：输出区的派生视图（权威事实在审计里，stats 由运行时
+/// 在结束时聚合，供调用方做指标分析；token 为内部估算值，非计费依据）。
+#[derive(Debug, Default)]
+pub struct UnitStats {
+    pub turns: u32,
+    pub llm_calls: u32,
+    pub retries: u32,
+    pub tool_calls: std::collections::HashMap<String, u32>,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// 追加一行单元统计到 out/stats.jsonl。附属证据：写失败只产生诊断，
+/// 不改写单元的业务结果（§9）。
+pub fn append_stats(out_dir: &Path, unit: u64, outcome: &str, stats: &UnitStats) -> io::Result<()> {
+    let line = serde_json::json!({
+        "unit": unit,
+        "outcome": outcome,
+        "turns": stats.turns,
+        "llm_calls": stats.llm_calls,
+        "retries": stats.retries,
+        "tool_calls": stats.tool_calls,
+        "input_tokens_est": stats.input_tokens,
+        "output_tokens_est": stats.output_tokens,
+    });
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(out_dir.join("stats.jsonl"))?;
+    writeln!(file, "{line}")
+}
+
 /// 作业汇总：完成数、失败单元号、取消数；失败原因已在各单元完成时即时报告。
 pub struct Summary {
     pub completed: u64,

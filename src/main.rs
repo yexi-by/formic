@@ -19,6 +19,7 @@ mod output;
 mod plan;
 mod prompt;
 mod scheduler;
+mod tokenize;
 mod tools;
 mod worker;
 
@@ -128,6 +129,7 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         source: e,
     })?;
 
+    let out_dir = args.out.clone();
     let ctx = Arc::new(worker::JobContext {
         scheduler: scheduler::Scheduler::start(tools::Roots {
             input: args.data.clone(),
@@ -164,7 +166,11 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
     // 任务总量无界，活动槽位有界，不产生容量错误。
     let order: Vec<u64> = units.iter().map(|u| u.unit).collect();
     let window = Arc::new(Semaphore::new(args.concurrency));
-    let mut running: JoinSet<(u64, Result<worker::Outcome, worker::UnitFailure>)> = JoinSet::new();
+    let mut running: JoinSet<(
+        u64,
+        Result<worker::Outcome, worker::UnitFailure>,
+        output::UnitStats,
+    )> = JoinSet::new();
     for unit in units {
         let permit = tokio::select! {
             _ = cancel_root.cancelled() => break,
@@ -175,17 +181,19 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         running.spawn(async move {
             let _permit = permit;
             let no = unit.unit;
-            let result = std::panic::AssertUnwindSafe(worker::run_unit(&ctx, &unit, cancel))
-                .catch_unwind()
-                .await
-                .unwrap_or(Err(worker::UnitFailure::Panicked));
+            let mut stats = output::UnitStats::default();
+            let result =
+                std::panic::AssertUnwindSafe(worker::run_unit(&ctx, &unit, cancel, &mut stats))
+                    .catch_unwind()
+                    .await
+                    .unwrap_or(Err(worker::UnitFailure::Panicked));
             // 事实发生后立即报告，不被窗口等待阻塞
             match &result {
                 Ok(worker::Outcome::Published) => eprintln!("单元 {no} 完成"),
                 Ok(worker::Outcome::Cancelled) => eprintln!("单元 {no} 取消（作业已被终止）"),
                 Err(failure) => eprintln!("单元 {no} 失败：{failure}"),
             }
-            (no, result)
+            (no, result, stats)
         });
     }
 
@@ -194,16 +202,19 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
     let mut failed = Vec::new();
     while let Some(joined) = running.join_next().await {
         match joined {
-            Ok((_no, Ok(worker::Outcome::Published))) => {
+            Ok((no, Ok(worker::Outcome::Published), stats)) => {
                 completed += 1;
                 metrics::counter_inc(&metrics::UNITS_COMPLETED);
+                append_stats_line(&out_dir, no, "published", &stats);
             }
-            Ok((_no, Ok(worker::Outcome::Cancelled))) => {
+            Ok((no, Ok(worker::Outcome::Cancelled), stats)) => {
                 cancelled += 1;
                 metrics::counter_inc(&metrics::UNITS_CANCELLED);
+                append_stats_line(&out_dir, no, "cancelled", &stats);
             }
-            Ok((no, Err(_))) => {
+            Ok((no, Err(_), stats)) => {
                 metrics::counter_inc(&metrics::UNITS_FAILED);
+                append_stats_line(&out_dir, no, "failed", &stats);
                 failed.push(no);
             }
             Err(join_error) => {
@@ -286,4 +297,16 @@ async fn termination_signal() {
 #[cfg(not(windows))]
 async fn termination_signal() {
     let _ = tokio::signal::ctrl_c().await;
+}
+
+/// 追加单元统计行；stats 是附属证据，写失败只产生诊断，不改写业务结果。
+fn append_stats_line(
+    out_dir: &std::path::Path,
+    unit: u64,
+    outcome: &str,
+    stats: &output::UnitStats,
+) {
+    if let Err(e) = output::append_stats(out_dir, unit, outcome, stats) {
+        eprintln!("单元 {unit} 统计写入失败：{e}");
+    }
 }

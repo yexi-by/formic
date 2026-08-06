@@ -64,6 +64,17 @@ LLM 供应商配额的判断；超出的单元排队等待，不产生容量错�
 调用的请求与原始响应在 `out/audit/<单元号>.jsonl`（含每次重试的 attempt 序号）。
 退出码：0 全部成功，1 存在失败单元，2 启动失败，3 被终止。
 
+`out/stats.jsonl` 是逐单元的统计视图（每行一个单元，含失败与取消）：
+
+```json
+{"unit":1,"outcome":"published","turns":2,"llm_calls":2,"retries":0,"tool_calls":{"search":1},"input_tokens_est":4025,"output_tokens_est":201}
+```
+
+token 为内部估算值（tiktoken o200k BPE 按内容计算，协议无关，参考 codex 等开源
+工具实现），用于预算与指标分析，不是计费依据。权威事实在审计里；stats 是可推导
+的便捷视图。完整对话内容在审计的 request 条目（每回合含全量历史），例如用
+`jq -r 'select(.direction=="request") | .data' out/audit/1.jsonl` 提取。
+
 中断语义：Ctrl+C（或 Ctrl+Break）一次 = 优雅终止——停止接纳新单元、在途单元取消
 收敛、已发布记录保留、退出码 3；再按一次立即退出。被终止不是破坏：调用方读输出区
 算差集、剔除已完成单元重新生成计划即可续跑。

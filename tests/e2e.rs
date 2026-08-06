@@ -286,6 +286,22 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+/// 读取 out/stats.jsonl，返回按单元号索引的 JSON 行。
+fn stats_lines(out: &Path) -> Vec<serde_json::Value> {
+    fs::read_to_string(out.join("stats.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+fn stats_of(lines: &[serde_json::Value], unit: u64) -> &serde_json::Value {
+    lines
+        .iter()
+        .find(|l| l["unit"] == unit)
+        .unwrap_or_else(|| panic!("stats 缺单元 {unit} 的行"))
+}
+
 /// 主成功路径：三协议各跑一次，断言产出、审计、多轮请求、汇总与退出码。
 fn assert_success(protocol: &str, expected_path: &str) {
     let dir = tempfile::tempdir().unwrap();
@@ -325,6 +341,31 @@ fn assert_success(protocol: &str, expected_path: &str) {
         assert!(
             audit.contains("\\\"pattern\\\":\\\"苹果\\\""),
             "{protocol} 审计应含工具参数原文（JSON 转义形态）：{audit}"
+        );
+    }
+
+    // 单元统计：轮数、调用数、工具计数、token 估算
+    let stats = stats_lines(&out);
+    assert_eq!(stats.len(), 2, "{protocol} stats 应有两个单元行");
+    for unit in [1, 2] {
+        let s = stats_of(&stats, unit);
+        assert_eq!(s["outcome"], "published", "{protocol} 单元 {unit}：{s}");
+        assert_eq!(s["turns"], 2, "{protocol} 单元 {unit} 应为 2 轮：{s}");
+        assert_eq!(
+            s["llm_calls"], 2,
+            "{protocol} 单元 {unit} 应为 2 次调用：{s}"
+        );
+        assert_eq!(
+            s["tool_calls"]["search"], 1,
+            "{protocol} 单元 {unit} 应调用 search 一次：{s}"
+        );
+        assert!(
+            s["input_tokens_est"].as_u64().unwrap() > 0,
+            "{protocol} 单元 {unit} input：{s}"
+        );
+        assert!(
+            s["output_tokens_est"].as_u64().unwrap() > 0,
+            "{protocol} 单元 {unit} output：{s}"
         );
     }
 
@@ -415,6 +456,14 @@ fn failed_unit_leaves_no_record() {
     // 单元 1 两轮 2 次请求 + 单元 2 三次尝试均 500
     let requests = mock.requests.lock().unwrap();
     assert_eq!(requests.len(), 5, "重试预算应耗尽：{:?}", requests.len());
+    drop(requests);
+
+    let stats = stats_lines(&out);
+    assert_eq!(stats_of(&stats, 1)["outcome"], "published");
+    let failed = stats_of(&stats, 2);
+    assert_eq!(failed["outcome"], "failed", "{failed}");
+    assert_eq!(failed["llm_calls"], 3, "失败单元应尝试 3 次：{failed}");
+    assert_eq!(failed["retries"], 2, "失败单元应重试 2 次：{failed}");
 }
 
 /// 瞬时故障重试成功：首次 500 → 重发 → 正常完成两轮。
@@ -447,10 +496,18 @@ fn retry_succeeds_after_transient_failure() {
     // 500 一次 + 重试的工具调用 + 最终回合，共 3 次请求
     let requests = mock.requests.lock().unwrap();
     assert_eq!(requests.len(), 3, "{:?}", requests.len());
+    drop(requests);
 
     let audit = fs::read_to_string(out.join("audit").join("1.jsonl")).unwrap();
     assert!(audit.contains("\"attempt\":1"), "审计应含首次尝试：{audit}");
     assert!(audit.contains("\"attempt\":2"), "审计应含重试尝试：{audit}");
+
+    let stats = stats_lines(&out);
+    let s = stats_of(&stats, 1);
+    assert_eq!(s["outcome"], "published", "{s}");
+    assert_eq!(s["retries"], 1, "应恰好重试 1 次：{s}");
+    assert_eq!(s["llm_calls"], 3, "{s}");
+    assert_eq!(s["tool_calls"]["search"], 1, "{s}");
 }
 
 #[test]
@@ -478,6 +535,14 @@ fn stalled_unit_is_terminated() {
     assert!(
         audit.contains("\"direction\":\"tool_call\""),
         "停滞单元的工具调用应留痕：{audit}"
+    );
+
+    let stats = stats_lines(&out);
+    let s = stats_of(&stats, 2);
+    assert_eq!(s["outcome"], "failed", "{s}");
+    assert_eq!(
+        s["tool_calls"]["search"], 3,
+        "停滞前应执行 3 次相同调用：{s}"
     );
 }
 

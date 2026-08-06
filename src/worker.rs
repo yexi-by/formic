@@ -9,10 +9,11 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::{Finish, LlmClient, LlmError, LlmEvent, Message, ToolCallReq};
-use crate::output::{self, AuditEntry};
+use crate::output::{self, AuditEntry, UnitStats};
 use crate::plan::{PlanUnit, Shard};
 use crate::prompt::{self, ShardContent};
 use crate::scheduler::{Scheduler, SchedulerGone};
+use crate::tokenize;
 
 /// 停滞检测阈值：连续相同 (name, arguments) 调用达到此次数即终止（内部常量）。
 const STALL_LIMIT: u32 = 3;
@@ -95,22 +96,29 @@ fn classify(failure: UnitFailure) -> CallFailure {
 }
 
 /// 执行一个单元。发布成功或取消都会照常落审计；失败不留下完成记录。
+/// stats 随执行累计（指标分析的派生数据，token 为内部估算值）。
 pub async fn run_unit(
     ctx: &JobContext,
     unit: &PlanUnit,
     cancel: CancellationToken,
+    stats: &mut UnitStats,
 ) -> Result<Outcome, UnitFailure> {
     let shard = read_shard(&ctx.data_root, &unit.shard)?;
     let user = prompt::build_user_message(&ctx.task, &ctx.listing, &shard);
     let mut history = vec![Message::User(user)];
     // 审计流式落盘：不在内存累积（规模验证证明内存放大主要来自审计）
     let mut audit = output::AuditLog::create(&ctx.out_dir, unit.unit)?;
+    let mut meter = Metering {
+        tracked: message_size(&history[0]),
+        history_tokens: tokenize::count_message(&history[0]),
+        instructions_tokens: tokenize::count(prompt::INSTRUCTIONS),
+        stats,
+    };
     // 对话历史是当前内存主导项的候选，全程计量以验证（规模观测）
-    let mut tracked = message_size(&history[0]);
-    crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, tracked);
+    crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, meter.tracked);
 
-    let outcome = drive_loop(ctx, &mut history, &mut audit, &cancel, &mut tracked).await;
-    crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, -tracked);
+    let outcome = drive_loop(ctx, &mut history, &mut audit, &cancel, &mut meter).await;
+    crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, -meter.tracked);
     // 证据完整是契约要求：取消与失败的现场也落盘，由审计还原经过。
     audit.finish()?;
     match outcome? {
@@ -142,13 +150,21 @@ enum LoopEnd {
     Cancelled,
 }
 
+/// 一个单元的计量：内存字节（metrics 观测）、历史 token（估算）、单元统计。
+struct Metering<'a> {
+    tracked: i64,
+    history_tokens: u64,
+    instructions_tokens: u64,
+    stats: &'a mut UnitStats,
+}
+
 /// 「LLM ↔ 工具调用」循环。
 async fn drive_loop(
     ctx: &JobContext,
     history: &mut Vec<Message>,
     audit: &mut output::AuditLog,
     cancel: &CancellationToken,
-    tracked: &mut i64,
+    meter: &mut Metering<'_>,
 ) -> Result<LoopEnd, UnitFailure> {
     let mut last_call: Option<(String, String)> = None;
     let mut same_calls = 0u32;
@@ -158,6 +174,11 @@ async fn drive_loop(
         let mut attempt = 0u32;
         let turn = loop {
             attempt += 1;
+            meter.stats.llm_calls += 1;
+            meter.stats.input_tokens += meter.instructions_tokens + meter.history_tokens;
+            if attempt > 1 {
+                meter.stats.retries += 1;
+            }
             match one_turn(ctx, history, audit, attempt, cancel).await {
                 Ok(turn) => break turn,
                 Err(CallFailure::Cancelled) => return Ok(LoopEnd::Cancelled),
@@ -177,17 +198,28 @@ async fn drive_loop(
                 }
             }
         };
+        meter.stats.turns += 1;
 
         match turn {
-            TurnEnd::FinalText(text) => return Ok(LoopEnd::Published(text)),
+            TurnEnd::FinalText(text) => {
+                meter.stats.output_tokens += tokenize::count(&text);
+                return Ok(LoopEnd::Published(text));
+            }
             TurnEnd::ToolCalls { text, calls } => {
+                meter.stats.output_tokens += tokenize::count(&text)
+                    + calls
+                        .iter()
+                        .map(|c| tokenize::count_tool_call(&c.req))
+                        .sum::<u64>();
                 let assistant = Message::Assistant {
                     text,
                     tool_calls: calls.iter().map(|c| c.req.clone()).collect(),
                 };
                 let size = message_size(&assistant);
+                let tokens = tokenize::count_message(&assistant);
                 history.push(assistant);
-                *tracked += size;
+                meter.tracked += size;
+                meter.history_tokens += tokens;
                 crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, size);
                 for prepared in calls {
                     let tc = prepared.req;
@@ -195,6 +227,7 @@ async fn drive_loop(
                         name: tc.name.clone(),
                         arguments: tc.arguments.clone(),
                     })?;
+                    *meter.stats.tool_calls.entry(tc.name.clone()).or_default() += 1;
                     let current = (tc.name.clone(), tc.arguments.clone());
                     if last_call.as_ref() == Some(&current) {
                         same_calls += 1;
@@ -219,8 +252,10 @@ async fn drive_loop(
                         content: result,
                     };
                     let size = message_size(&tool_result);
+                    let tokens = tokenize::count_message(&tool_result);
                     history.push(tool_result);
-                    *tracked += size;
+                    meter.tracked += size;
+                    meter.history_tokens += tokens;
                     crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, size);
                 }
             }
@@ -472,7 +507,9 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
             trigger.cancel();
         });
-        let outcome = run_unit(&ctx, &unit(), token).await.unwrap();
+        let outcome = run_unit(&ctx, &unit(), token, &mut UnitStats::default())
+            .await
+            .unwrap();
         assert_eq!(outcome, Outcome::Cancelled);
         assert!(
             !dir.path().join("out").join("1.md").exists(),
@@ -492,7 +529,13 @@ mod tests {
     async fn http_400_is_fatal_not_retried() {
         let (port, count) = mini_server(Mode::Status(400));
         let (_dir, ctx) = fixture(port);
-        let result = run_unit(&ctx, &unit(), CancellationToken::new()).await;
+        let result = run_unit(
+            &ctx,
+            &unit(),
+            CancellationToken::new(),
+            &mut UnitStats::default(),
+        )
+        .await;
         let Err(failure) = result else {
             panic!("400 应判失败")
         };
@@ -508,7 +551,13 @@ mod tests {
     async fn http_500_retried_to_budget() {
         let (port, count) = mini_server(Mode::Status(500));
         let (_dir, ctx) = fixture(port);
-        let result = run_unit(&ctx, &unit(), CancellationToken::new()).await;
+        let result = run_unit(
+            &ctx,
+            &unit(),
+            CancellationToken::new(),
+            &mut UnitStats::default(),
+        )
+        .await;
         let Err(failure) = result else {
             panic!("500 应判失败")
         };
