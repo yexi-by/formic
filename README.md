@@ -106,4 +106,8 @@ cargo run -- run --data examples/demo/data --plan examples/demo/plan.jsonl \
 
 - [设计文档](docs/design.md)（候选设计，实现验证后修订为事实描述）
 - [模块拓扑](docs/topology.html)（已验证 / 候选两态，随轮更新）
-- 各轮档案：[docs/rounds/](docs/rounds/)（1 最小全链路骨架；2 search 工具与多轮循环；3 并发窗口；4 重试预算与取消令牌树；5 规模验证）
+- 各轮档案：[docs/rounds/](docs/rounds/)（1 最小全链路骨架；2 search 工具与多轮循环；3 并发窗口；4 重试预算与取消令牌树；5 规模验证；6 单元统计视图）
+
+## 开源协议
+
+[AGPL-3.0](LICENSE)。Copyright (C) 2026 yexi。
