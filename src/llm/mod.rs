@@ -135,6 +135,8 @@ impl LlmClient {
         history: &[Message],
         tools: &[ToolSpec],
     ) -> Result<Call, LlmError> {
+        // 在途计数覆盖「请求发送 → 响应头 → 流式正文」全程（规模观测）
+        let in_flight = LlmInFlight::new();
         let (url, body, headers) = match self.config.protocol {
             Protocol::Completions => {
                 completions::build_request(&self.config, instructions, history, tools)
@@ -172,15 +174,34 @@ impl LlmClient {
         Ok(Call {
             request_body: body,
             stream: EventStream::new(Box::pin(resp.bytes_stream()), transform),
+            _in_flight: in_flight,
         })
     }
 }
 
+/// LLM 在途调用的计数守卫：创建即 +1，销毁即 -1（规模观测）。
+struct LlmInFlight;
+
+impl LlmInFlight {
+    fn new() -> Self {
+        crate::metrics::gauge_add(&crate::metrics::LLM_IN_FLIGHT, 1);
+        Self
+    }
+}
+
+impl Drop for LlmInFlight {
+    fn drop(&mut self) {
+        crate::metrics::gauge_add(&crate::metrics::LLM_IN_FLIGHT, -1);
+    }
+}
+
 /// 一次进行中的调用：事件流 + 审计留痕（请求体与全部原始 SSE 负载）。
+/// 在途计数随请求开始与调用结束更新（规模观测）。
 pub struct Call {
     /// 发出的请求体原文。
     pub request_body: String,
     stream: EventStream,
+    _in_flight: LlmInFlight,
 }
 
 impl Call {

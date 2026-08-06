@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 mod llm;
+mod metrics;
 mod output;
 mod plan;
 mod prompt;
@@ -139,6 +140,12 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         out_dir: args.out,
     });
 
+    // 规模观测：附属证据，不参与业务状态（FORMIC_METRICS=1 时定期汇总到 stderr）
+    let metrics_on = env::var("FORMIC_METRICS").ok().as_deref() == Some("1");
+    if metrics_on {
+        metrics::spawn_reporter();
+    }
+
     // 取消令牌树：根令牌由信号触发，每 worker 持 child token，
     // worker 内部的 LLM 流、工具等待、重试退避再向下派生，一处取消全树收敛。
     let cancel_root = CancellationToken::new();
@@ -187,22 +194,34 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
     let mut failed = Vec::new();
     while let Some(joined) = running.join_next().await {
         match joined {
-            Ok((_no, Ok(worker::Outcome::Published))) => completed += 1,
-            Ok((_no, Ok(worker::Outcome::Cancelled))) => cancelled += 1,
-            Ok((no, Err(_))) => failed.push(no),
+            Ok((_no, Ok(worker::Outcome::Published))) => {
+                completed += 1;
+                metrics::counter_inc(&metrics::UNITS_COMPLETED);
+            }
+            Ok((_no, Ok(worker::Outcome::Cancelled))) => {
+                cancelled += 1;
+                metrics::counter_inc(&metrics::UNITS_CANCELLED);
+            }
+            Ok((no, Err(_))) => {
+                metrics::counter_inc(&metrics::UNITS_FAILED);
+                failed.push(no);
+            }
             Err(join_error) => {
                 // catch_unwind 已把 panic 转为单元失败；走到这里只能是运行时自身故障
                 eprintln!("内部错误：worker task 异常结束：{join_error}");
             }
         }
     }
-    // 并发只改变完成时间，不改变自然顺序：失败单元按计划文件顺序呈现
+    // 失败单元按计划文件顺序呈现
     let failed_in_plan_order: Vec<u64> = order
         .iter()
         .filter(|u| failed.contains(u))
         .copied()
         .collect();
 
+    if metrics_on {
+        metrics::report_once(); // 捕获终态
+    }
     let summary = Summary {
         completed,
         failed: failed_in_plan_order,

@@ -4,7 +4,7 @@
 //! 审计的语义所有者也是本模块：每次 LLM 调用与工具调用的输入输出完整留痕。
 
 use std::fs;
-use std::io;
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 /// 原子发布单元产出，返回记录路径。同一单元重复发布会以新记录替换。
@@ -14,6 +14,39 @@ pub fn publish(out_dir: &Path, unit: u64, content: &str) -> io::Result<PathBuf> 
     let target = out_dir.join(format!("{unit}.md"));
     fs::rename(&tmp, &target)?;
     Ok(target)
+}
+
+/// 单元审计日志：流式逐条落盘，不在内存累积（规模验证证明内存放大主要来自
+/// 审计——每回合请求体含全量历史，在内存累积 ≈ Σ回合大小）。
+/// 文件自创建起存在，空文件表示单元在首次调用前结束。
+pub struct AuditLog {
+    writer: BufWriter<fs::File>,
+    path: PathBuf,
+}
+
+impl AuditLog {
+    pub fn create(out_dir: &Path, unit: u64) -> io::Result<Self> {
+        let audit_dir = out_dir.join("audit");
+        fs::create_dir_all(&audit_dir)?;
+        let path = audit_dir.join(format!("{unit}.jsonl"));
+        let file = fs::File::create(&path)?;
+        Ok(Self {
+            writer: BufWriter::new(file),
+            path,
+        })
+    }
+
+    pub fn push(&mut self, entry: &AuditEntry) -> io::Result<()> {
+        self.writer.write_all(entry.to_line().as_bytes())?;
+        self.writer.write_all(b"\n")
+    }
+
+    /// 冲刷并关闭。证据完整是契约要求：失败使单元不成立。
+    pub fn finish(self) -> io::Result<PathBuf> {
+        let mut writer = self.writer;
+        writer.flush()?;
+        Ok(self.path)
+    }
 }
 
 /// 一条审计留痕：data 逐字保留原始内容，不重新解析。
@@ -47,21 +80,6 @@ impl AuditEntry {
             }
         }
     }
-}
-
-/// 落盘一个单元的完整证据：每次 LLM 调用的请求体与原始响应、每次工具调用的
-/// 输入与输出，按发生顺序排列。
-pub fn write_audit(out_dir: &Path, unit: u64, entries: &[AuditEntry]) -> io::Result<PathBuf> {
-    let audit_dir = out_dir.join("audit");
-    fs::create_dir_all(&audit_dir)?;
-    let mut text = String::new();
-    for entry in entries {
-        text.push_str(&entry.to_line());
-        text.push('\n');
-    }
-    let path = audit_dir.join(format!("{unit}.jsonl"));
-    fs::write(&path, text)?;
-    Ok(path)
 }
 
 /// 作业汇总：完成数、失败单元号、取消数；失败原因已在各单元完成时即时报告。

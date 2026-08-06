@@ -68,6 +68,18 @@ LLM 供应商配额的判断；超出的单元排队等待，不产生容量错�
 收敛、已发布记录保留、退出码 3；再按一次立即退出。被终止不是破坏：调用方读输出区
 算差集、剔除已完成单元重新生成计划即可续跑。
 
+观测：设 `FORMIC_METRICS=1` 时，运行期间每 250ms 向 stderr 写一行机器可 grep 的
+指标（RSS、在途 LLM 调用、调度器队列深度、在途历史字节、search 耗时、单元计数），
+不设置则无输出；指标只是附属证据，不参与业务行为。
+
+规模实验（mock 驱动几千 worker 全链路，观测内存与调度器）：
+
+```bash
+cargo build && cargo run --example scale_run -- 5000 1000 8 20
+# 参数：单元数 并发窗口 每单元工具调用回合数 mock 延迟毫秒
+# 产出：stdout 汇总表 + 当前目录 scale-metrics.csv
+```
+
 本地无模型体验全流程：
 
 ```bash
@@ -83,4 +95,4 @@ cargo run -- run --data examples/demo/data --plan examples/demo/plan.jsonl \
 
 - [设计文档](docs/design.md)（候选设计，实现验证后修订为事实描述）
 - [模块拓扑](docs/topology.html)（已验证 / 候选两态，随轮更新）
-- 各轮档案：[docs/rounds/](docs/rounds/)（1 最小全链路骨架；2 search 工具与多轮循环；3 并发窗口；4 重试预算与取消令牌树）
+- 各轮档案：[docs/rounds/](docs/rounds/)（1 最小全链路骨架；2 search 工具与多轮循环；3 并发窗口；4 重试预算与取消令牌树；5 规模验证）

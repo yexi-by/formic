@@ -38,6 +38,7 @@ impl Scheduler {
         ));
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
+                crate::metrics::gauge_add(&crate::metrics::TOOL_INFLIGHT, 1);
                 let permit = Arc::clone(&permits)
                     .acquire_owned()
                     .await
@@ -45,8 +46,11 @@ impl Scheduler {
                 let roots = Arc::clone(&roots);
                 tokio::task::spawn_blocking(move || {
                     let _permit = permit;
+                    let started = std::time::Instant::now();
                     let result = tools::execute(&roots, &req.name, &req.arguments);
+                    crate::metrics::observe_search_ms(started.elapsed().as_millis() as u64);
                     let _ = req.reply.send(result);
+                    crate::metrics::gauge_add(&crate::metrics::TOOL_INFLIGHT, -1);
                 });
             }
         });

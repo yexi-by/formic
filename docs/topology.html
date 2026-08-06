@@ -59,7 +59,7 @@
   </div>
 </div>
 
-<h2>worker 内核（第 1–4 轮，已验证）</h2>
+<h2>worker 内核（第 1–5 轮，已验证）</h2>
 <div class="flow">
   <div class="node verified">
     <div class="name">计划</div>
@@ -115,17 +115,22 @@
     <div class="owner">src/worker.rs + src/main.rs</div>
     <div class="duty">瞬时故障按预算重试（attempt 留痕）；Ctrl+C/Break → 根令牌，select! 全树收敛；退出码 3</div>
   </div>
+  <div class="node verified">
+    <div class="name">规模观测 <span class="note">第 5 轮</span></div>
+    <div class="owner">src/metrics.rs + examples/scale_run.rs</div>
+    <div class="duty">FORMIC_METRICS=1 时指标行（RSS/在途/历史/队列/耗时）；规模实验一键复跑</div>
+  </div>
 </div>
 
 <h2>候选：后续轮次（design.md，未实现）</h2>
 <div class="grid">
   <div class="node candidate">
-    <div class="name">历史预算与压缩 <span class="note">规模化前置</span></div>
-    <div class="duty">对话历史是主导内存项；阈值须有实测依据（第 5 轮规模实验）</div>
+    <div class="name">历史预算与压缩 <span class="note">后续轮次</span></div>
+    <div class="duty">预算取 2 MB（第 5 轮实测依据）；超出判单元失败或压缩，策略届时按实测值设计</div>
   </div>
   <div class="node candidate">
-    <div class="name">规模验证 <span class="note">第 5 轮</span></div>
-    <div class="duty">mock LLM 驱动 5000 worker 全链路：内存曲线、调度器热点、阈值实测</div>
+    <div class="name">审计格式压缩 <span class="note">候选优化</span></div>
+    <div class="duty">首回合全量 + 后续增量，消除请求体重复的磁盘体积（§14 完整可复现语义不变）</div>
   </div>
   <div class="node candidate">
     <div class="name">web fetch <span class="note">原型不实现</span></div>
@@ -135,10 +140,10 @@
 
 <h2>依赖方向（当前）</h2>
 <p class="note">
-main（并发窗口）→ plan / prompt / worker / output / llm / scheduler / tools；<br>
+main（并发窗口）→ plan / prompt / worker / output / llm / scheduler / tools / metrics；<br>
 worker → prompt / llm / scheduler / output；scheduler → tools（search）；<br>
 llm/{completions,responses,anthropic} → llm（消息模型与事件枚举），三协议互不知晓；<br>
-取消令牌树（第 4 轮）：挂在 main 驱动循环与 worker 的 LLM/工具等待上，窗口结构不变（候选）。
+metrics 被各模块以静态量引用，只读不写业务状态（附属证据，§9）。
 </p>
 
 <footer>随每轮实现同改更新；各轮验证证据见 docs/rounds/。</footer>

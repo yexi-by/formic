@@ -103,11 +103,16 @@ pub async fn run_unit(
     let shard = read_shard(&ctx.data_root, &unit.shard)?;
     let user = prompt::build_user_message(&ctx.task, &ctx.listing, &shard);
     let mut history = vec![Message::User(user)];
-    let mut audit = Vec::new();
+    // 审计流式落盘：不在内存累积（规模验证证明内存放大主要来自审计）
+    let mut audit = output::AuditLog::create(&ctx.out_dir, unit.unit)?;
+    // 对话历史是当前内存主导项的候选，全程计量以验证（规模观测）
+    let mut tracked = message_size(&history[0]);
+    crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, tracked);
 
-    let outcome = drive_loop(ctx, &mut history, &mut audit, &cancel).await;
+    let outcome = drive_loop(ctx, &mut history, &mut audit, &cancel, &mut tracked).await;
+    crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, -tracked);
     // 证据完整是契约要求：取消与失败的现场也落盘，由审计还原经过。
-    output::write_audit(&ctx.out_dir, unit.unit, &audit)?;
+    audit.finish()?;
     match outcome? {
         LoopEnd::Published(text) => {
             output::publish(&ctx.out_dir, unit.unit, &text)?;
@@ -115,6 +120,21 @@ pub async fn run_unit(
         }
         LoopEnd::Cancelled => Ok(Outcome::Cancelled),
     }
+}
+
+fn message_size(message: &Message) -> i64 {
+    let size: usize = match message {
+        Message::User(text) => text.len(),
+        Message::Assistant { text, tool_calls } => {
+            text.len()
+                + tool_calls
+                    .iter()
+                    .map(|tc| tc.call_id.len() + tc.name.len() + tc.arguments.len())
+                    .sum::<usize>()
+        }
+        Message::ToolResult { call_id, content } => call_id.len() + content.len(),
+    };
+    size.try_into().unwrap_or(i64::MAX)
 }
 
 enum LoopEnd {
@@ -126,8 +146,9 @@ enum LoopEnd {
 async fn drive_loop(
     ctx: &JobContext,
     history: &mut Vec<Message>,
-    audit: &mut Vec<AuditEntry>,
+    audit: &mut output::AuditLog,
     cancel: &CancellationToken,
+    tracked: &mut i64,
 ) -> Result<LoopEnd, UnitFailure> {
     let mut last_call: Option<(String, String)> = None;
     let mut same_calls = 0u32;
@@ -160,16 +181,20 @@ async fn drive_loop(
         match turn {
             TurnEnd::FinalText(text) => return Ok(LoopEnd::Published(text)),
             TurnEnd::ToolCalls { text, calls } => {
-                history.push(Message::Assistant {
+                let assistant = Message::Assistant {
                     text,
                     tool_calls: calls.iter().map(|c| c.req.clone()).collect(),
-                });
+                };
+                let size = message_size(&assistant);
+                history.push(assistant);
+                *tracked += size;
+                crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, size);
                 for prepared in calls {
                     let tc = prepared.req;
-                    audit.push(AuditEntry::ToolCall {
+                    audit.push(&AuditEntry::ToolCall {
                         name: tc.name.clone(),
                         arguments: tc.arguments.clone(),
-                    });
+                    })?;
                     let current = (tc.name.clone(), tc.arguments.clone());
                     if last_call.as_ref() == Some(&current) {
                         same_calls += 1;
@@ -188,11 +213,15 @@ async fn drive_loop(
                         _ = cancel.cancelled() => return Ok(LoopEnd::Cancelled),
                         r = ctx.scheduler.execute(&tc.name, prepared.arguments) => r?,
                     };
-                    audit.push(AuditEntry::ToolResult(result.clone()));
-                    history.push(Message::ToolResult {
+                    audit.push(&AuditEntry::ToolResult(result.clone()))?;
+                    let tool_result = Message::ToolResult {
                         call_id: tc.call_id,
                         content: result,
-                    });
+                    };
+                    let size = message_size(&tool_result);
+                    history.push(tool_result);
+                    *tracked += size;
+                    crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, size);
                 }
             }
         }
@@ -217,7 +246,7 @@ struct PreparedCall {
 async fn one_turn(
     ctx: &JobContext,
     history: &[Message],
-    audit: &mut Vec<AuditEntry>,
+    audit: &mut output::AuditLog,
     attempt: u32,
     cancel: &CancellationToken,
 ) -> Result<TurnEnd, CallFailure> {
@@ -227,10 +256,12 @@ async fn one_turn(
         r = ctx.llm.call(prompt::INSTRUCTIONS, history, &specs) => r,
     }
     .map_err(|e| classify(e.into()))?;
-    audit.push(AuditEntry::LlmRequest {
-        attempt,
-        body: call.request_body.clone(),
-    });
+    audit
+        .push(&AuditEntry::LlmRequest {
+            attempt,
+            body: call.request_body.clone(),
+        })
+        .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
 
     let mut text = String::new();
     let mut tool_calls: Vec<ToolCallReq> = Vec::new();
@@ -246,12 +277,20 @@ async fn one_turn(
             Ok(Some(LlmEvent::Finished(f))) => finish = Some(f),
             Ok(None) => break,
             Err(e) => {
-                audit.extend(call.raw_log().iter().cloned().map(AuditEntry::LlmEvent));
+                for raw in call.raw_log() {
+                    audit
+                        .push(&AuditEntry::LlmEvent(raw.clone()))
+                        .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
+                }
                 return Err(classify(e.into()));
             }
         }
     }
-    audit.extend(call.raw_log().iter().cloned().map(AuditEntry::LlmEvent));
+    for raw in call.raw_log() {
+        audit
+            .push(&AuditEntry::LlmEvent(raw.clone()))
+            .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
+    }
 
     if finish == Some(Finish::MaxTokens) {
         return Err(CallFailure::Fatal(UnitFailure::Truncated));
