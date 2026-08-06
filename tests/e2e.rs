@@ -1,5 +1,6 @@
 //! 端到端：真实生产入口（编译产物 formic）× 真实 HTTP/SSE（手写 mock server）。
-//! 覆盖三种协议的主成功路径、失败路径与启动期计划校验错误。
+//! mock 脚本化两轮：首轮返回 search 工具调用（参数分片传输），携带工具结果的
+//! 请求返回最终文本。覆盖三协议主成功、HTTP 500 失败、停滞检测、计划校验错误。
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -15,7 +16,12 @@ const FINAL_TEXT: &str = "你好世界";
 /// 请求体含此标记时 mock 返回 500，用于驱动失败路径。
 const FAIL_MARKER: &str = "FAIL-UNIT";
 
-const COMPLETIONS_SSE: &str = concat!(
+/// 请求体含此标记时 mock 永远返回工具调用，用于驱动停滞检测路径。
+const LOOP_MARKER: &str = "LOOP-MARKER";
+
+// ---- 罐装 SSE：文本最终帧（三协议）----
+
+const COMPLETIONS_FINAL: &str = concat!(
     "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"},\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"世界\"},\"finish_reason\":null}]}\n\n",
@@ -23,15 +29,14 @@ const COMPLETIONS_SSE: &str = concat!(
     "data: [DONE]\n\n",
 );
 
-const RESPONSES_SSE: &str = concat!(
+const RESPONSES_FINAL: &str = concat!(
     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\"}}\n\n",
     "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":0,\"content_index\":0,\"delta\":\"你好\"}\n\n",
     "data: {\"type\":\"response.output_text.delta\",\"item_id\":\"m1\",\"output_index\":0,\"content_index\":0,\"delta\":\"世界\"}\n\n",
-    "data: {\"type\":\"response.output_text.done\",\"item_id\":\"m1\",\"output_index\":0,\"content_index\":0,\"text\":\"你好世界\"}\n\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n\n",
 );
 
-const ANTHROPIC_SSE: &str = concat!(
+const ANTHROPIC_FINAL: &str = concat!(
     "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\"stop_reason\":null}}\n\n",
     "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好\"}}\n\n",
@@ -40,6 +45,58 @@ const ANTHROPIC_SSE: &str = concat!(
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}}\n\n",
     "data: {\"type\":\"message_stop\"}\n\n",
 );
+
+// ---- 罐装 SSE：search 工具调用（三协议，参数分片传输）----
+
+const COMPLETIONS_TOOLCALL: &str = concat!(
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"pattern\\\":\\\"苹果\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\",\\\"scope\\\":\\\"input\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+const RESPONSES_TOOLCALL: &str = concat!(
+    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\"}}\n\n",
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc1\",\"call_id\":\"call_1\",\"name\":\"search\",\"arguments\":\"\"}}\n\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc1\",\"output_index\":0,\"delta\":\"{\\\"pattern\\\":\\\"苹果\\\"\"}\n\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc1\",\"output_index\":0,\"delta\":\",\\\"scope\\\":\\\"input\\\"}\"}\n\n",
+    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc1\",\"call_id\":\"call_1\",\"name\":\"search\",\"arguments\":\"{\\\"pattern\\\":\\\"苹果\\\",\\\"scope\\\":\\\"input\\\"}\"}}\n\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n\n",
+);
+
+const ANTHROPIC_TOOLCALL: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg1\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\"stop_reason\":null}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"search\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"pattern\\\":\\\"苹果\\\"\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\",\\\"scope\\\":\\\"input\\\"}\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+fn sse_for(path: &str, tool_call: bool) -> Option<&'static str> {
+    match (path, tool_call) {
+        (p, true) if p.ends_with("/chat/completions") => Some(COMPLETIONS_TOOLCALL),
+        (p, false) if p.ends_with("/chat/completions") => Some(COMPLETIONS_FINAL),
+        (p, true) if p.ends_with("/responses") => Some(RESPONSES_TOOLCALL),
+        (p, false) if p.ends_with("/responses") => Some(RESPONSES_FINAL),
+        (p, true) if p.ends_with("/messages") => Some(ANTHROPIC_TOOLCALL),
+        (p, false) if p.ends_with("/messages") => Some(ANTHROPIC_FINAL),
+        _ => None,
+    }
+}
+
+/// 请求体里协议对应的「已携带工具结果」标记。
+fn tool_result_marker(path: &str) -> &'static str {
+    if path.ends_with("/chat/completions") {
+        "\"role\":\"tool\""
+    } else if path.ends_with("/responses") {
+        "function_call_output"
+    } else {
+        "tool_result"
+    }
+}
 
 struct Recorded {
     path: String,
@@ -109,14 +166,17 @@ fn handle_conn(mut stream: TcpStream, requests: Arc<Mutex<Vec<Recorded>>>) {
 
     let (status, response_body) = if body_text.contains(FAIL_MARKER) {
         ("500 Internal Server Error", "boom".to_string())
-    } else if path.ends_with("/chat/completions") {
-        ("200 OK", COMPLETIONS_SSE.to_string())
-    } else if path.ends_with("/responses") {
-        ("200 OK", RESPONSES_SSE.to_string())
-    } else if path.ends_with("/messages") {
-        ("200 OK", ANTHROPIC_SSE.to_string())
+    } else if body_text.contains(LOOP_MARKER) {
+        match sse_for(&path, true) {
+            Some(sse) => ("200 OK", sse.to_string()),
+            None => ("404 Not Found", "unknown path".to_string()),
+        }
     } else {
-        ("404 Not Found", "unknown path".to_string())
+        let is_second_turn = body_text.contains(tool_result_marker(&path));
+        match sse_for(&path, !is_second_turn) {
+            Some(sse) => ("200 OK", sse.to_string()),
+            None => ("404 Not Found", "unknown path".to_string()),
+        }
     };
     let response = format!(
         "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
@@ -126,14 +186,14 @@ fn handle_conn(mut stream: TcpStream, requests: Arc<Mutex<Vec<Recorded>>>) {
 }
 
 /// 搭一个两单元作业：单元 1 文件清单形状，单元 2 行区间形状。
-fn write_job(dir: &Path, fail_unit_2: bool) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+/// marker 为 Some 时注入到单元 2 的分片内容里（FAIL-UNIT / LOOP-MARKER）。
+fn write_job(dir: &Path, marker: Option<&str>) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let data = dir.join("data");
     fs::create_dir_all(&data).unwrap();
-    fs::write(data.join("a.txt"), "苹果是一种水果。\n").unwrap();
-    let big = if fail_unit_2 {
-        "一\nFAIL-UNIT\n三\n"
-    } else {
-        "一\n二\n三\n"
+    fs::write(data.join("a.txt"), "苹果是水果。\n香蕉也是。\n").unwrap();
+    let big = match marker {
+        Some(m) => format!("一\n{m}\n三\n"),
+        None => "一\n二\n三\n".to_string(),
     };
     fs::write(data.join("big.txt"), big).unwrap();
 
@@ -183,10 +243,10 @@ fn stderr_of(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
-/// 主成功路径：三协议各跑一次，断言产出、审计、汇总、退出码与请求路径。
+/// 主成功路径：三协议各跑一次，断言产出、审计、多轮请求、汇总与退出码。
 fn assert_success(protocol: &str, expected_path: &str) {
     let dir = tempfile::tempdir().unwrap();
-    let (data, plan, task, out) = write_job(dir.path(), false);
+    let (data, plan, task, out) = write_job(dir.path(), None);
     let mock = start_mock();
     let output = run_formic(protocol, mock.port, &data, &plan, &task, &out);
 
@@ -207,37 +267,43 @@ fn assert_success(protocol: &str, expected_path: &str) {
     );
 
     for unit in [1, 2] {
-        let record = out.join(format!("{unit}.md"));
         assert_eq!(
-            fs::read_to_string(&record).unwrap(),
+            fs::read_to_string(out.join(format!("{unit}.md"))).unwrap(),
             FINAL_TEXT,
-            "{protocol} 单元 {unit} 产出应为最终消息原文"
+            "{protocol} 单元 {unit} 产出应为最终回合文本"
         );
         let audit = fs::read_to_string(out.join("audit").join(format!("{unit}.jsonl"))).unwrap();
+        for direction in ["request", "event", "tool_call", "tool_result"] {
+            assert!(
+                audit.contains(&format!("\"direction\":\"{direction}\"")),
+                "{protocol} 单元 {unit} 审计缺 {direction}：{audit}"
+            );
+        }
         assert!(
-            audit.contains("\"direction\":\"request\""),
-            "{protocol} 审计缺请求：{audit}"
-        );
-        assert!(
-            audit.contains("test-model"),
-            "{protocol} 审计应含请求体：{audit}"
-        );
-        assert!(
-            audit.contains("你好"),
-            "{protocol} 审计应含原始 SSE 负载：{audit}"
+            audit.contains("\\\"pattern\\\":\\\"苹果\\\""),
+            "{protocol} 审计应含工具参数原文（JSON 转义形态）：{audit}"
         );
     }
 
     let requests = mock.requests.lock().unwrap();
-    assert_eq!(requests.len(), 2, "{protocol} 应收两次调用");
+    assert_eq!(requests.len(), 4, "{protocol} 每单元两轮共 4 次请求");
     assert!(
         requests.iter().all(|r| r.path.ends_with(expected_path)),
-        "{protocol} 请求路径应为 {expected_path}：{:?}",
-        requests.iter().map(|r| r.path.as_str()).collect::<Vec<_>>()
+        "{protocol} 请求路径应为 {expected_path}"
+    );
+    let first = &requests[0].body;
+    assert!(
+        first.contains("\"search\""),
+        "{protocol} 首轮请求应携带 tools schema：{first}"
+    );
+    let second = &requests[1].body;
+    assert!(
+        second.contains("苹果是水果"),
+        "{protocol} 第二轮请求应回注 search 结果：{second}"
     );
     assert!(
-        requests.iter().all(|r| r.body.contains("判断分片内容")),
-        "{protocol} 请求体应含任务说明原文"
+        second.contains(tool_result_marker(expected_path)),
+        "{protocol} 第二轮请求应含工具结果消息"
     );
 }
 
@@ -259,7 +325,7 @@ fn anthropic_success() {
 #[test]
 fn failed_unit_leaves_no_record() {
     let dir = tempfile::tempdir().unwrap();
-    let (data, plan, task, out) = write_job(dir.path(), true);
+    let (data, plan, task, out) = write_job(dir.path(), Some(FAIL_MARKER));
     let mock = start_mock();
     let output = run_formic("completions", mock.port, &data, &plan, &task, &out);
 
@@ -291,6 +357,34 @@ fn failed_unit_leaves_no_record() {
         "失败诊断应含单元号：{stderr}"
     );
     assert!(stderr.contains("500"), "失败诊断应含直接原因：{stderr}");
+}
+
+#[test]
+fn stalled_unit_is_terminated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_job(dir.path(), Some(LOOP_MARKER));
+    let mock = start_mock();
+    let output = run_formic("completions", mock.port, &data, &plan, &task, &out);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "停滞单元应判失败：{}",
+        stderr_of(&output)
+    );
+    let stdout = stdout_of(&output);
+    assert!(stdout.contains("失败单元：2"), "{stdout}");
+    assert!(!out.join("2.md").exists(), "停滞单元不得留下记录");
+
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("单元 2 失败"), "{stderr}");
+    assert!(stderr.contains("停滞"), "诊断应说明停滞原因：{stderr}");
+
+    let audit = fs::read_to_string(out.join("audit").join("2.jsonl")).unwrap();
+    assert!(
+        audit.contains("\"direction\":\"tool_call\""),
+        "停滞单元的工具调用应留痕：{audit}"
+    );
 }
 
 #[test]

@@ -59,7 +59,7 @@
   </div>
 </div>
 
-<h2>第 1 轮：最小全链路骨架（已验证）</h2>
+<h2>worker 内核（第 1–2 轮，已验证）</h2>
 <div class="flow">
   <div class="node verified">
     <div class="name">计划</div>
@@ -68,48 +68,53 @@
   </div>
   <div class="arrow">→</div>
   <div class="node verified">
-    <div class="name">worker</div>
+    <div class="name">worker（多轮循环）</div>
     <div class="owner">src/worker.rs</div>
-    <div class="duty">单单元执行：读分片 → 装配 → 调用 → 发布或诊断</div>
+    <div class="duty">读分片 → 装配 → LLM ↔ 工具循环 → 发布或诊断；停滞检测</div>
   </div>
   <div class="arrow">→</div>
   <div class="node verified">
     <div class="name">输出区</div>
     <div class="owner">src/output.rs</div>
-    <div class="duty">原子发布、审计落盘、汇总</div>
+    <div class="duty">原子发布、审计落盘（request/event/tool_call/tool_result）、汇总</div>
   </div>
 </div>
 <div class="flow">
   <div class="node verified">
     <div class="name">prompt 装配</div>
     <div class="owner">src/prompt.rs</div>
-    <div class="duty">instructions + 任务说明 + 清单 + 分片；跨单元前缀字节一致</div>
+    <div class="duty">instructions 三段 + 任务说明 + 清单 + 分片；跨单元前缀字节一致</div>
   </div>
   <div class="arrow">← worker 使用</div>
   <div class="node verified">
     <div class="name">LLM 协议层</div>
     <div class="owner">src/llm/</div>
-    <div class="duty">三协议 transform → 统一内部事件；请求/原始响应全程留痕</div>
+    <div class="duty">内部对话模型；三协议双向翻译；请求/原始响应全程留痕</div>
+  </div>
+</div>
+<div class="flow">
+  <div class="node verified">
+    <div class="name">统一调度器 <span class="note">第 2 轮</span></div>
+    <div class="owner">src/scheduler.rs</div>
+    <div class="duty">工具调用唯一入口：串行准入 + 有界 blocking 池执行；限流/去重待并发轮</div>
+  </div>
+  <div class="arrow">← worker 的一切工具调用</div>
+  <div class="node verified">
+    <div class="name">search 工具 <span class="note">第 2 轮</span></div>
+    <div class="owner">src/tools.rs</div>
+    <div class="duty">grep crates 进程内嵌；两棵只读根（input/output）；硬边界 + 截断标记</div>
   </div>
 </div>
 
 <h2>候选：后续轮次（design.md，未实现）</h2>
 <div class="grid">
   <div class="node candidate">
-    <div class="name">统一调度器 <span class="note">第 2 轮起</span></div>
-    <div class="duty">工具调用唯一入口：限流记账、大小硬边界、去重缓存、审计、只读 enforcement；治理集中、执行并发</div>
-  </div>
-  <div class="node candidate">
-    <div class="name">search 工具 <span class="note">第 2 轮</span></div>
-    <div class="duty">grep crates 进程内嵌；两棵只读根（input / output）；截断显式标记；多轮循环随之引入</div>
-  </div>
-  <div class="node candidate">
     <div class="name">并发窗口 <span class="note">第 3 轮</span></div>
-    <div class="duty">每 worker 一个 tokio task；槽位有界、总量无界，窗口满时排队等待</div>
+    <div class="duty">每 worker 一个 tokio task；槽位有界、总量无界，窗口满时排队等待；调度器限流记账与去重缓存随之真实化</div>
   </div>
   <div class="node candidate">
-    <div class="name">重试 / 停滞检测 / 取消 <span class="note">第 4 轮</span></div>
-    <div class="duty">重试预算、重复 tool call 阈值、CancellationToken 树</div>
+    <div class="name">重试预算 / 取消令牌树 <span class="note">第 4 轮</span></div>
+    <div class="duty">瞬时故障有界重试；CancellationToken 树一处取消全树收敛</div>
   </div>
   <div class="node candidate">
     <div class="name">历史预算与压缩 <span class="note">规模化前置</span></div>
@@ -127,12 +132,13 @@
 
 <h2>依赖方向（当前）</h2>
 <p class="note">
-main → plan / prompt / worker / output / llm；worker → prompt / llm / output；
-llm/{completions,responses,anthropic} → llm（事件枚举），三协议互不知晓。
-调度器进入后：worker 的一切工具调用与 LLM 记账经调度器准入（候选）。
+main → plan / prompt / worker / output / llm / scheduler / tools；<br>
+worker → prompt / llm / scheduler / output；scheduler → tools（search）；<br>
+llm/{completions,responses,anthropic} → llm（消息模型与事件枚举），三协议互不知晓；<br>
+并发轮进入后：调度器串行段内生长限流记账与去重缓存，worker 与工具层不动（候选）。
 </p>
 
-<footer>随每轮实现同改更新；第 1 轮验证证据见 docs/rounds/round-01.md。</footer>
+<footer>随每轮实现同改更新；各轮验证证据见 docs/rounds/。</footer>
 
 </body>
 </html>

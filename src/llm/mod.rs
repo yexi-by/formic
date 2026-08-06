@@ -1,11 +1,13 @@
-//! LLM 调用层：三种 API 协议（Chat Completions / Responses / Anthropic）各自
-//! 一个请求构造 + SSE transform，统一输出内部事件枚举；worker 主循环只消费
-//! 内部事件，不感知后端差异。每次调用的请求体与原始 SSE 负载完整留痕（审计）。
+//! LLM 调用层：三种 API 协议（Chat Completions / Responses / Anthropic）各自负责
+//! 双向翻译——请求侧把内部对话历史映射为协议格式，响应侧把 SSE 流组装成统一
+//! 内部事件；worker 主循环只消费内部事件，不感知后端差异。每次调用的请求体与
+//! 原始 SSE 负载完整留痕（审计）。
 
 pub mod anthropic;
 pub mod completions;
 pub mod responses;
 
+use std::collections::VecDeque;
 use std::pin::Pin;
 
 use bytes::Bytes;
@@ -32,13 +34,43 @@ impl Protocol {
     }
 }
 
+/// 一条完整组装的工具调用请求。arguments 是模型给出的原始 JSON 文本；
+/// JSON 合法性由 worker 在进入历史前校验（唯一一次，在 LLM 边界上）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCallReq {
+    pub call_id: String,
+    pub name: String,
+    pub arguments: String,
+}
+
+/// 内部对话历史：协议无关，三个协议各自翻译成自己的请求格式。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    User(String),
+    Assistant {
+        text: String,
+        tool_calls: Vec<ToolCallReq>,
+    },
+    ToolResult {
+        call_id: String,
+        content: String,
+    },
+}
+
+/// 工具规格：走请求的 tools 字段，不进提示词文字。实例的唯一来源是调度器。
+pub struct ToolSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub parameters: serde_json::Value,
+}
+
 /// 统一内部事件：worker 只消费它。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LlmEvent {
     /// 产出一个文本增量。
     TextDelta(String),
-    /// 模型请求工具调用（原型未配置工具，worker 据此判单元失败）。
-    ToolCall,
+    /// 一条完整组装的工具调用（流式增量已拼好）。
+    ToolCall(ToolCallReq),
     /// 流正常收尾。
     Finished(Finish),
 }
@@ -47,21 +79,8 @@ pub enum LlmEvent {
 pub enum Finish {
     Stop,
     MaxTokens,
-}
-
-/// 一次调用的输入：instructions 顶层字段 + 用户消息。
-pub struct CallInput<'a> {
-    pub instructions: &'a str,
-    pub user: &'a str,
-}
-
-/// LLM 调用配置，来源是环境变量（部署选择），缺失必填项在启动时明确失败。
-#[derive(Debug, Clone)]
-pub struct LlmConfig {
-    pub protocol: Protocol,
-    pub base_url: String,
-    pub model: String,
-    pub api_key: Option<String>,
+    /// 模型以工具调用结束本回合；transform 保证此时确有 ToolCall 事件发出。
+    ToolUse,
 }
 
 /// 调用层错误：保留控制流所需事实，呈现由入口完成。
@@ -92,6 +111,15 @@ pub struct LlmClient {
     config: LlmConfig,
 }
 
+/// LLM 调用配置，来源是环境变量（部署选择），缺失必填项在启动时明确失败。
+#[derive(Debug, Clone)]
+pub struct LlmConfig {
+    pub protocol: Protocol,
+    pub base_url: String,
+    pub model: String,
+    pub api_key: Option<String>,
+}
+
 impl LlmClient {
     pub fn new(config: LlmConfig) -> Self {
         Self {
@@ -101,11 +129,22 @@ impl LlmClient {
     }
 
     /// 发起一次流式调用。SSE 解析在调用方（worker）循环内驱动，不另起任务。
-    pub async fn call(&self, input: &CallInput<'_>) -> Result<Call, LlmError> {
+    pub async fn call(
+        &self,
+        instructions: &str,
+        history: &[Message],
+        tools: &[ToolSpec],
+    ) -> Result<Call, LlmError> {
         let (url, body, headers) = match self.config.protocol {
-            Protocol::Completions => completions::build_request(&self.config, input),
-            Protocol::Responses => responses::build_request(&self.config, input),
-            Protocol::Anthropic => anthropic::build_request(&self.config, input),
+            Protocol::Completions => {
+                completions::build_request(&self.config, instructions, history, tools)
+            }
+            Protocol::Responses => {
+                responses::build_request(&self.config, instructions, history, tools)
+            }
+            Protocol::Anthropic => {
+                anthropic::build_request(&self.config, instructions, history, tools)
+            }
         };
         let mut req = self
             .http
@@ -125,9 +164,14 @@ impl LlmClient {
                 body: snippet,
             });
         }
+        let transform: Box<dyn Transform> = match self.config.protocol {
+            Protocol::Completions => Box::new(completions::Transform::new()),
+            Protocol::Responses => Box::new(responses::Transform::new()),
+            Protocol::Anthropic => Box::new(anthropic::Transform::new()),
+        };
         Ok(Call {
             request_body: body,
-            stream: EventStream::new(Box::pin(resp.bytes_stream()), self.config.protocol),
+            stream: EventStream::new(Box::pin(resp.bytes_stream()), transform),
         })
     }
 }
@@ -151,21 +195,29 @@ impl Call {
     }
 }
 
+/// 协议 transform：把 SSE data 负载翻译成 0..n 个内部事件。
+/// 有状态——流式工具调用的增量在同一调用的连续帧中组装。
+pub(crate) trait Transform {
+    fn push(&mut self, payload: &str) -> Result<Vec<LlmEvent>, LlmError>;
+}
+
 type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
 struct EventStream {
     bytes: ByteStream,
-    protocol: Protocol,
+    transform: Box<dyn Transform>,
+    pending: VecDeque<LlmEvent>,
     buffer: Vec<u8>,
     raw_log: Vec<String>,
     eof: bool,
 }
 
 impl EventStream {
-    fn new(bytes: ByteStream, protocol: Protocol) -> Self {
+    fn new(bytes: ByteStream, transform: Box<dyn Transform>) -> Self {
         Self {
             bytes,
-            protocol,
+            transform,
+            pending: VecDeque::new(),
             buffer: Vec::new(),
             raw_log: Vec::new(),
             eof: false,
@@ -174,12 +226,16 @@ impl EventStream {
 
     async fn next_event(&mut self) -> Result<Option<LlmEvent>, LlmError> {
         loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Ok(Some(event));
+            }
             while let Some(frame) = take_frame(&mut self.buffer) {
                 for payload in frame_payloads(&frame) {
                     self.raw_log.push(payload.clone());
-                    if let Some(event) = transform(self.protocol, &payload)? {
-                        return Ok(Some(event));
-                    }
+                    self.pending.extend(self.transform.push(&payload)?);
+                }
+                if let Some(event) = self.pending.pop_front() {
+                    return Ok(Some(event));
                 }
             }
             if self.eof {
@@ -197,14 +253,6 @@ impl EventStream {
                 }
             }
         }
-    }
-}
-
-fn transform(protocol: Protocol, payload: &str) -> Result<Option<LlmEvent>, LlmError> {
-    match protocol {
-        Protocol::Completions => completions::transform(payload),
-        Protocol::Responses => responses::transform(payload),
-        Protocol::Anthropic => anthropic::transform(payload),
     }
 }
 
@@ -249,6 +297,18 @@ pub(crate) fn frame_payloads(frame: &[u8]) -> Vec<String> {
         out.push(data_lines.join("\n"));
     }
     out
+}
+
+#[cfg(test)]
+pub(crate) fn events_of(mut t: Box<dyn Transform>, sample: &str) -> Vec<LlmEvent> {
+    let mut buffer = sample.as_bytes().to_vec();
+    let mut events = Vec::new();
+    while let Some(frame) = take_frame(&mut buffer) {
+        for payload in frame_payloads(&frame) {
+            events.extend(t.push(&payload).unwrap());
+        }
+    }
+    events
 }
 
 #[cfg(test)]

@@ -12,6 +12,8 @@ mod llm;
 mod output;
 mod plan;
 mod prompt;
+mod scheduler;
+mod tools;
 mod worker;
 
 use llm::{LlmClient, LlmConfig, Protocol};
@@ -113,6 +115,10 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
     })?;
 
     let ctx = worker::JobContext {
+        scheduler: scheduler::Scheduler::start(tools::Roots {
+            input: args.data.clone(),
+            output: args.out.clone(),
+        }),
         data_root: args.data,
         task,
         listing,
