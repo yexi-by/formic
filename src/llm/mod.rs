@@ -164,7 +164,7 @@ impl LlmClient {
                 body: snippet,
             });
         }
-        let transform: Box<dyn Transform> = match self.config.protocol {
+        let transform: Box<dyn Transform + Send> = match self.config.protocol {
             Protocol::Completions => Box::new(completions::Transform::new()),
             Protocol::Responses => Box::new(responses::Transform::new()),
             Protocol::Anthropic => Box::new(anthropic::Transform::new()),
@@ -205,7 +205,7 @@ type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Sen
 
 struct EventStream {
     bytes: ByteStream,
-    transform: Box<dyn Transform>,
+    transform: Box<dyn Transform + Send>,
     pending: VecDeque<LlmEvent>,
     buffer: Vec<u8>,
     raw_log: Vec<String>,
@@ -213,7 +213,7 @@ struct EventStream {
 }
 
 impl EventStream {
-    fn new(bytes: ByteStream, transform: Box<dyn Transform>) -> Self {
+    fn new(bytes: ByteStream, transform: Box<dyn Transform + Send>) -> Self {
         Self {
             bytes,
             transform,
@@ -300,7 +300,7 @@ pub(crate) fn frame_payloads(frame: &[u8]) -> Vec<String> {
 }
 
 #[cfg(test)]
-pub(crate) fn events_of(mut t: Box<dyn Transform>, sample: &str) -> Vec<LlmEvent> {
+pub(crate) fn events_of(mut t: Box<dyn Transform + Send>, sample: &str) -> Vec<LlmEvent> {
     let mut buffer = sample.as_bytes().to_vec();
     let mut events = Vec::new();
     while let Some(frame) = take_frame(&mut buffer) {

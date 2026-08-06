@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -106,31 +107,55 @@ struct Recorded {
 struct MockServer {
     port: u16,
     requests: Arc<Mutex<Vec<Recorded>>>,
+    max_in_flight: Arc<AtomicUsize>,
 }
 
 fn start_mock() -> MockServer {
+    start_mock_with_delay(0)
+}
+
+fn start_mock_with_delay(delay_ms: u64) -> MockServer {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
     let shared = Arc::clone(&requests);
+    let shared_in_flight = Arc::clone(&in_flight);
+    let shared_max = Arc::clone(&max_in_flight);
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
                     let shared = Arc::clone(&shared);
-                    thread::spawn(move || handle_conn(stream, shared));
+                    let in_flight = Arc::clone(&shared_in_flight);
+                    let max = Arc::clone(&shared_max);
+                    thread::spawn(move || handle_conn(stream, shared, in_flight, max, delay_ms));
                 }
                 Err(_) => break,
             }
         }
     });
-    MockServer { port, requests }
+    MockServer {
+        port,
+        requests,
+        max_in_flight,
+    }
 }
 
-fn handle_conn(mut stream: TcpStream, requests: Arc<Mutex<Vec<Recorded>>>) {
+fn handle_conn(
+    mut stream: TcpStream,
+    requests: Arc<Mutex<Vec<Recorded>>>,
+    in_flight: Arc<AtomicUsize>,
+    max_in_flight: Arc<AtomicUsize>,
+    delay_ms: u64,
+) {
+    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+    max_in_flight.fetch_max(current, Ordering::SeqCst);
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
+        in_flight.fetch_sub(1, Ordering::SeqCst);
         return;
     }
     let path = request_line
@@ -182,7 +207,11 @@ fn handle_conn(mut stream: TcpStream, requests: Arc<Mutex<Vec<Recorded>>>) {
         "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
         response_body.len()
     );
+    if delay_ms > 0 {
+        thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
     stream.write_all(response.as_bytes()).ok();
+    in_flight.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// 搭一个两单元作业：单元 1 文件清单形状，单元 2 行区间形状。
@@ -212,6 +241,7 @@ fn write_job(dir: &Path, marker: Option<&str>) -> (PathBuf, PathBuf, PathBuf, Pa
 fn run_formic(
     protocol: &str,
     port: u16,
+    concurrency: usize,
     data: &Path,
     plan: &Path,
     task: &Path,
@@ -227,6 +257,8 @@ fn run_formic(
         .arg(task)
         .arg("--out")
         .arg(out)
+        .arg("--concurrency")
+        .arg(concurrency.to_string())
         .env("FORMIC_LLM_PROTOCOL", protocol)
         .env("FORMIC_LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
         .env("FORMIC_LLM_MODEL", "test-model")
@@ -248,7 +280,7 @@ fn assert_success(protocol: &str, expected_path: &str) {
     let dir = tempfile::tempdir().unwrap();
     let (data, plan, task, out) = write_job(dir.path(), None);
     let mock = start_mock();
-    let output = run_formic(protocol, mock.port, &data, &plan, &task, &out);
+    let output = run_formic(protocol, mock.port, 2, &data, &plan, &task, &out);
 
     assert_eq!(
         output.status.code(),
@@ -291,19 +323,26 @@ fn assert_success(protocol: &str, expected_path: &str) {
         requests.iter().all(|r| r.path.ends_with(expected_path)),
         "{protocol} 请求路径应为 {expected_path}"
     );
-    let first = &requests[0].body;
+    // 并发下请求不按单元顺序到达，按多重集断言：两个首轮（携带 tools schema），
+    // 两个次轮（携带协议工具结果消息与 search 命中行）
+    let marker = tool_result_marker(expected_path);
+    let first_turns: Vec<_> = requests
+        .iter()
+        .filter(|r| !r.body.contains(marker))
+        .collect();
+    let second_turns: Vec<_> = requests
+        .iter()
+        .filter(|r| r.body.contains(marker))
+        .collect();
+    assert_eq!(first_turns.len(), 2, "{protocol} 应有两个首轮请求");
+    assert_eq!(second_turns.len(), 2, "{protocol} 应有两个次轮请求");
     assert!(
-        first.contains("\"search\""),
-        "{protocol} 首轮请求应携带 tools schema：{first}"
+        first_turns.iter().all(|r| r.body.contains("\"search\"")),
+        "{protocol} 首轮请求应携带 tools schema"
     );
-    let second = &requests[1].body;
     assert!(
-        second.contains("苹果是水果"),
-        "{protocol} 第二轮请求应回注 search 结果：{second}"
-    );
-    assert!(
-        second.contains(tool_result_marker(expected_path)),
-        "{protocol} 第二轮请求应含工具结果消息"
+        second_turns.iter().all(|r| r.body.contains("苹果是水果")),
+        "{protocol} 次轮请求应回注 search 结果"
     );
 }
 
@@ -327,7 +366,7 @@ fn failed_unit_leaves_no_record() {
     let dir = tempfile::tempdir().unwrap();
     let (data, plan, task, out) = write_job(dir.path(), Some(FAIL_MARKER));
     let mock = start_mock();
-    let output = run_formic("completions", mock.port, &data, &plan, &task, &out);
+    let output = run_formic("completions", mock.port, 2, &data, &plan, &task, &out);
 
     assert_eq!(
         output.status.code(),
@@ -364,7 +403,7 @@ fn stalled_unit_is_terminated() {
     let dir = tempfile::tempdir().unwrap();
     let (data, plan, task, out) = write_job(dir.path(), Some(LOOP_MARKER));
     let mock = start_mock();
-    let output = run_formic("completions", mock.port, &data, &plan, &task, &out);
+    let output = run_formic("completions", mock.port, 2, &data, &plan, &task, &out);
 
     assert_eq!(
         output.status.code(),
@@ -404,6 +443,7 @@ fn invalid_plan_reports_unit_and_exits_2() {
     let output = run_formic(
         "completions",
         mock.port,
+        1,
         &data,
         &plan,
         &task,
@@ -413,4 +453,76 @@ fn invalid_plan_reports_unit_and_exits_2() {
     let stderr = stderr_of(&output);
     assert!(stderr.contains("单元 7"), "错误应含单元号：{stderr}");
     assert!(stderr.contains("逃逸"), "错误应说明原因：{stderr}");
+}
+
+/// 窗口证据：mock 端在途请求峰值 == 并发窗口（真实入口验证，不是单元推断）。
+#[test]
+fn concurrency_window_bounds_in_flight() {
+    let run = |concurrency: usize| {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("a.txt"), "苹果是水果。\n").unwrap();
+        let plan = dir.path().join("plan.jsonl");
+        fs::write(
+            &plan,
+            "{\"unit\":1,\"files\":[\"a.txt\"]}\n{\"unit\":2,\"files\":[\"a.txt\"]}\n{\"unit\":3,\"files\":[\"a.txt\"]}\n{\"unit\":4,\"files\":[\"a.txt\"]}\n",
+        )
+        .unwrap();
+        let task = dir.path().join("task.md");
+        fs::write(&task, "判断分片内容。\n").unwrap();
+        let out = dir.path().join("out");
+
+        let mock = start_mock_with_delay(100);
+        let output = run_formic(
+            "completions",
+            mock.port,
+            concurrency,
+            &data,
+            &plan,
+            &task,
+            &out,
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "concurrency={concurrency} 应全部成功：{}",
+            stderr_of(&output)
+        );
+        let max = mock.max_in_flight.load(Ordering::SeqCst);
+        drop(dir);
+        max
+    };
+
+    assert_eq!(run(2), 2, "窗口 2 + 慢响应时，在途峰值应恰好达到 2");
+    assert_eq!(run(1), 1, "窗口 1 时请求必须严格串行");
+}
+
+/// 汇总确定性：并发改变完成时间，不改变自然顺序——失败单元按计划文件顺序呈现。
+#[test]
+fn summary_follows_plan_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("a.txt"), "FAIL-UNIT 甲\n").unwrap();
+    fs::write(data.join("b.txt"), "FAIL-UNIT 乙\n").unwrap();
+    // 计划行乱序：单元 2 在前、单元 1 在后；两者都触发 500
+    let plan = dir.path().join("plan.jsonl");
+    fs::write(
+        &plan,
+        "{\"unit\":2,\"files\":[\"a.txt\"]}\n{\"unit\":1,\"files\":[\"b.txt\"]}\n",
+    )
+    .unwrap();
+    let task = dir.path().join("task.md");
+    fs::write(&task, "任务。\n").unwrap();
+    let out = dir.path().join("out");
+
+    let mock = start_mock_with_delay(50);
+    let output = run_formic("completions", mock.port, 2, &data, &plan, &task, &out);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("失败单元：2, 1"),
+        "失败单元必须按计划文件顺序呈现，与完成时间无关：{stdout}"
+    );
 }

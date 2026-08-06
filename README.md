@@ -44,8 +44,11 @@ Formic 只做通用的批处理内核。高度可拓展性是原型的基石：�
 ## 使用
 
 ```bash
-formic run --data <数据集目录> --plan <plan.jsonl> --task <task.md> --out <输出区目录>
+formic run --data <数据集目录> --plan <plan.jsonl> --task <task.md> --out <输出区目录> --concurrency <N>
 ```
+
+`--concurrency <N>` 是并发窗口（同时运行的单元数上限，必填），依据是你对
+LLM 供应商配额的判断；超出的单元排队等待，不产生容量错误。
 
 模型通过环境变量配置（缺失必填项启动即失败）：
 
@@ -69,11 +72,11 @@ FORMIC_LLM_PROTOCOL=completions \
 FORMIC_LLM_BASE_URL=http://127.0.0.1:18080/v1 \
 FORMIC_LLM_MODEL=demo-model \
 cargo run -- run --data examples/demo/data --plan examples/demo/plan.jsonl \
-  --task examples/demo/task.md --out /tmp/formic-out
+  --task examples/demo/task.md --out /tmp/formic-out --concurrency 2
 ```
 
 ## 文档
 
 - [设计文档](docs/design.md)（候选设计，实现验证后修订为事实描述）
 - [模块拓扑](docs/topology.html)（已验证 / 候选两态，随轮更新）
-- 各轮档案：[docs/rounds/](docs/rounds/)（第 1 轮：最小全链路骨架）
+- 各轮档案：[docs/rounds/](docs/rounds/)（1 最小全链路骨架；2 search 工具与多轮循环；3 并发窗口）

@@ -5,8 +5,12 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::Parser;
+use futures_util::FutureExt;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 mod llm;
 mod output;
@@ -52,6 +56,9 @@ struct RunArgs {
     /// 输出区目录
     #[arg(long)]
     out: PathBuf,
+    /// 并发窗口：同时运行的单元数上限，调用方唯一的策略选择（依据是 LLM 配额）
+    #[arg(long)]
+    concurrency: usize,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -71,6 +78,8 @@ enum StartupError {
     TaskInvalid(PathBuf),
     #[error(transparent)]
     Plan(#[from] plan::PlanError),
+    #[error("--concurrency 必须是不小于 1 的整数")]
+    ConcurrencyZero,
     #[error("无法创建输出区 {path}：{source}")]
     OutDir {
         path: PathBuf,
@@ -100,6 +109,9 @@ async fn main() -> ExitCode {
 async fn run(args: RunArgs) -> Result<u8, StartupError> {
     let config = llm_config_from_env().map_err(StartupError::Env)?;
 
+    if args.concurrency == 0 {
+        return Err(StartupError::ConcurrencyZero);
+    }
     if !args.data.is_dir() {
         return Err(StartupError::DataRoot(args.data));
     }
@@ -114,7 +126,7 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         source: e,
     })?;
 
-    let ctx = worker::JobContext {
+    let ctx = Arc::new(worker::JobContext {
         scheduler: scheduler::Scheduler::start(tools::Roots {
             input: args.data.clone(),
             output: args.out.clone(),
@@ -124,25 +136,58 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         listing,
         llm: LlmClient::new(config),
         out_dir: args.out,
-    };
+    });
 
-    let mut summary = Summary {
-        completed: 0,
-        failed: Vec::new(),
-    };
-    for unit in &units {
-        match worker::run_unit(&ctx, unit).await {
-            Ok(()) => {
-                summary.completed += 1;
-                eprintln!("单元 {} 完成", unit.unit);
+    // 并发窗口：取到槽位才 spawn——窗口满时排队的是尚未创建的工作，
+    // 任务总量无界，活动槽位有界，不产生容量错误。
+    let order: Vec<u64> = units.iter().map(|u| u.unit).collect();
+    let window = Arc::new(Semaphore::new(args.concurrency));
+    let mut running: JoinSet<(u64, Result<(), worker::UnitFailure>)> = JoinSet::new();
+    for unit in units {
+        let permit = Arc::clone(&window)
+            .acquire_owned()
+            .await
+            .expect("窗口信号量随作业同生命周期");
+        let ctx = Arc::clone(&ctx);
+        running.spawn(async move {
+            let _permit = permit;
+            let no = unit.unit;
+            let result = std::panic::AssertUnwindSafe(worker::run_unit(&ctx, &unit))
+                .catch_unwind()
+                .await
+                .unwrap_or(Err(worker::UnitFailure::Panicked));
+            // 事实发生后立即报告，不被窗口等待阻塞
+            match &result {
+                Ok(()) => eprintln!("单元 {no} 完成"),
+                Err(failure) => eprintln!("单元 {no} 失败：{failure}"),
             }
-            Err(failure) => {
-                summary.failed.push(unit.unit);
-                eprintln!("单元 {} 失败：{failure}", unit.unit);
+            (no, result)
+        });
+    }
+
+    let mut completed = 0u64;
+    let mut failed = Vec::new();
+    while let Some(joined) = running.join_next().await {
+        match joined {
+            Ok((_no, Ok(()))) => completed += 1,
+            Ok((no, Err(_))) => failed.push(no),
+            Err(join_error) => {
+                // catch_unwind 已把 panic 转为单元失败；走到这里只能是运行时自身故障
+                eprintln!("内部错误：worker task 异常结束：{join_error}");
             }
         }
     }
+    // 并发只改变完成时间，不改变自然顺序：失败单元按计划文件顺序呈现
+    let failed_in_plan_order: Vec<u64> = order
+        .iter()
+        .filter(|u| failed.contains(u))
+        .copied()
+        .collect();
 
+    let summary = Summary {
+        completed,
+        failed: failed_in_plan_order,
+    };
     println!("{}", summary.render());
     Ok(summary.exit_code())
 }

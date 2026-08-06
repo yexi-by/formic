@@ -46,6 +46,8 @@ pub enum UnitFailure {
     EmptyOutput,
     #[error("调度器故障：{0}")]
     Scheduler(#[from] SchedulerGone),
+    #[error("内部错误：worker task panic")]
+    Panicked,
     #[error("写入输出区失败：{0}")]
     Output(#[from] std::io::Error),
 }
