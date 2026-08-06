@@ -59,7 +59,7 @@
   </div>
 </div>
 
-<h2>worker 内核（第 1–3 轮，已验证）</h2>
+<h2>worker 内核（第 1–4 轮，已验证）</h2>
 <div class="flow">
   <div class="node verified">
     <div class="name">计划</div>
@@ -110,14 +110,15 @@
     <div class="owner">src/tools.rs</div>
     <div class="duty">grep crates 进程内嵌；两棵只读根（input/output）；硬边界 + 截断标记</div>
   </div>
+  <div class="node verified">
+    <div class="name">重试预算 / 取消令牌树 <span class="note">第 4 轮</span></div>
+    <div class="owner">src/worker.rs + src/main.rs</div>
+    <div class="duty">瞬时故障按预算重试（attempt 留痕）；Ctrl+C/Break → 根令牌，select! 全树收敛；退出码 3</div>
+  </div>
 </div>
 
 <h2>候选：后续轮次（design.md，未实现）</h2>
 <div class="grid">
-  <div class="node candidate">
-    <div class="name">重试预算 / 取消令牌树 <span class="note">第 4 轮</span></div>
-    <div class="duty">瞬时故障有界重试；CancellationToken 树一处取消全树收敛</div>
-  </div>
   <div class="node candidate">
     <div class="name">历史预算与压缩 <span class="note">规模化前置</span></div>
     <div class="duty">对话历史是主导内存项；阈值须有实测依据（第 5 轮规模实验）</div>

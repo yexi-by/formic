@@ -74,23 +74,22 @@ fn tool_result_marker(path: &str) -> &'static str {
 }
 
 fn main() {
-    let port: u16 = std::env::args()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(18080);
+    let mut args = std::env::args().skip(1);
+    let port: u16 = args.next().and_then(|s| s.parse().ok()).unwrap_or(18080);
+    let delay_ms: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
-    println!("mock LLM 就绪，FORMIC_LLM_BASE_URL=http://127.0.0.1:{port}/v1");
+    println!("mock LLM 就绪，FORMIC_LLM_BASE_URL=http://127.0.0.1:{port}/v1（延迟 {delay_ms}ms）");
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                thread::spawn(|| handle(stream));
+                thread::spawn(move || handle(stream, delay_ms));
             }
             Err(e) => eprintln!("接受连接失败：{e}"),
         }
     }
 }
 
-fn handle(mut stream: std::net::TcpStream) {
+fn handle(mut stream: std::net::TcpStream, delay_ms: u64) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -141,5 +140,8 @@ fn handle(mut stream: std::net::TcpStream) {
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
         sse.len()
     );
+    if delay_ms > 0 {
+        thread::sleep(std::time::Duration::from_millis(delay_ms));
+    }
     stream.write_all(response.as_bytes()).ok();
 }

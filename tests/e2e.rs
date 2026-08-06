@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -19,6 +19,9 @@ const FAIL_MARKER: &str = "FAIL-UNIT";
 
 /// 请求体含此标记时 mock 永远返回工具调用，用于驱动停滞检测路径。
 const LOOP_MARKER: &str = "LOOP-MARKER";
+
+/// 请求体含此标记时 mock 对首次请求返回 500、后续恢复正常，用于驱动重试成功路径。
+const FLAKY_MARKER: &str = "FLAKY-UNIT";
 
 // ---- 罐装 SSE：文本最终帧（三协议）----
 
@@ -120,9 +123,11 @@ fn start_mock_with_delay(delay_ms: u64) -> MockServer {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
+    let flaky_seen = Arc::new(AtomicBool::new(false));
     let shared = Arc::clone(&requests);
     let shared_in_flight = Arc::clone(&in_flight);
     let shared_max = Arc::clone(&max_in_flight);
+    let shared_flaky = Arc::clone(&flaky_seen);
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
@@ -130,7 +135,10 @@ fn start_mock_with_delay(delay_ms: u64) -> MockServer {
                     let shared = Arc::clone(&shared);
                     let in_flight = Arc::clone(&shared_in_flight);
                     let max = Arc::clone(&shared_max);
-                    thread::spawn(move || handle_conn(stream, shared, in_flight, max, delay_ms));
+                    let flaky = Arc::clone(&shared_flaky);
+                    thread::spawn(move || {
+                        handle_conn(stream, shared, in_flight, max, flaky, delay_ms)
+                    });
                 }
                 Err(_) => break,
             }
@@ -148,6 +156,7 @@ fn handle_conn(
     requests: Arc<Mutex<Vec<Recorded>>>,
     in_flight: Arc<AtomicUsize>,
     max_in_flight: Arc<AtomicUsize>,
+    flaky_seen: Arc<AtomicBool>,
     delay_ms: u64,
 ) {
     let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -191,6 +200,8 @@ fn handle_conn(
 
     let (status, response_body) = if body_text.contains(FAIL_MARKER) {
         ("500 Internal Server Error", "boom".to_string())
+    } else if body_text.contains(FLAKY_MARKER) && !flaky_seen.swap(true, Ordering::SeqCst) {
+        ("500 Internal Server Error", "transient".to_string())
     } else if body_text.contains(LOOP_MARKER) {
         match sse_for(&path, true) {
             Some(sse) => ("200 OK", sse.to_string()),
@@ -396,6 +407,50 @@ fn failed_unit_leaves_no_record() {
         "失败诊断应含单元号：{stderr}"
     );
     assert!(stderr.contains("500"), "失败诊断应含直接原因：{stderr}");
+    assert!(
+        stderr.contains("重试 2 次"),
+        "瞬时故障应重试到预算耗尽：{stderr}"
+    );
+
+    // 单元 1 两轮 2 次请求 + 单元 2 三次尝试均 500
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5, "重试预算应耗尽：{:?}", requests.len());
+}
+
+/// 瞬时故障重试成功：首次 500 → 重发 → 正常完成两轮。
+#[test]
+fn retry_succeeds_after_transient_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("a.txt"), "苹果是水果。\nFLAKY-UNIT\n").unwrap();
+    let plan = dir.path().join("plan.jsonl");
+    fs::write(&plan, "{\"unit\":1,\"files\":[\"a.txt\"]}\n").unwrap();
+    let task = dir.path().join("task.md");
+    fs::write(&task, "任务。\n").unwrap();
+    let out = dir.path().join("out");
+
+    let mock = start_mock();
+    let output = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "重试后应成功：{}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("1.md")).unwrap(),
+        FINAL_TEXT,
+        "产出应为最终回合文本"
+    );
+
+    // 500 一次 + 重试的工具调用 + 最终回合，共 3 次请求
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3, "{:?}", requests.len());
+
+    let audit = fs::read_to_string(out.join("audit").join("1.jsonl")).unwrap();
+    assert!(audit.contains("\"attempt\":1"), "审计应含首次尝试：{audit}");
+    assert!(audit.contains("\"attempt\":2"), "审计应含重试尝试：{audit}");
 }
 
 #[test]

@@ -18,8 +18,8 @@ pub fn publish(out_dir: &Path, unit: u64, content: &str) -> io::Result<PathBuf> 
 
 /// 一条审计留痕：data 逐字保留原始内容，不重新解析。
 pub enum AuditEntry {
-    /// LLM 请求体原文。
-    LlmRequest(String),
+    /// LLM 请求体原文；attempt 是本次调用的尝试序号（1 起始，重试递增）。
+    LlmRequest { attempt: u32, body: String },
     /// 原始 SSE data 负载。
     LlmEvent(String),
     /// 组装完毕的工具调用（名称 + 模型给出的原始参数文本）。
@@ -31,8 +31,9 @@ pub enum AuditEntry {
 impl AuditEntry {
     fn to_line(&self) -> String {
         match self {
-            AuditEntry::LlmRequest(data) => {
-                serde_json::json!({"direction": "request", "data": data}).to_string()
+            AuditEntry::LlmRequest { attempt, body } => {
+                serde_json::json!({"direction": "request", "attempt": attempt, "data": body})
+                    .to_string()
             }
             AuditEntry::LlmEvent(data) => {
                 serde_json::json!({"direction": "event", "data": data}).to_string()
@@ -63,10 +64,11 @@ pub fn write_audit(out_dir: &Path, unit: u64, entries: &[AuditEntry]) -> io::Res
     Ok(path)
 }
 
-/// 作业汇总：完成数、失败单元号；失败原因已在各单元完成时即时报告。
+/// 作业汇总：完成数、失败单元号、取消数；失败原因已在各单元完成时即时报告。
 pub struct Summary {
     pub completed: u64,
     pub failed: Vec<u64>,
+    pub cancelled: u64,
 }
 
 impl Summary {
@@ -75,6 +77,9 @@ impl Summary {
         if !self.failed.is_empty() {
             let ids: Vec<String> = self.failed.iter().map(u64::to_string).collect();
             line.push_str(&format!("；失败单元：{}", ids.join(", ")));
+        }
+        if self.cancelled > 0 {
+            line.push_str(&format!("；取消 {}（作业已被终止）", self.cancelled));
         }
         line
     }

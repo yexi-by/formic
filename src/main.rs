@@ -11,6 +11,7 @@ use clap::Parser;
 use futures_util::FutureExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
+use tokio_util::sync::CancellationToken;
 
 mod llm;
 mod output;
@@ -138,27 +139,43 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         out_dir: args.out,
     });
 
+    // 取消令牌树：根令牌由信号触发，每 worker 持 child token，
+    // worker 内部的 LLM 流、工具等待、重试退避再向下派生，一处取消全树收敛。
+    let cancel_root = CancellationToken::new();
+    {
+        let cancel_root = cancel_root.clone();
+        tokio::spawn(async move {
+            termination_signal().await;
+            eprintln!("收到终止信号：停止接纳新单元，等待在途单元收敛（再次按下 Ctrl+C 立即退出）");
+            cancel_root.cancel();
+            termination_signal().await;
+            std::process::exit(130);
+        });
+    }
+
     // 并发窗口：取到槽位才 spawn——窗口满时排队的是尚未创建的工作，
     // 任务总量无界，活动槽位有界，不产生容量错误。
     let order: Vec<u64> = units.iter().map(|u| u.unit).collect();
     let window = Arc::new(Semaphore::new(args.concurrency));
-    let mut running: JoinSet<(u64, Result<(), worker::UnitFailure>)> = JoinSet::new();
+    let mut running: JoinSet<(u64, Result<worker::Outcome, worker::UnitFailure>)> = JoinSet::new();
     for unit in units {
-        let permit = Arc::clone(&window)
-            .acquire_owned()
-            .await
-            .expect("窗口信号量随作业同生命周期");
+        let permit = tokio::select! {
+            _ = cancel_root.cancelled() => break,
+            p = Arc::clone(&window).acquire_owned() => p.expect("窗口信号量随作业同生命周期"),
+        };
         let ctx = Arc::clone(&ctx);
+        let cancel = cancel_root.child_token();
         running.spawn(async move {
             let _permit = permit;
             let no = unit.unit;
-            let result = std::panic::AssertUnwindSafe(worker::run_unit(&ctx, &unit))
+            let result = std::panic::AssertUnwindSafe(worker::run_unit(&ctx, &unit, cancel))
                 .catch_unwind()
                 .await
                 .unwrap_or(Err(worker::UnitFailure::Panicked));
             // 事实发生后立即报告，不被窗口等待阻塞
             match &result {
-                Ok(()) => eprintln!("单元 {no} 完成"),
+                Ok(worker::Outcome::Published) => eprintln!("单元 {no} 完成"),
+                Ok(worker::Outcome::Cancelled) => eprintln!("单元 {no} 取消（作业已被终止）"),
                 Err(failure) => eprintln!("单元 {no} 失败：{failure}"),
             }
             (no, result)
@@ -166,10 +183,12 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
     }
 
     let mut completed = 0u64;
+    let mut cancelled = 0u64;
     let mut failed = Vec::new();
     while let Some(joined) = running.join_next().await {
         match joined {
-            Ok((_no, Ok(()))) => completed += 1,
+            Ok((_no, Ok(worker::Outcome::Published))) => completed += 1,
+            Ok((_no, Ok(worker::Outcome::Cancelled))) => cancelled += 1,
             Ok((no, Err(_))) => failed.push(no),
             Err(join_error) => {
                 // catch_unwind 已把 panic 转为单元失败；走到这里只能是运行时自身故障
@@ -187,9 +206,15 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
     let summary = Summary {
         completed,
         failed: failed_in_plan_order,
+        cancelled,
     };
     println!("{}", summary.render());
-    Ok(summary.exit_code())
+    // 退出码：收到终止信号 → 3；否则有失败 → 1；全部成功 → 0
+    if cancel_root.is_cancelled() {
+        Ok(3)
+    } else {
+        Ok(summary.exit_code())
+    }
 }
 
 fn llm_config_from_env() -> Result<LlmConfig, String> {
@@ -226,4 +251,20 @@ fn read_task(path: &PathBuf) -> Result<String, StartupError> {
         return Err(StartupError::TaskInvalid(path.clone()));
     }
     Ok(text)
+}
+
+/// 等待一次终止信号：Ctrl+C，或 Windows 的 Ctrl+Break。
+#[cfg(windows)]
+async fn termination_signal() {
+    let mut ctrl_c = tokio::signal::windows::ctrl_c().expect("注册 Ctrl+C 监听");
+    let mut ctrl_break = tokio::signal::windows::ctrl_break().expect("注册 Ctrl+Break 监听");
+    tokio::select! {
+        _ = ctrl_c.recv() => {}
+        _ = ctrl_break.recv() => {}
+    }
+}
+
+#[cfg(not(windows))]
+async fn termination_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
