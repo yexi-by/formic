@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Formic 模块拓扑</title>
+<style>
+  :root {
+    --verified: #1a7f37;
+    --verified-bg: #f0fff4;
+    --candidate: #6b7280;
+    --candidate-bg: #fafafa;
+    --ink: #1f2328;
+  }
+  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color: var(--ink);
+         max-width: 1080px; margin: 2rem auto; padding: 0 1rem; line-height: 1.6; }
+  h1 { font-size: 1.5rem; }
+  h2 { font-size: 1.1rem; margin-top: 2rem; border-bottom: 2px solid #e5e7eb; padding-bottom: .3rem; }
+  .legend { display: flex; gap: 1.5rem; margin: 1rem 0; font-size: .9rem; }
+  .legend span::before { content: ""; display: inline-block; width: .9rem; height: .9rem;
+         border-radius: 3px; margin-right: .4rem; vertical-align: -0.1rem; }
+  .legend .v::before { background: var(--verified-bg); border: 2px solid var(--verified); }
+  .legend .c::before { background: var(--candidate-bg); border: 2px dashed var(--candidate); }
+  .flow { display: flex; flex-wrap: wrap; gap: .6rem; align-items: stretch; margin: 1rem 0; }
+  .node { border-radius: 8px; padding: .6rem .8rem; max-width: 15rem; font-size: .88rem; }
+  .node .name { font-weight: 600; }
+  .node .owner { font-family: Consolas, monospace; font-size: .78rem; opacity: .75; }
+  .node .duty { margin-top: .25rem; }
+  .verified { border: 2px solid var(--verified); background: var(--verified-bg); }
+  .candidate { border: 2px dashed var(--candidate); background: var(--candidate-bg); }
+  .arrow { align-self: center; font-size: 1.2rem; color: #9ca3af; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: .8rem; margin: 1rem 0; }
+  .note { font-size: .85rem; color: #6b7280; }
+  footer { margin-top: 2.5rem; font-size: .82rem; color: #9ca3af; }
+</style>
+</head>
+<body>
+
+<h1>Formic 模块拓扑</h1>
+<p class="note">只表达职责归属与依赖方向；接口细节以代码为准。实线 = 已实现并验证；
+虚线 = 候选（design.md，未经实现验证）。与代码冲突的一方按现行契约修正。</p>
+
+<div class="legend">
+  <span class="v">已验证实现</span>
+  <span class="c">候选（未实现）</span>
+</div>
+
+<h2>调用方 → 作业</h2>
+<div class="flow">
+  <div class="node verified">
+    <div class="name">调用方（人 / 上游 Agent / CI）</div>
+    <div class="duty">给文件、等结果、看目录；分片规划与结果汇总是它的权责</div>
+  </div>
+  <div class="arrow">→</div>
+  <div class="node verified">
+    <div class="name">CLI 入口</div>
+    <div class="owner">src/main.rs</div>
+    <div class="duty">参数、环境变量、错误呈现、退出码（0/1/2）</div>
+  </div>
+</div>
+
+<h2>第 1 轮：最小全链路骨架（已验证）</h2>
+<div class="flow">
+  <div class="node verified">
+    <div class="name">计划</div>
+    <div class="owner">src/plan.rs</div>
+    <div class="duty">JSONL 解析与校验：单元号、根内路径、分片非空</div>
+  </div>
+  <div class="arrow">→</div>
+  <div class="node verified">
+    <div class="name">worker</div>
+    <div class="owner">src/worker.rs</div>
+    <div class="duty">单单元执行：读分片 → 装配 → 调用 → 发布或诊断</div>
+  </div>
+  <div class="arrow">→</div>
+  <div class="node verified">
+    <div class="name">输出区</div>
+    <div class="owner">src/output.rs</div>
+    <div class="duty">原子发布、审计落盘、汇总</div>
+  </div>
+</div>
+<div class="flow">
+  <div class="node verified">
+    <div class="name">prompt 装配</div>
+    <div class="owner">src/prompt.rs</div>
+    <div class="duty">instructions + 任务说明 + 清单 + 分片；跨单元前缀字节一致</div>
+  </div>
+  <div class="arrow">← worker 使用</div>
+  <div class="node verified">
+    <div class="name">LLM 协议层</div>
+    <div class="owner">src/llm/</div>
+    <div class="duty">三协议 transform → 统一内部事件；请求/原始响应全程留痕</div>
+  </div>
+</div>
+
+<h2>候选：后续轮次（design.md，未实现）</h2>
+<div class="grid">
+  <div class="node candidate">
+    <div class="name">统一调度器 <span class="note">第 2 轮起</span></div>
+    <div class="duty">工具调用唯一入口：限流记账、大小硬边界、去重缓存、审计、只读 enforcement；治理集中、执行并发</div>
+  </div>
+  <div class="node candidate">
+    <div class="name">search 工具 <span class="note">第 2 轮</span></div>
+    <div class="duty">grep crates 进程内嵌；两棵只读根（input / output）；截断显式标记；多轮循环随之引入</div>
+  </div>
+  <div class="node candidate">
+    <div class="name">并发窗口 <span class="note">第 3 轮</span></div>
+    <div class="duty">每 worker 一个 tokio task；槽位有界、总量无界，窗口满时排队等待</div>
+  </div>
+  <div class="node candidate">
+    <div class="name">重试 / 停滞检测 / 取消 <span class="note">第 4 轮</span></div>
+    <div class="duty">重试预算、重复 tool call 阈值、CancellationToken 树</div>
+  </div>
+  <div class="node candidate">
+    <div class="name">历史预算与压缩 <span class="note">规模化前置</span></div>
+    <div class="duty">对话历史是主导内存项；阈值须有实测依据（第 5 轮规模实验）</div>
+  </div>
+  <div class="node candidate">
+    <div class="name">规模验证 <span class="note">第 5 轮</span></div>
+    <div class="duty">mock LLM 驱动 5000 worker 全链路：内存曲线、调度器热点、阈值实测</div>
+  </div>
+  <div class="node candidate">
+    <div class="name">web fetch <span class="note">原型不实现</span></div>
+    <div class="duty">外部读取：每次是出站副作用，经调度器限流与缓存进入</div>
+  </div>
+</div>
+
+<h2>依赖方向（当前）</h2>
+<p class="note">
+main → plan / prompt / worker / output / llm；worker → prompt / llm / output；
+llm/{completions,responses,anthropic} → llm（事件枚举），三协议互不知晓。
+调度器进入后：worker 的一切工具调用与 LLM 记账经调度器准入（候选）。
+</p>
+
+<footer>随每轮实现同改更新；第 1 轮验证证据见 docs/rounds/round-01.md。</footer>
+
+</body>
+</html>
