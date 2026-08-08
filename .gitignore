@@ -1,4 +1,25 @@
-# 参考实现仓库，不入库
-reference/
+# Rust 构建产物
+/target/
 
-/target
+# 本地发布产物
+/dist/
+
+# 本地运行与规模实验产物
+/tmp/
+/scale-metrics.csv
+
+# 本地密钥与环境配置
+.env
+.env.*
+!.env.example
+
+# 编辑器与操作系统文件
+/.idea/
+/.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# 参考实现仓库，不入库
+/reference/

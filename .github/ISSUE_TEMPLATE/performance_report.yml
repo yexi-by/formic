@@ -1,0 +1,100 @@
+name: 规模与性能问题
+description: 报告大规模作业中的吞吐、内存、调度或资源异常
+title: "[性能] "
+labels:
+  - performance
+body:
+  - type: markdown
+    attributes:
+      value: |
+        性能判断必须基于可复现的真实负载或受控 mock。请提供工作量、并发窗口和测量方法，不要只提交单次耗时。审计文件可能包含敏感内容，通常只需提供 stats 和 FORMIC_METRICS 指标。
+
+  - type: textarea
+    id: impact
+    attributes:
+      label: 问题与影响
+      description: 说明吞吐、内存、调度、磁盘或取消行为哪里异常，以及作业受到什么影响。
+    validations:
+      required: true
+
+  - type: textarea
+    id: workload
+    attributes:
+      label: 负载特征
+      description: 给出单元总数、并发窗口、分片大小、每单元 LLM 回合与工具调用次数，以及模型或 mock 的典型延迟。
+      placeholder: |
+        单元总数：5000
+        并发窗口：1000
+        分片大小：……
+        LLM 回合：……
+        工具调用：……
+        服务延迟：……
+    validations:
+      required: true
+
+  - type: input
+    id: revision
+    attributes:
+      label: Formic 版本或 commit
+      placeholder: 0.1.0 或 784ffc3
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 操作系统、CPU、内存和构建类型（debug 或 release）。
+      placeholder: Windows 11，16 核，32 GiB，release
+    validations:
+      required: true
+
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: LLM 协议
+      options:
+        - completions
+        - responses
+        - anthropic
+        - 内置 mock
+        - 与 LLM 调用无关
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现命令与测量方法
+      description: 提供命令、预热方式、重复次数、采样工具和比较基线。请删除密钥和私有地址。
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: measurements
+    attributes:
+      label: 测量结果
+      description: 提供墙钟时间、吞吐、峰值 RSS、指标峰值或磁盘占用等原始数据；可粘贴删减后的 FORMIC_METRICS 输出和 stats 汇总。
+    validations:
+      required: true
+
+  - type: textarea
+    id: expectation
+    attributes:
+      label: 比较基线或预期
+      description: 说明与哪个版本、配置或理论边界相比出现异常。没有基线时，请说明你依据什么判断它是问题。
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 我已确认数据来自可复现负载，并说明了测量方法。
+          required: true
+        - label: 我已删除 API key、私有数据和未处理的完整模型上下文。
+          required: true
+        - label: 我已阅读现有规模实验并搜索过相关 Issue。
+          required: true

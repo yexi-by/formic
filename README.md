@@ -1,113 +1,239 @@
 # Formic（蚁群）
 
-## 项目定位
+> 面向大量独立语义任务的轻量 LLM 批处理运行时：文件输入，记录输出。
 
-Formic 是一个 CLI 应用，专门解决传统 Agent subagent 的局限性问题。
+Formic 是一个 Rust CLI。它按调用方提供的计划读取相互独立的数据分片，为每个分片
+启动一次性、只读的 LLM worker，并负责并发、重试、取消、结果发布和调用审计。作业
+通过数据、分片计划和自然语言任务说明定义，不需要接入 SDK，也不需要运行常驻服务。
 
-越来越多的任务——通读长篇小说并提取术语、逐条分析上万条记录、逐个判断页面里有没有目标信息——没有固定流程可写，每一步都需要理解与判断，只能交给具备智能的执行单元自主完成，而且数量巨大、相互独立。传统 Agent 的 subagent 做不了这件事：它本身就是一个完整的 Agent，带着完整的工具套件与提示词约束，设计过重，开几十个、几百个并行就力不从心，用哪个模型也由宿主决定。
+当前项目是可运行原型，已经完成三种 LLM API 协议、多轮工具调用、并发窗口、失败重试、
+优雅终止、逐次调用审计和逐单元统计。5000 个单元、1000 并发窗口的 mock 全流程实验
+及其测量结果记录在[第 5 轮档案](docs/rounds/round-05.md)中。
 
-Formic 把执行单元做到最轻：一次性、只读、模型任选，几万个任务排队、几百个同时跑是设计常态。
+## Formic 解决什么问题
 
-嵌入式是核心理念：Formic 不是一个自成一体的应用，而是设计为被嵌入的组件。它的接口就是文件与目录——不发明协议、不开端口、不需要 SDK——人、上层 Agent（Claude Code、Codex 等）、CI 或另一个程序，都能把它当作普通命令行工具嵌进自己的流程。
+有一类批量工作无法用固定脚本可靠完成，因为每个数据单元都需要理解上下文并作出判断，
+例如：
 
-## 核心抽象
+- 从长篇文本的每个章节中提取实体、术语或事实；
+- 逐条分类、审核或解释大量非结构化记录；
+- 在大批页面或文档中判断目标信息是否存在，并给出依据；
+- 对彼此独立的数据分片执行相同的研究或分析任务。
 
-> 海量独立的自主任务 → 一个任务分配一个执行单元 → 给定输入与任务说明 → 多轮「LLM ↔ 工具调用」循环、全程自主判断 → 以单元为键的产出记录
+直接循环调用模型只能发出请求，不能自然地处理多轮工具调用、并发窗口、失败隔离、原子
+输出和完整审计。通用交互 Agent 的 subagent 通常还会继承完整工具集、交互规则和宿主
+选择的模型；当任务数量增大时，这些能力会增加不必要的资源、权限和调度成本。
 
-围绕这条抽象，运行时负责：
+Formic 把这类工作收敛为一个明确契约：
 
-- 并发调度：同时运行的单元数量有上限，超出的排队等待
-- API 限流：不超过模型供应商的调用配额
-- 失败重试：运行内失败自动重试，次数有上限
-- 权限隔离：单元只能读数据，不能写
-- 统一输出：产出由运行时写入输出区，按单元编号命名，写完才对外可见
-- 调用审计：每次模型调用的输入与输出都可查、可复现
+| 批处理中的问题 | Formic 的处理方式 |
+| --- | --- |
+| 单元需要自主判断，不能预先写死步骤 | 每个单元运行独立的多轮 `LLM ↔ search` 会话 |
+| 合法任务很多，但同时请求数受模型配额限制 | 只限制活动窗口，窗口外单元等待，不限制任务总量 |
+| 单个单元失败不应丢失其他进展 | 每个单元独立结算，已完成结果立即发布 |
+| 中断时不能留下半截结果 | 结果先写临时文件，再原子发布为 `<单元号>.md` |
+| 模型行为需要检查和复现 | 完整记录每次请求、响应、工具调用和重试次数 |
+| 调用方需要比较成本与行为 | 逐单元输出回合数、调用数、工具计数和 token 估算 |
 
-以下三件事刻意交给调用方：分片规划、断点续跑（跨运行）、结果汇总。
+## 适用范围
 
-## 执行单元（worker，工蚁）
+Formic 适合满足以下条件的作业：
 
-执行单元是完整但一次性的 Agent 会话：
+- 工作可以拆成大量相互独立的单元；
+- 每个单元需要语义理解，而不是单纯的数据转换；
+- worker 只需读取输入数据和已完成结果；
+- 调用方需要保留可检查的独立产出，而不是只要一个聚合答案。
 
-- 领取自己的数据分片与任务说明，独立循环，完成后销毁，腾出的位置立即由下一个任务填补。
-- 对数据默认只读，结果只能经运行时的统一输出通道写入输出区。
-- 刻意轻量：无交互概念、无写工具、极小提示词。它不是任何上层 Agent 的子代理，而是运行时的内部执行单元。
+以下情况不属于当前内核的目标：
 
-## 调用方式
+- 单元之间需要频繁同步或共同修改状态；
+- worker 需要 shell、写文件或任意代码执行能力；
+- 只有一个短任务，普通单次模型调用已经足够；
+- 需要 Formic 自动决定如何分片、汇总结果或跨运行续跑。
 
-调用方一次给齐四样东西：一批数据、一份分片计划（哪个单元处理哪段数据）、一份自然语言任务说明、一个并发上限。之后可以等待最后一个单元完成，也可以中途查看输出区、决定任务继续还是停止。
+## 工作方式
 
-## 拓展性
-
-Formic 只做通用的批处理内核。高度可拓展性是原型的基石：内核概念最少、职责单一、对外契约稳定，保证原型能向任何方向轻松发展——新能力在内核之外生长，不改动内核。
-
-## 使用
-
-```bash
-formic run --data <数据集目录> --plan <plan.jsonl> --task <task.md> --out <输出区目录> --concurrency <N>
+```text
+数据目录 + plan.jsonl + task.md
+               │
+               ▼
+       有界并发的一次性 worker
+          │       │       │
+          └── LLM ↔ search ──┘
+               │
+               ├── <单元号>.md       最终产出
+               ├── audit/*.jsonl     完整调用记录
+               └── stats.jsonl       逐单元统计
 ```
 
-`--concurrency <N>` 是并发窗口（同时运行的单元数上限，必填），依据是你对
-LLM 供应商配额的判断；超出的单元排队等待，不产生容量错误。
+运行时负责：
 
-模型通过环境变量配置（缺失必填项启动即失败）：
+- 按计划顺序接纳单元，并在调用方指定的并发窗口内执行；
+- 为每个单元维持独立的多轮 LLM 会话；
+- 提供只读 `search` 工具，允许检索输入根和已完成输出根；
+- 对可重试故障使用有界重试，隔离单元失败；
+- 原子发布结果，并完整记录模型请求与原始响应；
+- 收到 Ctrl+C 或 Ctrl+Break 后停止接纳新单元，取消在途调用并保留已发布结果。
 
-- `FORMIC_LLM_PROTOCOL`：API 协议形状，`completions` / `responses` / `anthropic`；
-- `FORMIC_LLM_BASE_URL`：API 基础地址，如 `https://api.openai.com/v1`；
-- `FORMIC_LLM_MODEL`：模型名；
-- `FORMIC_LLM_API_KEY`：可选，设置后按协议附带认证头。
+调用方负责：
 
-计划文件是 JSONL，一行一个单元：`{"unit":1,"files":["a.txt",...]}`（文件清单）或
-`{"unit":2,"file":"big.txt","start":100,"end":200}`（行区间，1 起始、双端闭区间）。
+- 生成分片计划；
+- 在任务说明中定义判断标准和输出格式；
+- 汇总各单元结果；
+- 跨运行续跑：读取已有 `<单元号>.md`，剔除已完成单元后生成新计划。
 
-输出区：完成单元的产出是 `out/<单元号>.md`（原子发布，失败单元无记录）；每次模型
-调用的请求与原始响应在 `out/audit/<单元号>.jsonl`（含每次重试的 attempt 序号）。
-退出码：0 全部成功，1 存在失败单元，2 启动失败，3 被终止。
+## 快速开始
 
-`out/stats.jsonl` 是逐单元的统计视图（每行一个单元，含失败与取消）：
+### 1. 构建
+
+需要 Rust 1.85 或更高版本。
+
+```bash
+cargo build --release
+```
+
+生成的程序位于 `target/release/formic`；Windows 下为
+`target/release/formic.exe`。
+
+### 2. 使用本地 mock LLM 跑通示例
+
+先在第一个终端启动仓库自带的 mock 服务：
+
+```bash
+cargo run --example mock_llm -- 18080
+```
+
+在第二个 PowerShell 终端运行示例作业：
+
+```powershell
+$env:FORMIC_LLM_PROTOCOL = "completions"
+$env:FORMIC_LLM_BASE_URL = "http://127.0.0.1:18080/v1"
+$env:FORMIC_LLM_MODEL = "demo-model"
+
+cargo run -- run `
+  --data examples/demo/data `
+  --plan examples/demo/plan.jsonl `
+  --task examples/demo/task.md `
+  --out tmp/demo-out `
+  --concurrency 2
+```
+
+Linux 或 macOS 可使用：
+
+```bash
+FORMIC_LLM_PROTOCOL=completions \
+FORMIC_LLM_BASE_URL=http://127.0.0.1:18080/v1 \
+FORMIC_LLM_MODEL=demo-model \
+cargo run -- run \
+  --data examples/demo/data \
+  --plan examples/demo/plan.jsonl \
+  --task examples/demo/task.md \
+  --out tmp/demo-out \
+  --concurrency 2
+```
+
+## 生产调用
+
+```bash
+formic run \
+  --data <数据集目录> \
+  --plan <plan.jsonl> \
+  --task <task.md> \
+  --out <输出目录> \
+  --concurrency <同时运行的单元数>
+```
+
+`--concurrency` 是必填项。它只控制同时运行的单元数，应依据 LLM 供应商配额和机器
+资源设置；超出的单元等待，不会被判为容量错误。
+
+### LLM 配置
+
+| 环境变量 | 必填 | 含义 |
+| --- | --- | --- |
+| `FORMIC_LLM_PROTOCOL` | 是 | API 协议形状：`completions`、`responses` 或 `anthropic` |
+| `FORMIC_LLM_BASE_URL` | 是 | API 基础地址，例如 `https://api.openai.com/v1` |
+| `FORMIC_LLM_MODEL` | 是 | 供应商接受的模型名 |
+| `FORMIC_LLM_API_KEY` | 否 | 设置后按所选协议附带认证头 |
+| `FORMIC_METRICS` | 否 | 设为 `1` 时，每 250 ms 向 stderr 输出运行指标 |
+
+缺少必填配置时，Formic 会在读取作业前明确失败。不要把 API key 写入任务文件、计划
+文件或版本库。
+
+### 分片计划
+
+计划文件采用 JSONL，一行一个单元。`unit` 是从 1 开始、在当前计划中唯一的自然编号。
+
+按文件分配：
+
+```json
+{"unit":1,"files":["chapter-01.txt","notes/context.txt"]}
+```
+
+按行区间分配（1 起始、双端闭区间）：
+
+```json
+{"unit":2,"file":"records.jsonl","start":100,"end":199}
+```
+
+任务说明是 UTF-8 文本。Formic 将其原样放入每个 worker 的输入；判断规则、输出结构和
+无法判断时的处理方法都应由调用方在这里写清楚。
+
+### 输出契约
+
+| 路径 | 内容 | 业务含义 |
+| --- | --- | --- |
+| `out/<单元号>.md` | worker 的最终消息 | 单元完成的权威记录；失败单元没有该文件 |
+| `out/audit/<单元号>.jsonl` | 每次请求与原始响应 | 调试和复现依据，包含完整上下文 |
+| `out/stats.jsonl` | 每行一个单元的统计 | 便于分析结果、重试、工具调用和 token 估算 |
+
+`stats.jsonl` 示例：
 
 ```json
 {"unit":1,"outcome":"published","turns":2,"llm_calls":2,"retries":0,"tool_calls":{"search":1},"input_tokens_est":4025,"output_tokens_est":201}
 ```
 
-token 为内部估算值（tiktoken o200k BPE 按内容计算，协议无关，参考 codex 等开源
-工具实现），用于预算与指标分析，不是计费依据。权威事实在审计里；stats 是可推导
-的便捷视图。完整对话内容在审计的 request 条目（每回合含全量历史），例如用
-`jq -r 'select(.direction=="request") | .data' out/audit/1.jsonl` 提取。
+token 使用 `o200k` BPE 在本地估算，用于预算和作业分析，不是供应商计费数据。审计文件
+会包含任务内容、数据分片、完整会话和模型原始输出；共享前请先检查其中是否有敏感信息。
 
-中断语义：Ctrl+C（或 Ctrl+Break）一次 = 优雅终止——停止接纳新单元、在途单元取消
-收敛、已发布记录保留、退出码 3；再按一次立即退出。被终止不是破坏：调用方读输出区
-算差集、剔除已完成单元重新生成计划即可续跑。
+### 退出状态
 
-观测：设 `FORMIC_METRICS=1` 时，运行期间每 250ms 向 stderr 写一行机器可 grep 的
-指标（RSS、在途 LLM 调用、调度器队列深度、在途历史字节、search 耗时、单元计数），
-不设置则无输出；指标只是附属证据，不参与业务行为。
+| 退出码 | 含义 |
+| --- | --- |
+| `0` | 所有单元成功 |
+| `1` | 至少一个单元失败，其余已完成结果仍保留 |
+| `2` | 作业未启动，例如参数、输入或环境配置无效 |
+| `3` | 收到终止信号，已发布结果保留 |
 
-规模实验（mock 驱动几千 worker 全链路，观测内存与调度器）：
+第一次按 Ctrl+C 或 Ctrl+Break 会执行优雅终止；再次按下会立即退出。跨运行续跑由调用方
+根据输出目录中的单元编号计算差集。
 
-```bash
-cargo build && cargo run --example scale_run -- 5000 1000 8 20
-# 参数：单元数 并发窗口 每单元工具调用回合数 mock 延迟毫秒
-# 产出：stdout 汇总表 + 当前目录 scale-metrics.csv
-```
+## 规模实验
 
-本地无模型体验全流程：
+仓库提供 mock 驱动的全流程实验，用于观察 worker 历史、LLM 在途请求、调度器队列、
+search 耗时和进程内存：
 
 ```bash
-cargo run --example mock_llm -- 18080   # 起 mock LLM
-FORMIC_LLM_PROTOCOL=completions \
-FORMIC_LLM_BASE_URL=http://127.0.0.1:18080/v1 \
-FORMIC_LLM_MODEL=demo-model \
-cargo run -- run --data examples/demo/data --plan examples/demo/plan.jsonl \
-  --task examples/demo/task.md --out /tmp/formic-out --concurrency 2
+cargo build
+cargo run --example scale_run -- 5000 1000 8 20
 ```
+
+参数依次为单元数、并发窗口、每单元工具调用回合数和 mock 延迟毫秒。实验会在当前目录
+生成 `scale-metrics.csv`；已记录的基准和分析见
+[docs/rounds/round-05.md](docs/rounds/round-05.md)。
 
 ## 文档
 
-- [设计文档](docs/design.md)（候选设计，实现验证后修订为事实描述）
-- [模块拓扑](docs/topology.html)（已验证 / 候选两态，随轮更新）
-- 各轮档案：[docs/rounds/](docs/rounds/)（1 最小全链路骨架；2 search 工具与多轮循环；3 并发窗口；4 重试预算与取消令牌树；5 规模验证；6 单元统计视图）
+- [设计文档](docs/design.md)：当前职责边界、数据契约和实现依据；
+- [模块拓扑](docs/topology.html)：已验证模块与候选模块的关系；
+- [实现档案](docs/rounds/)：每轮目标、实测结果和验证证据。
+
+## 反馈问题
+
+请从 [GitHub Issue 模板](https://github.com/yexi-by/formic/issues/new/choose)中选择最合适的
+类型：运行缺陷、功能建议或规模与性能问题。运行缺陷和性能问题应附上最小复现、退出码、
+stderr 以及经过删减的审计或统计信息；不要提交 API key、完整私有数据或未处理的模型
+上下文。
 
 ## 开源协议
 
-[AGPL-3.0](LICENSE)。Copyright (C) 2026 yexi。
+[GNU Affero General Public License v3.0](LICENSE)。Copyright (C) 2026 yexi。
