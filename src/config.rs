@@ -13,16 +13,17 @@ use serde::Deserialize;
 use crate::llm::{LlmConfig, Protocol};
 
 const CONFIG_FILE: &str = "config.toml";
-const DEFAULT_LLM_ATTEMPTS: u32 = 3;
-const DEFAULT_IDENTICAL_TOOL_CALL_LIMIT: u32 = 3;
-const DEFAULT_CONTEXT_SAFETY_TOKENS: u64 = 4096;
-const DEFAULT_MAX_RESULT_BYTES: usize = 32 * 1024;
-const DEFAULT_MAX_MATCHES: usize = 100;
-const DEFAULT_MAX_CONTEXT_LINES: usize = 20;
-const DEFAULT_CACHE_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_MCP_MAX_IN_FLIGHT: usize = 1;
-const DEFAULT_MCP_STARTUP_TIMEOUT_SEC: u64 = 30;
-const DEFAULT_MCP_TOOL_TIMEOUT_SEC: u64 = 300;
+const DEFAULT_LLM_ATTEMPTS: u32 = 5;
+const DEFAULT_IDENTICAL_TOOL_CALL_LIMIT: u32 = 16;
+const DEFAULT_CONTEXT_SAFETY_TOKENS: u64 = 2048;
+const DEFAULT_MAX_RESULT_BYTES: usize = 1024 * 1024;
+const DEFAULT_MAX_IN_FLIGHT: usize = 64;
+const DEFAULT_MAX_MATCHES: usize = 1000;
+const DEFAULT_MAX_CONTEXT_LINES: usize = 100;
+const DEFAULT_CACHE_BYTES: usize = 1024 * 1024 * 1024;
+const DEFAULT_MCP_MAX_IN_FLIGHT: usize = 64;
+const DEFAULT_MCP_STARTUP_TIMEOUT_SEC: u64 = 60;
+const DEFAULT_MCP_TOOL_TIMEOUT_SEC: u64 = 600;
 
 #[derive(Clone)]
 pub struct AppConfig {
@@ -216,7 +217,7 @@ struct FileMcpServerConfig {
     startup_timeout_sec: Option<u64>,
     tool_timeout_sec: Option<u64>,
     max_result_bytes: Option<usize>,
-    reconnect: bool,
+    reconnect: Option<bool>,
     tool_limits: BTreeMap<String, FileMcpToolLimit>,
 }
 
@@ -330,16 +331,16 @@ fn resolve(
         )));
     }
 
-    let cpu_default = std::thread::available_parallelism()
-        .map(|value| value.get())
-        .unwrap_or(1);
     let global_result = positive_or(
         file.tools.max_result_bytes,
         DEFAULT_MAX_RESULT_BYTES,
         "tools.max_result_bytes",
     )?;
-    let global_in_flight =
-        positive_or(file.tools.max_in_flight, cpu_default, "tools.max_in_flight")?;
+    let global_in_flight = positive_or(
+        file.tools.max_in_flight,
+        DEFAULT_MAX_IN_FLIGHT,
+        "tools.max_in_flight",
+    )?;
     let tools = ToolsConfig {
         max_in_flight: global_in_flight,
         search: SearchToolConfig {
@@ -579,7 +580,7 @@ fn resolve_mcp_server(
             &format!("mcp_servers.{name}.tool_timeout_sec"),
         )?),
         max_result_bytes: server_result,
-        reconnect: file.reconnect,
+        reconnect: file.reconnect.unwrap_or(true),
         tool_limits,
         transport,
     })
@@ -670,10 +671,19 @@ max_output_tokens = 16384
         assert_eq!(config.llm.api_key.as_deref(), Some("file-key"));
         assert_eq!(config.llm.model, "file-model");
         assert_eq!(config.llm.context_window_tokens, 131072);
-        assert_eq!(config.execution.llm_attempts, 3);
+        assert_eq!(config.execution.llm_attempts, 5);
+        assert_eq!(config.execution.identical_tool_call_limit, 16);
+        assert_eq!(config.execution.context_safety_tokens, 2048);
+        assert_eq!(config.tools.max_in_flight, 64);
         assert!(config.tools.search.enabled);
+        assert_eq!(config.tools.search.max_result_bytes, 1024 * 1024);
+        assert_eq!(config.tools.search.max_in_flight, 64);
+        assert_eq!(config.tools.search.max_matches, 1000);
+        assert_eq!(config.tools.search.max_context_lines, 100);
         assert!(config.tools.read.enabled);
-        assert_eq!(config.cache.max_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.tools.read.max_result_bytes, 1024 * 1024);
+        assert_eq!(config.tools.read.max_in_flight, 64);
+        assert_eq!(config.cache.max_bytes, 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -743,7 +753,24 @@ max_output_tokens = 16384
             format!("{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\nurl='http://localhost/mcp'\n");
         let config =
             load_fixture(Some(&automatic), &[("FORMIC_LLM_PROTOCOL", "responses")]).unwrap();
-        assert!(config.mcp_servers["demo"].enabled_tools.is_none());
+        let automatic = &config.mcp_servers["demo"];
+        assert!(automatic.enabled_tools.is_none());
+        assert_eq!(automatic.session_scope, SessionScope::Job);
+        assert_eq!(automatic.max_in_flight, 64);
+        assert_eq!(automatic.max_result_bytes, 1024 * 1024);
+        assert_eq!(automatic.startup_timeout, Duration::from_secs(60));
+        assert_eq!(automatic.tool_timeout, Duration::from_secs(600));
+        assert!(automatic.reconnect);
+
+        let explicit_no_reconnect = format!(
+            "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\nurl='http://localhost/mcp'\nreconnect=false\n"
+        );
+        let config = load_fixture(
+            Some(&explicit_no_reconnect),
+            &[("FORMIC_LLM_PROTOCOL", "responses")],
+        )
+        .unwrap();
+        assert!(!config.mcp_servers["demo"].reconnect);
 
         let conflict = format!(
             "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\nurl='http://localhost/mcp'\ncommand='server'\n"

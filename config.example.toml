@@ -1,5 +1,6 @@
 # 复制为当前工作目录的 config.toml 后填写。明文密钥不会进入 worker 运行档案；
 # 不要提交复制后含真实密钥的 config.toml。
+# 本示例显式写出 Formic 的高吞吐默认值。只有外部服务配额或实测资源边界要求时才降低它们。
 url = "https://api.example.com/v1"
 api_key = ""
 model = "model-name"
@@ -7,18 +8,23 @@ context_window_tokens = 131072
 max_output_tokens = 16384
 
 [execution]
-llm_attempts = 3
-identical_tool_call_limit = 3
-context_safety_tokens = 4096
+# 单次 LLM 步骤最多尝试 5 次，包括可修正的结构错误；这不是 worker 总回合数限制。
+llm_attempts = 5
+# 只阻止连续完全相同且没有进展的调用；普通工具调用总数不受此值限制。
+identical_tool_call_limit = 16
+# 在声明的模型上下文中预留 2048 tokens，超出预算前自动压缩旧工具往返。
+context_safety_tokens = 2048
 
 [tools]
-max_result_bytes = 32768
-# max_in_flight 省略时使用可用 CPU 数；也可由操作者显式设置。
+# 内置工具单次最多返回 1 MiB；UTF-8 文本超出后带明确截断标记。
+max_result_bytes = 1048576
+# 内置工具最多同时执行 64 次，窗口满时排队，不拒绝合法任务。
+max_in_flight = 64
 
 [tools.search]
 enabled = true
-max_matches = 100
-max_context_lines = 20
+max_matches = 1000
+max_context_lines = 100
 # max_result_bytes 与 max_in_flight 可覆盖 [tools]。
 
 [tools.read]
@@ -27,7 +33,8 @@ enabled = true
 
 [cache]
 enabled = true
-max_bytes = 67108864
+# 作业内 input 搜索和读取结果使用 1 GiB 内存 LRU；MCP 和 output 工具不进入缓存。
+max_bytes = 1073741824
 
 # Streamable HTTP MCP 示例。默认暴露 tools/list 发现的全部工具；需要主动筛选时才写 enabled_tools。
 [mcp_servers.http_example]
@@ -40,15 +47,17 @@ headers = { "x-client" = "formic" }
 header_env = { "x-tenant" = "EXAMPLE_TENANT" }
 tool_aliases = {}
 session_scope = "job"
-max_in_flight = 1
-startup_timeout_sec = 30
-tool_timeout_sec = 300
-max_result_bytes = 32768
-reconnect = false
+max_in_flight = 64
+startup_timeout_sec = 60
+tool_timeout_sec = 600
+max_result_bytes = 1048576
+# 只重建后续调用使用的会话，不重放已经中断的调用。
+reconnect = true
 
 [mcp_servers.http_example.tool_limits.search]
-max_in_flight = 1
-max_result_bytes = 65536
+# 单个工具可以在服务器默认值之上继续扩大。
+max_in_flight = 128
+max_result_bytes = 2097152
 
 # stdio MCP 示例。command 与 url 互斥；命令不会经过 shell 拼接。
 [mcp_servers.stdio_example]
@@ -59,9 +68,9 @@ env = { LOG_LEVEL = "warn" }
 # env_vars 的键是子进程环境变量，值是本机环境变量名；环境变量值覆盖 env。
 env_vars = { SERVICE_TOKEN = "EXAMPLE_TOKEN" }
 tool_aliases = {}
-session_scope = "unit"
-max_in_flight = 2
-startup_timeout_sec = 30
-tool_timeout_sec = 300
-max_result_bytes = 32768
-reconnect = false
+session_scope = "job"
+max_in_flight = 64
+startup_timeout_sec = 60
+tool_timeout_sec = 600
+max_result_bytes = 1048576
+reconnect = true
