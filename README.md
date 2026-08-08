@@ -148,16 +148,30 @@ formic run \
 
 ### LLM 配置
 
+Formic 启动时读取当前工作目录下的 `config.toml`。复制
+[`config.example.toml`](config.example.toml) 后填写：
+
+```toml
+url = "https://api.openai.com/v1"
+api_key = "sk-..."
+model = "gpt-5"
+```
+
+`url` 和 `model` 必填，`api_key` 可留空。`config.toml` 中的 API key 是明文，文件已被
+`.gitignore` 排除；不要强制提交它，也不要把 key 写入任务文件或计划文件。
+
+环境变量仍然可用。非空环境变量按字段覆盖 `config.toml`，因此可以只覆盖其中一项：
+
 | 环境变量 | 必填 | 含义 |
 | --- | --- | --- |
-| `FORMIC_LLM_PROTOCOL` | 是 | API 协议形状：`completions`、`responses` 或 `anthropic` |
-| `FORMIC_LLM_BASE_URL` | 是 | API 基础地址，例如 `https://api.openai.com/v1` |
-| `FORMIC_LLM_MODEL` | 是 | 供应商接受的模型名 |
-| `FORMIC_LLM_API_KEY` | 否 | 设置后按所选协议附带认证头 |
+| `FORMIC_LLM_PROTOCOL` | 是 | API 协议形状：`completions`、`responses` 或 `anthropic`；只从环境变量读取 |
+| `FORMIC_LLM_BASE_URL` | 否 | 覆盖 `config.toml` 的 `url` |
+| `FORMIC_LLM_MODEL` | 否 | 覆盖 `config.toml` 的 `model` |
+| `FORMIC_LLM_API_KEY` | 否 | 覆盖 `config.toml` 的 `api_key` |
 | `FORMIC_METRICS` | 否 | 设为 `1` 时，每 250 ms 向 stderr 输出运行指标 |
 
-缺少必填配置时，Formic 会在读取作业前明确失败。不要把 API key 写入任务文件、计划
-文件或版本库。
+没有 `config.toml` 时，原有的纯环境变量配置仍然有效。缺少必填配置时，Formic 会在读取
+作业前明确失败。
 
 ### 分片计划
 

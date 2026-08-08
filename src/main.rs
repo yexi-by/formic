@@ -1,5 +1,5 @@
-//! 入口：CLI 解析、环境变量读取、错误的人性化呈现。
-//! 退出码：0 全部成功；1 存在失败单元；2 启动失败（参数、输入、环境）。
+//! 入口：CLI 解析、启动配置读取、错误的人性化呈现。
+//! 退出码：0 全部成功；1 存在失败单元；2 启动失败（参数、输入、配置或环境）。
 
 use std::env;
 use std::fs;
@@ -13,6 +13,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+mod config;
 mod llm;
 mod metrics;
 mod output;
@@ -23,7 +24,7 @@ mod tokenize;
 mod tools;
 mod worker;
 
-use llm::{LlmClient, LlmConfig, Protocol};
+use llm::LlmClient;
 use output::Summary;
 
 /// 任务说明的大小上限（结构校验的一部分，语义边界见 design.md §3）。
@@ -66,8 +67,8 @@ struct RunArgs {
 
 #[derive(thiserror::Error, Debug)]
 enum StartupError {
-    #[error("{0}")]
-    Env(String),
+    #[error(transparent)]
+    Config(#[from] config::ConfigError),
     #[error("数据目录 {0} 不存在或不是目录")]
     DataRoot(PathBuf),
     #[error("任务说明 {path} 无法读取：{source}")]
@@ -110,7 +111,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: RunArgs) -> Result<u8, StartupError> {
-    let config = llm_config_from_env().map_err(StartupError::Env)?;
+    let config = config::load()?;
 
     if args.concurrency == 0 {
         return Err(StartupError::ConcurrencyZero);
@@ -245,30 +246,6 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
     } else {
         Ok(summary.exit_code())
     }
-}
-
-fn llm_config_from_env() -> Result<LlmConfig, String> {
-    let required = |name: &str, hint: &str| {
-        env::var(name)
-            .ok()
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| format!("缺少环境变量 {name}：{hint}"))
-    };
-    let protocol = Protocol::parse(&required(
-        "FORMIC_LLM_PROTOCOL",
-        "指定 API 协议形状：completions / responses / anthropic",
-    )?)?;
-    Ok(LlmConfig {
-        protocol,
-        base_url: required(
-            "FORMIC_LLM_BASE_URL",
-            "API 基础地址，如 https://api.openai.com/v1",
-        )?,
-        model: required("FORMIC_LLM_MODEL", "要调用的模型名")?,
-        api_key: env::var("FORMIC_LLM_API_KEY")
-            .ok()
-            .filter(|v| !v.is_empty()),
-    })
 }
 
 fn read_task(path: &PathBuf) -> Result<String, StartupError> {

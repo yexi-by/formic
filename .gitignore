@@ -9,6 +9,7 @@
 /scale-metrics.csv
 
 # 本地密钥与环境配置
+/config.toml
 .env
 .env.*
 !.env.example

@@ -1,0 +1,4 @@
+# 复制为 config.toml 后填写。config.toml 保存明文 API key，请勿提交到版本库。
+url = "https://api.openai.com/v1"
+api_key = ""
+model = "gpt-5"

@@ -105,6 +105,7 @@ fn tool_result_marker(path: &str) -> &'static str {
 struct Recorded {
     path: String,
     body: String,
+    authorization: Option<String>,
 }
 
 struct MockServer {
@@ -174,6 +175,7 @@ fn handle_conn(
         .to_string();
 
     let mut content_length = 0usize;
+    let mut authorization = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).is_err() {
@@ -183,9 +185,12 @@ fn handle_conn(
         if trimmed.is_empty() {
             break;
         }
-        let lower = trimmed.to_ascii_lowercase();
-        if let Some(value) = lower.strip_prefix("content-length:") {
-            content_length = value.trim().parse().unwrap_or(0);
+        if let Some((name, value)) = trimmed.split_once(':') {
+            match name.to_ascii_lowercase().as_str() {
+                "content-length" => content_length = value.trim().parse().unwrap_or(0),
+                "authorization" => authorization = Some(value.trim().to_string()),
+                _ => {}
+            }
         }
     }
     let mut body = vec![0u8; content_length];
@@ -196,6 +201,7 @@ fn handle_conn(
     requests.lock().unwrap().push(Recorded {
         path: path.clone(),
         body: body_text.clone(),
+        authorization,
     });
 
     let (status, response_body) = if body_text.contains(FAIL_MARKER) {
@@ -258,7 +264,24 @@ fn run_formic(
     task: &Path,
     out: &Path,
 ) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_formic"))
+    let mut command = formic_command(concurrency, data, plan, task, out);
+    command
+        .env("FORMIC_LLM_PROTOCOL", protocol)
+        .env("FORMIC_LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
+        .env("FORMIC_LLM_MODEL", "test-model")
+        .env_remove("FORMIC_LLM_API_KEY");
+    command.output().unwrap()
+}
+
+fn formic_command(
+    concurrency: usize,
+    data: &Path,
+    plan: &Path,
+    task: &Path,
+    out: &Path,
+) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_formic"));
+    command
         .arg("run")
         .arg("--data")
         .arg(data)
@@ -269,13 +292,8 @@ fn run_formic(
         .arg("--out")
         .arg(out)
         .arg("--concurrency")
-        .arg(concurrency.to_string())
-        .env("FORMIC_LLM_PROTOCOL", protocol)
-        .env("FORMIC_LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .output()
-        .unwrap()
+        .arg(concurrency.to_string());
+    command
 }
 
 fn stdout_of(output: &Output) -> String {
@@ -411,6 +429,58 @@ fn responses_success() {
 #[test]
 fn anthropic_success() {
     assert_success("anthropic", "/messages");
+}
+
+#[test]
+fn config_file_supplies_http_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_job(dir.path(), None);
+    let mock = start_mock();
+    fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "url = \"http://127.0.0.1:{}/v1\"\napi_key = \"config-key\"\nmodel = \"config-model\"\n",
+            mock.port
+        ),
+    )
+    .unwrap();
+
+    let mut command = formic_command(2, &data, &plan, &task, &out);
+    let output = command
+        .current_dir(dir.path())
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env_remove("FORMIC_LLM_BASE_URL")
+        .env_remove("FORMIC_LLM_API_KEY")
+        .env_remove("FORMIC_LLM_MODEL")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "config.toml 应能完成真实调用：{}",
+        stderr_of(&output)
+    );
+    let requests = mock.requests.lock().unwrap();
+    assert!(!requests.is_empty());
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.path.ends_with("/v1/chat/completions")),
+        "请求应使用 config.toml 的 url"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.body.contains("\"model\":\"config-model\"")),
+        "请求应使用 config.toml 的 model"
+    );
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.authorization.as_deref() == Some("Bearer config-key")),
+        "请求应使用 config.toml 的明文 api_key"
+    );
 }
 
 #[test]

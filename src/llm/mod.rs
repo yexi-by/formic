@@ -111,7 +111,7 @@ pub struct LlmClient {
     config: LlmConfig,
 }
 
-/// LLM 调用配置，来源是环境变量（部署选择），缺失必填项在启动时明确失败。
+/// LLM 调用配置，由启动边界合并环境变量和配置文件，缺失必填项时明确失败。
 #[derive(Debug, Clone)]
 pub struct LlmConfig {
     pub protocol: Protocol,
