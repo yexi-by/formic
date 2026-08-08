@@ -1,0 +1,98 @@
+name: 运行缺陷
+description: 报告可复现的 Formic 错误、异常退出或错误结果
+title: "[缺陷] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢你帮助改进 Formic。请提供能够重现问题的最小输入，并删除 API key、私有数据和不必要的模型上下文。审计文件包含完整请求与响应，上传前必须检查并删减敏感内容。
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: 问题概述
+      description: 用几句话说明发生了什么，以及它对作业结果造成了什么影响。
+      placeholder: 例如：一个单元成功发布后，stats.jsonl 中缺少对应记录。
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+      description: 说明你认为 Formic 应该产生的结果、诊断或退出码。
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 最小复现步骤
+      description: 提供最小数据、plan.jsonl、task.md 和执行命令。请用占位符替代密钥和私有地址。
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: revision
+    attributes:
+      label: Formic 版本或 commit
+      description: 填写发布版本，或执行 `git rev-parse --short HEAD` 得到当前 commit。
+      placeholder: 0.1.0 或 784ffc3
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 操作系统、CPU 架构和 Rust 版本；使用预编译程序时可省略 Rust 版本。
+      placeholder: Windows 11 x86_64，rustc 1.85.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: protocol
+    attributes:
+      label: LLM 协议
+      options:
+        - completions
+        - responses
+        - anthropic
+        - 与 LLM 调用无关
+    validations:
+      required: true
+
+  - type: input
+    id: workload
+    attributes:
+      label: 作业规模
+      description: 给出计划单元数、`--concurrency` 和典型分片大小。
+      placeholder: 100 个单元，并发 20，每个分片约 50 KiB
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 实际结果与诊断
+      description: 附上退出码、stderr、相关 stats 行，以及能够说明问题且已删减敏感内容的 audit 片段。
+      placeholder: |
+        退出码：1
+        stderr：……
+        stats：……
+        audit：……
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前检查
+      options:
+        - label: 我已确认最小复现中没有 API key、私有数据或未经处理的完整模型上下文。
+          required: true
+        - label: 我已搜索现有 Issue，没有找到同一问题。
+          required: true

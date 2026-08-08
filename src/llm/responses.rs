@@ -2,7 +2,7 @@
 //! 工具调用的完整参数在 response.output_item.done 事件上取，无需增量组装。
 //! 事件类型是开放集合，未识别的一律忽略；失败类事件显式报错。
 
-use super::{Finish, LlmConfig, LlmError, LlmEvent, Message, ToolCallReq, ToolSpec};
+use super::{Finish, LlmConfig, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq, ToolSpec};
 
 pub fn build_request(
     config: &LlmConfig,
@@ -18,6 +18,13 @@ pub fn build_request(
                     "type": "message",
                     "role": "user",
                     "content": [{"type": "input_text", "text": text}],
+                }));
+            }
+            Message::Compaction(text) => {
+                input.push(serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": format!("此前历史的已验证压缩摘要：\n{text}")}],
                 }));
             }
             Message::Assistant { text, tool_calls } => {
@@ -48,6 +55,7 @@ pub fn build_request(
     }
     let mut body = serde_json::json!({
         "model": config.model,
+        "max_output_tokens": config.max_output_tokens,
         "stream": true,
         "instructions": instructions,
         "input": input,
@@ -81,6 +89,7 @@ pub fn build_request(
 #[derive(Default)]
 pub struct Transform {
     saw_tool_call: bool,
+    saw_refusal: bool,
 }
 
 impl Transform {
@@ -104,6 +113,10 @@ impl super::Transform for Transform {
                     .into_iter()
                     .collect())
             }
+            "response.refusal.delta" => {
+                self.saw_refusal = true;
+                Ok(Vec::new())
+            }
             "response.output_item.done" => {
                 if v["item"]["type"].as_str() == Some("function_call") {
                     self.saw_tool_call = true;
@@ -119,16 +132,29 @@ impl super::Transform for Transform {
                             .to_string(),
                     })])
                 } else {
+                    if v["item"]["type"].as_str() == Some("refusal") {
+                        self.saw_refusal = true;
+                    }
                     Ok(Vec::new())
                 }
             }
-            "response.completed" => Ok(vec![LlmEvent::Finished(if self.saw_tool_call {
-                Finish::ToolUse
-            } else {
-                Finish::Stop
-            })]),
+            "response.completed" => {
+                let mut events = response_usage(&v)
+                    .into_iter()
+                    .map(LlmEvent::Usage)
+                    .collect::<Vec<_>>();
+                events.push(LlmEvent::Finished(if self.saw_refusal {
+                    Finish::Refusal
+                } else if self.saw_tool_call {
+                    Finish::ToolUse
+                } else {
+                    Finish::Stop
+                }));
+                Ok(events)
+            }
             "response.incomplete" => match v["response"]["incomplete_details"]["reason"].as_str() {
                 Some("max_output_tokens") => Ok(vec![LlmEvent::Finished(Finish::MaxTokens)]),
+                Some("content_filter") => Ok(vec![LlmEvent::Finished(Finish::Refusal)]),
                 other => Err(LlmError::protocol(
                     format!("响应未完成，原因 {other:?}"),
                     payload,
@@ -138,6 +164,24 @@ impl super::Transform for Transform {
             _ => Ok(Vec::new()),
         }
     }
+}
+
+fn response_usage(value: &serde_json::Value) -> Option<ProviderUsage> {
+    let usage = value.pointer("/response/usage")?;
+    Some(ProviderUsage {
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64),
+        cache_read_tokens: usage
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(serde_json::Value::as_u64),
+        cache_creation_tokens: usage
+            .pointer("/input_tokens_details/cache_creation_tokens")
+            .and_then(serde_json::Value::as_u64),
+    })
 }
 
 #[cfg(test)]
@@ -204,12 +248,42 @@ mod tests {
     }
 
     #[test]
+    fn completed_usage_and_refusal_are_distinct() {
+        let mut usage = Transform::new();
+        let events = usage
+            .push("{\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":2,\"input_tokens_details\":{\"cached_tokens\":7,\"cache_creation_tokens\":1}}}}")
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::Usage(ProviderUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    cache_read_tokens: Some(7),
+                    cache_creation_tokens: Some(1),
+                }),
+                LlmEvent::Finished(Finish::Stop),
+            ]
+        );
+        let mut refusal = Transform::new();
+        refusal
+            .push("{\"type\":\"response.refusal.delta\",\"delta\":\"no\"}")
+            .unwrap();
+        let events = refusal
+            .push("{\"type\":\"response.completed\",\"response\":{}}")
+            .unwrap();
+        assert_eq!(events, vec![LlmEvent::Finished(Finish::Refusal)]);
+    }
+
+    #[test]
     fn history_maps_to_input_items() {
         let config = LlmConfig {
             protocol: super::super::Protocol::Responses,
             base_url: "http://x/v1".into(),
             model: "m".into(),
             api_key: None,
+            context_window_tokens: 131072,
+            max_output_tokens: 16384,
         };
         let history = vec![
             Message::User("任务".into()),

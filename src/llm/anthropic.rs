@@ -1,11 +1,8 @@
 //! Anthropic Messages 协议：历史 → 请求映射，SSE → 内部事件 transform。
 //! 工具调用的参数以 input_json_delta 增量到达，content_block_stop 时拼好放出。
-//! max_tokens 是该协议的必填字段，属于内部参数，由代码固定（AGENTS.md §7）。
+//! max_tokens 是该协议的必填字段，使用已校验的模型配置。
 
-use super::{Finish, LlmConfig, LlmError, LlmEvent, Message, ToolCallReq, ToolSpec};
-
-/// 协议必填的输出上限；单元产出超过它即判截断失败，不作为调用方配置项。
-const MAX_OUTPUT_TOKENS: u32 = 16384;
+use super::{Finish, LlmConfig, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq, ToolSpec};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -20,6 +17,12 @@ pub fn build_request(
         match message {
             Message::User(text) => {
                 messages.push(serde_json::json!({"role": "user", "content": text}));
+            }
+            Message::Compaction(text) => {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!("此前历史的已验证压缩摘要：\n{text}"),
+                }));
             }
             Message::Assistant { text, tool_calls } => {
                 let mut content = Vec::new();
@@ -61,7 +64,7 @@ pub fn build_request(
     }
     let mut body = serde_json::json!({
         "model": config.model,
-        "max_tokens": MAX_OUTPUT_TOKENS,
+        "max_tokens": config.max_output_tokens,
         "stream": true,
         "system": instructions,
         "messages": messages,
@@ -112,6 +115,10 @@ impl super::Transform for Transform {
             .as_str()
             .ok_or_else(|| LlmError::protocol("缺少 type 字段", payload))?;
         match ty {
+            "message_start" => Ok(usage_at(&v["message"]["usage"])
+                .map(LlmEvent::Usage)
+                .into_iter()
+                .collect()),
             "content_block_start" => {
                 if v["content_block"]["type"].as_str() == Some("tool_use") {
                     self.pending_tool = Some((
@@ -156,16 +163,42 @@ impl super::Transform for Transform {
                 }
                 None => Vec::new(),
             }),
-            "message_delta" => match v["delta"]["stop_reason"].as_str() {
-                Some("end_turn") => Ok(vec![LlmEvent::Finished(Finish::Stop)]),
-                Some("max_tokens") => Ok(vec![LlmEvent::Finished(Finish::MaxTokens)]),
-                Some("tool_use") => Ok(vec![LlmEvent::Finished(Finish::ToolUse)]),
-                _ => Ok(Vec::new()),
-            },
+            "message_delta" => {
+                let mut events = usage_at(&v["usage"])
+                    .map(LlmEvent::Usage)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                let finish = match v["delta"]["stop_reason"].as_str() {
+                    Some("end_turn") => Some(Finish::Stop),
+                    Some("max_tokens") => Some(Finish::MaxTokens),
+                    Some("tool_use") => Some(Finish::ToolUse),
+                    Some("refusal") => Some(Finish::Refusal),
+                    _ => None,
+                };
+                events.extend(finish.map(LlmEvent::Finished));
+                Ok(events)
+            }
             "error" => Err(LlmError::protocol("错误事件", payload)),
             _ => Ok(Vec::new()), // message_start / message_stop / ping 等
         }
     }
+}
+
+fn usage_at(usage: &serde_json::Value) -> Option<ProviderUsage> {
+    usage.is_object().then(|| ProviderUsage {
+        input_tokens: usage
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_u64),
+        output_tokens: usage
+            .get("output_tokens")
+            .and_then(serde_json::Value::as_u64),
+        cache_read_tokens: usage
+            .get("cache_read_input_tokens")
+            .and_then(serde_json::Value::as_u64),
+        cache_creation_tokens: usage
+            .get("cache_creation_input_tokens")
+            .and_then(serde_json::Value::as_u64),
+    })
 }
 
 #[cfg(test)]
@@ -200,8 +233,20 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                LlmEvent::Usage(ProviderUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(1),
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                }),
                 LlmEvent::TextDelta("你好".into()),
                 LlmEvent::TextDelta("世界".into()),
+                LlmEvent::Usage(ProviderUsage {
+                    input_tokens: None,
+                    output_tokens: Some(5),
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                }),
                 LlmEvent::Finished(Finish::Stop),
             ]
         );
@@ -229,7 +274,27 @@ mod tests {
         let events = t
             .push("{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"},\"usage\":{\"output_tokens\":9}}")
             .unwrap();
-        assert_eq!(events, vec![LlmEvent::Finished(Finish::MaxTokens)]);
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::Usage(ProviderUsage {
+                    input_tokens: None,
+                    output_tokens: Some(9),
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                }),
+                LlmEvent::Finished(Finish::MaxTokens)
+            ]
+        );
+    }
+
+    #[test]
+    fn refusal_stop_is_not_reported_as_empty_output() {
+        let mut transform = Transform::new();
+        let events = transform
+            .push("{\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"refusal\"}}")
+            .unwrap();
+        assert_eq!(events, vec![LlmEvent::Finished(Finish::Refusal)]);
     }
 
     #[test]
@@ -239,6 +304,8 @@ mod tests {
             base_url: "http://x".into(),
             model: "m".into(),
             api_key: None,
+            context_window_tokens: 131072,
+            max_output_tokens: 16384,
         };
         let history = vec![
             Message::User("任务".into()),

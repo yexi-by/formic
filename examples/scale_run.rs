@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -33,6 +32,7 @@ fn main() {
     let stderr_file = dir.path().join("formic-stderr.log");
     let started = Instant::now();
     let mut child = Command::new(&formic)
+        .current_dir(dir.path())
         .arg("run")
         .arg("--data")
         .arg(&data)
@@ -50,8 +50,15 @@ fn main() {
             format!("http://127.0.0.1:{}/v1", mock.port),
         )
         .env("FORMIC_LLM_MODEL", "scale-model")
+        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .env("FORMIC_LLM_MAX_OUTPUT_TOKENS", "16384")
         .env("FORMIC_METRICS", "1")
         .env_remove("FORMIC_LLM_API_KEY")
+        // 本地 mock 必须直连，避免开发机代理把规模实验变成代理压力测试。
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env_remove("HTTP_PROXY")
+        .env_remove("HTTPS_PROXY")
+        .env_remove("ALL_PROXY")
         .stdout(Stdio::inherit())
         .stderr(Stdio::from(fs::File::create(&stderr_file).unwrap()))
         .spawn()
@@ -77,6 +84,7 @@ fn main() {
     };
     let done = samples.last().map(|s| s["done"]).unwrap_or(0);
     let failed = samples.last().map(|s| s["failed"]).unwrap_or(0);
+    let observations = count_worker_reports(&out);
 
     println!("\n==== 规模实验汇总 ====");
     println!(
@@ -99,15 +107,69 @@ fn main() {
         "mock 处理请求总数：{}",
         mock.total_requests.load(Ordering::SeqCst)
     );
+    println!(
+        "worker 档案：任务目录 {}，Markdown {}，重复或临时文件 {}",
+        observations.run_directories, observations.markdown, observations.unexpected
+    );
     println!("指标序列：scale-metrics.csv");
+    if !status.success()
+        || done != units
+        || failed != 0
+        || observations.run_directories != 1
+        || observations.markdown != units
+        || observations.unexpected != 0
+    {
+        let diagnostic = Path::new("scale-stderr.log");
+        fs::copy(&stderr_file, diagnostic).ok();
+        eprintln!(
+            "规模实验失败：Formic 未完成全部单元；完整 stderr 已复制到 {}",
+            diagnostic.display()
+        );
+        std::process::exit(1);
+    }
+}
+
+#[derive(Default)]
+struct ObservationCounts {
+    run_directories: u64,
+    markdown: u64,
+    unexpected: u64,
+}
+
+fn count_worker_reports(out: &Path) -> ObservationCounts {
+    let mut counts = ObservationCounts::default();
+    let Ok(entries) = fs::read_dir(out.join("workers")) else {
+        return counts;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            counts.unexpected += 1;
+            continue;
+        }
+        counts.run_directories += 1;
+        let Ok(files) = fs::read_dir(path) else {
+            counts.unexpected += 1;
+            continue;
+        };
+        for file in files.flatten() {
+            let path = file.path();
+            if path.is_file() && path.extension().is_some_and(|extension| extension == "md") {
+                counts.markdown += 1;
+            } else {
+                counts.unexpected += 1;
+            }
+        }
+    }
+    counts
 }
 
 fn write_job(dir: &Path, units: u64) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let data = dir.join("data");
     fs::create_dir_all(&data).unwrap();
-    // 苹果行：单行 ~200B，前 100 行命中（匹配数上限）→ 每次 search ~20KB，不截断
+    // 苹果行：单行约 200B、共 80 行，低于默认匹配上限；完整 input 结果可进入作业缓存。
     let filler = "规".repeat(180);
-    let apples: String = (1..=250)
+    let apples: String = (1..=80)
         .map(|i| format!("第 {i} 行 苹果 {filler}\n"))
         .collect();
     fs::write(data.join("apples.txt"), apples).unwrap();
@@ -132,10 +194,29 @@ fn write_job(dir: &Path, units: u64) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     (data, plan, task, out)
 }
 
-/// 定位同 profile 构建的 formic 二进制（examples 与主 bin 同目录层级）。
+/// 先按 example 当前 profile 构建主程序，再定位同目录二进制。Cargo 运行 example
+/// 时不会自动重建 bin；缺少这一步会把旧二进制误当成当前实现参与实验。
 fn formic_binary() -> PathBuf {
     let exe = std::env::current_exe().unwrap();
     let profile_dir = exe.parent().and_then(|p| p.parent()).unwrap();
+    let profile_directory = profile_dir.file_name().unwrap().to_string_lossy();
+    let mut build = Command::new("cargo");
+    build
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .arg("build")
+        .arg("--bin")
+        .arg("formic");
+    match profile_directory.as_ref() {
+        "debug" => {}
+        "release" => {
+            build.arg("--release");
+        }
+        profile => {
+            build.arg("--profile").arg(profile);
+        }
+    }
+    let status = build.status().expect("无法调用 cargo 构建 formic");
+    assert!(status.success(), "构建 formic 主程序失败");
     profile_dir.join(if cfg!(windows) {
         "formic.exe"
     } else {
@@ -150,15 +231,24 @@ struct ScaleMock {
 
 fn start_scale_mock(turns: usize, delay_ms: u64) -> ScaleMock {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
     let total = Arc::new(AtomicUsize::new(0));
     let shared = Arc::clone(&total);
     thread::spawn(move || {
-        for stream in listener.incoming() {
-            let Ok(stream) = stream else { break };
-            shared.fetch_add(1, Ordering::SeqCst);
-            thread::spawn(move || handle(stream, turns, delay_ms));
-        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(handle(stream, turns, delay_ms, Arc::clone(&shared)));
+            }
+        });
     });
     ScaleMock {
         port,
@@ -184,47 +274,75 @@ const FINAL_SSE: &str = concat!(
     "data: [DONE]\n\n",
 );
 
-fn handle(mut stream: std::net::TcpStream, turns: usize, delay_ms: u64) {
-    let mut reader = BufReader::new(stream.try_clone().unwrap());
-    let mut request_line = String::new();
-    if reader.read_line(&mut request_line).is_err() {
-        return;
-    }
-    let mut content_length = 0usize;
+async fn handle(
+    stream: tokio::net::TcpStream,
+    turns: usize,
+    delay_ms: u64,
+    total_requests: Arc<AtomicUsize>,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    let (reader, mut writer) = stream.into_split();
+    let mut reader = tokio::io::BufReader::new(reader);
     loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line).is_err() {
+        let mut request_line = String::new();
+        match reader.read_line(&mut request_line).await {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+
+        let mut content_length = 0usize;
+        let mut close_requested = false;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                break;
+            }
+            let lower = trimmed.to_ascii_lowercase();
+            if let Some(value) = lower.strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap_or(0);
+            } else if let Some(value) = lower.strip_prefix("connection:") {
+                close_requested = value.trim() == "close";
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        if reader.read_exact(&mut body).await.is_err() {
             return;
         }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            break;
+        total_requests.fetch_add(1, Ordering::SeqCst);
+
+        let body_text = String::from_utf8_lossy(&body);
+        // 已完成回合数 = 请求体里 tool 结果消息数
+        let k = body_text.matches("\"role\":\"tool\"").count();
+        let sse = if k < turns {
+            tool_call_sse(k)
+        } else {
+            FINAL_SSE.to_string()
+        };
+        let connection = if close_requested {
+            "close"
+        } else {
+            "keep-alive"
+        };
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: {connection}\r\n\r\n{sse}",
+            sse.len()
+        );
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
         }
-        let lower = trimmed.to_ascii_lowercase();
-        if let Some(value) = lower.strip_prefix("content-length:") {
-            content_length = value.trim().parse().unwrap_or(0);
+        if writer.write_all(response.as_bytes()).await.is_err() || writer.flush().await.is_err() {
+            return;
+        }
+        if close_requested {
+            return;
         }
     }
-    let mut body = vec![0u8; content_length];
-    if reader.read_exact(&mut body).is_err() {
-        return;
-    }
-    let body_text = String::from_utf8_lossy(&body);
-    // 已完成回合数 = 请求体里 tool 结果消息数
-    let k = body_text.matches("\"role\":\"tool\"").count();
-    let sse = if k < turns {
-        tool_call_sse(k)
-    } else {
-        FINAL_SSE.to_string()
-    };
-    let response = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
-        sse.len()
-    );
-    if delay_ms > 0 {
-        thread::sleep(std::time::Duration::from_millis(delay_ms));
-    }
-    stream.write_all(response.as_bytes()).ok();
 }
 
 fn parse_metrics(path: &Path) -> Vec<HashMap<String, u64>> {

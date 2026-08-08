@@ -6,16 +6,37 @@
 
 use std::path::Path;
 
-/// 系统提示词：Formic 拥有的静态文本，全 worker 字节一致、作业内不改。
-/// 只含批处理特有的行为约束；输出格式的语义要求由调用方写进任务说明，不进内核。
-pub const INSTRUCTIONS: &str = "\
+/// 文本模式系统提示词：Formic 拥有的静态文本，全 worker 字节一致、作业内不改。
+const TEXT_INSTRUCTIONS: &str = "\
 你是一次性自主执行单元，独立完成分配给你的数据单元。没有人在场回答你的问题：\
 不要提问、不要请示，根据任务说明自行判断；无法取得进展时说明原因并停止，不要重复相同操作。
 
-你可以使用 search 工具在两棵只读根内检索：input 是整个输入数据集，output 是已完成单元的产出记录。\
-搜索结果有大小上限，截断时会显式标记。不要重复发起相同的搜索。
+你可以使用请求中列出的内置只读工具和外部 MCP 工具。内置工具的 input 指整个输入数据集，\
+output 指当前输出模式下已完成单元的数字编号记录。工具结果有大小上限，截断或错误会显式说明。\
+不要无进展地重复相同调用。
 
 你的最后一条消息就是你的产出，运行时原样持久化。完成交付后立即停止。";
+
+/// 结构化模式把最终结果交给内部终止工具，不把普通最终文本误当成完成事实。
+const STRUCTURED_INSTRUCTIONS: &str = "\
+你是一次性自主执行单元，独立完成分配给你的数据单元。没有人在场回答你的问题：\
+不要提问、不要请示，根据任务说明自行判断；无法取得进展时说明原因并停止，不要重复相同操作。
+
+你可以使用请求中列出的内置只读工具和外部 MCP 工具。内置工具的 input 指整个输入数据集，\
+output 指当前输出模式下已完成单元的数字编号记录。工具结果有大小上限，截断或错误会显式说明。\
+不要无进展地重复相同调用。
+
+完成后必须单独调用 formic_submit_result 提交最终对象；提交回合不能包含文本或其他工具调用。\
+普通最终文本不会成为完成记录。提交成功后立即停止。";
+
+/// 返回本作业冻结的系统提示词。
+pub fn instructions(structured: bool) -> &'static str {
+    if structured {
+        STRUCTURED_INSTRUCTIONS
+    } else {
+        TEXT_INSTRUCTIONS
+    }
+}
 
 /// 已读出的分片内容，路径均为面向模型的根内相对表示。
 pub enum ShardContent {
@@ -135,5 +156,13 @@ mod tests {
     fn slash_path_uses_forward_slashes() {
         let p = Path::new("dir").join("sub").join("f.txt");
         assert_eq!(slash_path(&p), "dir/sub/f.txt");
+    }
+
+    #[test]
+    fn output_mode_has_unambiguous_completion_contract() {
+        assert!(instructions(false).contains("最后一条消息"));
+        assert!(!instructions(false).contains("formic_submit_result"));
+        assert!(instructions(true).contains("必须单独调用 formic_submit_result"));
+        assert!(instructions(true).contains("普通最终文本不会成为完成记录"));
     }
 }

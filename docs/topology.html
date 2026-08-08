@@ -1,157 +1,57 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Formic 模块拓扑</title>
-<style>
-  :root {
-    --verified: #1a7f37;
-    --verified-bg: #f0fff4;
-    --candidate: #6b7280;
-    --candidate-bg: #fafafa;
-    --ink: #1f2328;
-  }
-  body { font-family: "Segoe UI", "Microsoft YaHei", sans-serif; color: var(--ink);
-         max-width: 1080px; margin: 2rem auto; padding: 0 1rem; line-height: 1.6; }
-  h1 { font-size: 1.5rem; }
-  h2 { font-size: 1.1rem; margin-top: 2rem; border-bottom: 2px solid #e5e7eb; padding-bottom: .3rem; }
-  .legend { display: flex; gap: 1.5rem; margin: 1rem 0; font-size: .9rem; }
-  .legend span::before { content: ""; display: inline-block; width: .9rem; height: .9rem;
-         border-radius: 3px; margin-right: .4rem; vertical-align: -0.1rem; }
-  .legend .v::before { background: var(--verified-bg); border: 2px solid var(--verified); }
-  .legend .c::before { background: var(--candidate-bg); border: 2px dashed var(--candidate); }
-  .flow { display: flex; flex-wrap: wrap; gap: .6rem; align-items: stretch; margin: 1rem 0; }
-  .node { border-radius: 8px; padding: .6rem .8rem; max-width: 15rem; font-size: .88rem; }
-  .node .name { font-weight: 600; }
-  .node .owner { font-family: Consolas, monospace; font-size: .78rem; opacity: .75; }
-  .node .duty { margin-top: .25rem; }
-  .verified { border: 2px solid var(--verified); background: var(--verified-bg); }
-  .candidate { border: 2px dashed var(--candidate); background: var(--candidate-bg); }
-  .arrow { align-self: center; font-size: 1.2rem; color: #9ca3af; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(15rem, 1fr)); gap: .8rem; margin: 1rem 0; }
-  .note { font-size: .85rem; color: #6b7280; }
-  footer { margin-top: 2.5rem; font-size: .82rem; color: #9ca3af; }
-</style>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Formic 当前模块拓扑</title>
+  <style>
+    body{font:15px/1.6 system-ui,"Microsoft YaHei",sans-serif;max-width:1100px;margin:32px auto;padding:0 20px;color:#20242a}
+    h1{font-size:24px} h2{font-size:18px;margin-top:30px}.row{display:flex;flex-wrap:wrap;gap:10px;align-items:stretch}
+    .box{border:1px solid #9bb7a5;background:#f2fff6;border-radius:8px;padding:10px 12px;max-width:250px}.box b{display:block}.box code{font-size:12px;color:#52605a}
+    .arrow{align-self:center;color:#718096;font-size:20px}.note{color:#5f6b66}.internal{border-color:#9aa8c5;background:#f5f7ff}
+  </style>
 </head>
 <body>
+<h1>Formic 当前模块拓扑</h1>
+<p class="note">只表示已经实现的职责和依赖方向；字段与错误语义以代码和测试为准。</p>
+<p class="note">Formic 负责独立单元执行；调用方负责分片规划和跨单元汇总。完整 input 可用于核实当前单元，不用于 worker 间协调。</p>
 
-<h1>Formic 模块拓扑</h1>
-<p class="note">只表达职责归属与依赖方向；接口细节以代码为准。实线 = 已实现并验证；
-虚线 = 候选（design.md，未经实现验证）。与代码冲突的一方按现行契约修正。</p>
-
-<div class="legend">
-  <span class="v">已验证实现</span>
-  <span class="c">候选（未实现）</span>
-</div>
-
-<h2>调用方 → 作业</h2>
-<div class="flow">
-  <div class="node verified">
-    <div class="name">调用方（人 / 上游 Agent / CI）</div>
-    <div class="duty">给文件、等结果、看目录；分片规划与结果汇总是它的权责</div>
-  </div>
+<h2>作业入口</h2>
+<div class="row">
+  <div class="box"><b>CLI 与固定配置</b><code>src/main.rs · src/config.rs</code><br>读取当前目录 config.toml、合并环境变量、校验计划与输出模式。</div>
   <div class="arrow">→</div>
-  <div class="node verified">
-    <div class="name">CLI 入口</div>
-    <div class="owner">src/main.rs</div>
-    <div class="duty">参数、环境变量、错误呈现、退出码（0/1/2）</div>
-  </div>
-</div>
-
-<h2>worker 内核（第 1–5 轮，已验证）</h2>
-<div class="flow">
-  <div class="node verified">
-    <div class="name">计划</div>
-    <div class="owner">src/plan.rs</div>
-    <div class="duty">JSONL 解析与校验：单元号、根内路径、分片非空</div>
-  </div>
+  <div class="box"><b>活动 worker 窗口</b><code>src/main.rs</code><br>取得 --concurrency 许可后才创建 task；总单元量不设上限。</div>
   <div class="arrow">→</div>
-  <div class="node verified">
-    <div class="name">并发窗口 <span class="note">第 3 轮</span></div>
-    <div class="owner">src/main.rs</div>
-    <div class="duty">每单元一个 tokio task；槽位有界、总量无界；acquire-then-spawn；panic 隔离</div>
-  </div>
+  <div class="box"><b>单元循环</b><code>src/worker.rs</code><br>LLM ↔ 工具，多轮直到文本完成、结构化提交、取消或失败。</div>
+</div>
+
+<h2>模型与上下文</h2>
+<div class="row">
+  <div class="box"><b>稳定输入前缀</b><code>src/prompt.rs</code><br>输出模式 instructions、任务和清单冻结；动态分片在末尾。</div>
   <div class="arrow">→</div>
-  <div class="node verified">
-    <div class="name">worker（多轮循环）</div>
-    <div class="owner">src/worker.rs</div>
-    <div class="duty">读分片 → 装配 → LLM ↔ 工具循环 → 发布或诊断；停滞检测</div>
-  </div>
+  <div class="box"><b>三协议适配</b><code>src/llm/</code><br>Completions、Responses、Anthropic 映射为同一消息、工具、usage 和终态。</div>
+  <div class="arrow">↔</div>
+  <div class="box internal"><b>上下文压缩</b><code>src/compaction.rs</code><br>调用前预算；只压缩完整工具组；内部提交并本地校验。</div>
+</div>
+
+<h2>唯一工具入口</h2>
+<div class="row">
+  <div class="box"><b>冻结 ToolRegistry</b><code>src/scheduler.rs</code><br>稳定名称、schema、来源与执行目标。</div>
   <div class="arrow">→</div>
-  <div class="node verified">
-    <div class="name">输出区</div>
-    <div class="owner">src/output.rs</div>
-    <div class="duty">原子发布、审计落盘（request/event/tool_call/tool_result）、汇总</div>
-  </div>
-</div>
-<div class="flow">
-  <div class="node verified">
-    <div class="name">prompt 装配</div>
-    <div class="owner">src/prompt.rs</div>
-    <div class="duty">instructions 三段 + 任务说明 + 清单 + 分片；跨单元前缀字节一致</div>
-  </div>
-  <div class="arrow">← worker 使用</div>
-  <div class="node verified">
-    <div class="name">LLM 协议层</div>
-    <div class="owner">src/llm/</div>
-    <div class="duty">内部对话模型；三协议双向翻译；请求/原始响应全程留痕</div>
-  </div>
-</div>
-<div class="flow">
-  <div class="node verified">
-    <div class="name">统一调度器 <span class="note">第 2 轮</span></div>
-    <div class="owner">src/scheduler.rs</div>
-    <div class="duty">工具调用唯一入口：串行准入 + 有界 blocking 池执行；限流/去重待并发轮</div>
-  </div>
-  <div class="arrow">← worker 的一切工具调用</div>
-  <div class="node verified">
-    <div class="name">search 工具 <span class="note">第 2 轮</span></div>
-    <div class="owner">src/tools.rs</div>
-    <div class="duty">grep crates 进程内嵌；两棵只读根（input/output）；硬边界 + 截断标记</div>
-  </div>
-  <div class="node verified">
-    <div class="name">重试预算 / 取消令牌树 <span class="note">第 4 轮</span></div>
-    <div class="owner">src/worker.rs + src/main.rs</div>
-    <div class="duty">瞬时故障按预算重试（attempt 留痕）；Ctrl+C/Break → 根令牌，select! 全树收敛；退出码 3</div>
-  </div>
-  <div class="node verified">
-    <div class="name">规模观测 <span class="note">第 5 轮</span></div>
-    <div class="owner">src/metrics.rs + examples/scale_run.rs</div>
-    <div class="duty">FORMIC_METRICS=1 时指标行（RSS/在途/历史/队列/耗时）；规模实验一键复跑</div>
-  </div>
-  <div class="node verified">
-    <div class="name">单元统计视图 <span class="note">第 6 轮</span></div>
-    <div class="owner">src/output.rs + src/tokenize.rs</div>
-    <div class="duty">out/stats.jsonl：轮数/调用数/工具计数/token 内部估算（tiktoken o200k）</div>
-  </div>
+  <div class="box"><b>有界 Scheduler</b><code>src/scheduler.rs · src/cache.rs</code><br>排队、取消、semaphore、singleflight/LRU、耗时和在途统计。</div>
+  <div class="arrow">→</div>
+  <div class="box"><b>内置只读工具</b><code>src/tools.rs</code><br>search/read；input/output 根；路径与结果边界。</div>
+  <div class="box"><b>任意自定义 MCP</b><code>src/mcp.rs</code><br>stdio 或 Streamable HTTP；启动发现；job/unit 会话；逐 server/tool 限流。</div>
 </div>
 
-<h2>候选：后续轮次（design.md，未实现）</h2>
-<div class="grid">
-  <div class="node candidate">
-    <div class="name">历史预算与压缩 <span class="note">后续轮次</span></div>
-    <div class="duty">预算取 2 MB（第 5 轮实测依据）；超出判单元失败或压缩，策略届时按实测值设计</div>
-  </div>
-  <div class="node candidate">
-    <div class="name">审计格式压缩 <span class="note">候选优化</span></div>
-    <div class="duty">首回合全量 + 后续增量，消除请求体重复的磁盘体积（§14 完整可复现语义不变）</div>
-  </div>
-  <div class="node candidate">
-    <div class="name">web fetch <span class="note">原型不实现</span></div>
-    <div class="duty">外部读取：每次是出站副作用，经调度器限流与缓存进入</div>
-  </div>
+<h2>内部终止与持久化</h2>
+<div class="row">
+  <div class="box internal"><b>formic_submit_result</b><code>src/structured.rs</code><br>可选作业 schema；worker 截获并本地验证，不进入 Scheduler。</div>
+  <div class="box internal"><b>formic_submit_compaction</b><code>src/compaction.rs</code><br>只用于压缩摘要，不具备外部能力。</div>
+  <div class="arrow">→</div>
+  <div class="box"><b>输出与可观测性</b><code>src/output.rs</code><br>原子结果、worker 时间线 Markdown、output-schema 与 stats。</div>
 </div>
 
-<h2>依赖方向（当前）</h2>
-<p class="note">
-main（并发窗口）→ plan / prompt / worker / output / llm / scheduler / tools / metrics；<br>
-worker → prompt / llm / scheduler / output；scheduler → tools（search）；<br>
-llm/{completions,responses,anthropic} → llm（消息模型与事件枚举），三协议互不知晓；<br>
-metrics 被各模块以静态量引用，只读不写业务状态（附属证据，§9）。
-</p>
-
-<footer>随每轮实现同改更新；各轮验证证据见 docs/rounds/。</footer>
-
+<p class="note">取消令牌贯穿 main → worker → LLM/Scheduler → 本地工具或 MCP。metrics 只记录已发生事实，不参与业务准入。</p>
 </body>
 </html>

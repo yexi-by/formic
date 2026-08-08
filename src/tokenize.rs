@@ -25,6 +25,7 @@ pub fn count(text: &str) -> u64 {
 pub fn count_message(message: &Message) -> u64 {
     let content = match message {
         Message::User(text) => count(text),
+        Message::Compaction(text) => count(text),
         Message::Assistant { text, tool_calls } => {
             count(text) + tool_calls.iter().map(count_tool_call).sum::<u64>()
         }

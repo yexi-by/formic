@@ -47,6 +47,8 @@ pub struct ToolCallReq {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     User(String),
+    /// 经内部压缩工具验证的历史摘要；不是模型可调用的普通工具结果。
+    Compaction(String),
     Assistant {
         text: String,
         tool_calls: Vec<ToolCallReq>,
@@ -58,9 +60,10 @@ pub enum Message {
 }
 
 /// 工具规格：走请求的 tools 字段，不进提示词文字。实例的唯一来源是调度器。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
+    pub name: String,
+    pub description: String,
     pub parameters: serde_json::Value,
 }
 
@@ -71,14 +74,49 @@ pub enum LlmEvent {
     TextDelta(String),
     /// 一条完整组装的工具调用（流式增量已拼好）。
     ToolCall(ToolCallReq),
+    /// 供应商明确报告的用量；缺失字段保持 None，不用估算值冒充。
+    Usage(ProviderUsage),
     /// 流正常收尾。
     Finished(Finish),
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ProviderUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_creation_tokens: Option<u64>,
+}
+
+impl ProviderUsage {
+    pub fn merge(&mut self, newer: Self) {
+        if newer.input_tokens.is_some() {
+            self.input_tokens = newer.input_tokens;
+        }
+        if newer.output_tokens.is_some() {
+            self.output_tokens = newer.output_tokens;
+        }
+        if newer.cache_read_tokens.is_some() {
+            self.cache_read_tokens = newer.cache_read_tokens;
+        }
+        if newer.cache_creation_tokens.is_some() {
+            self.cache_creation_tokens = newer.cache_creation_tokens;
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.cache_read_tokens.is_none()
+            && self.cache_creation_tokens.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Finish {
     Stop,
     MaxTokens,
+    Refusal,
     /// 模型以工具调用结束本回合；transform 保证此时确有 ToolCall 事件发出。
     ToolUse,
 }
@@ -90,6 +128,8 @@ pub enum LlmError {
     Transport(#[from] reqwest::Error),
     #[error("LLM 返回 HTTP {status}：{body}")]
     Http { status: u16, body: String },
+    #[error("LLM 明确报告上下文超过限制（HTTP {status}）：{body}")]
+    ContextLimit { status: u16, body: String },
     #[error("协议事件无法解析：{reason}；原始负载：{payload}")]
     Protocol { reason: String, payload: String },
 }
@@ -111,13 +151,32 @@ pub struct LlmClient {
     config: LlmConfig,
 }
 
-/// LLM 调用配置，来源是环境变量（部署选择），缺失必填项在启动时明确失败。
-#[derive(Debug, Clone)]
+/// 已按当前协议完整构造、但尚未发送的请求。调用方先保存 `body`，再把对象交回
+/// LlmClient 发送，确保传输失败和取消也有精确输入证据。headers 保持私有，密钥
+/// 不会进入 worker 档案。
+pub struct PreparedLlmCall {
+    url: String,
+    body: String,
+    headers: Vec<(String, String)>,
+}
+
+impl PreparedLlmCall {
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+}
+
+/// LLM 调用配置，由启动边界合并环境变量和配置文件，缺失必填项时明确失败。
+#[derive(Clone)]
 pub struct LlmConfig {
     pub protocol: Protocol,
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
+    /// 模型声明的完整上下文窗口，用于调用前预算。
+    pub context_window_tokens: u64,
+    /// 每次生成允许的最大输出，同时计入调用前预留。
+    pub max_output_tokens: u64,
 }
 
 impl LlmClient {
@@ -128,32 +187,28 @@ impl LlmClient {
         }
     }
 
-    /// 发起一次流式调用。SSE 解析在调用方（worker）循环内驱动，不另起任务。
-    pub async fn call(
+    pub fn prepare_call(
         &self,
         instructions: &str,
         history: &[Message],
         tools: &[ToolSpec],
-    ) -> Result<Call, LlmError> {
+    ) -> PreparedLlmCall {
+        let (url, body, headers) = self.build_request(instructions, history, tools);
+        PreparedLlmCall { url, body, headers }
+    }
+
+    /// 发送一个已经留痕的流式调用。SSE 解析在调用方（worker）循环内驱动，
+    /// 不另起任务。
+    pub async fn send(&self, prepared: PreparedLlmCall) -> Result<Call, LlmError> {
         // 在途计数覆盖「请求发送 → 响应头 → 流式正文」全程（规模观测）
         let in_flight = LlmInFlight::new();
-        let (url, body, headers) = match self.config.protocol {
-            Protocol::Completions => {
-                completions::build_request(&self.config, instructions, history, tools)
-            }
-            Protocol::Responses => {
-                responses::build_request(&self.config, instructions, history, tools)
-            }
-            Protocol::Anthropic => {
-                anthropic::build_request(&self.config, instructions, history, tools)
-            }
-        };
+
         let mut req = self
             .http
-            .post(&url)
+            .post(&prepared.url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.clone());
-        for (name, value) in headers {
+            .body(prepared.body);
+        for (name, value) in prepared.headers {
             req = req.header(name, value);
         }
         let resp = req.send().await?;
@@ -161,6 +216,12 @@ impl LlmClient {
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
             let snippet: String = text.chars().take(HTTP_ERROR_BODY_LIMIT).collect();
+            if is_structured_context_limit(&text) {
+                return Err(LlmError::ContextLimit {
+                    status: status.as_u16(),
+                    body: snippet,
+                });
+            }
             return Err(LlmError::Http {
                 status: status.as_u16(),
                 body: snippet,
@@ -172,11 +233,71 @@ impl LlmClient {
             Protocol::Anthropic => Box::new(anthropic::Transform::new()),
         };
         Ok(Call {
-            request_body: body,
             stream: EventStream::new(Box::pin(resp.bytes_stream()), transform),
             _in_flight: in_flight,
         })
     }
+
+    pub fn build_request(
+        &self,
+        instructions: &str,
+        history: &[Message],
+        tools: &[ToolSpec],
+    ) -> (String, String, Vec<(String, String)>) {
+        match self.config.protocol {
+            Protocol::Completions => {
+                completions::build_request(&self.config, instructions, history, tools)
+            }
+            Protocol::Responses => {
+                responses::build_request(&self.config, instructions, history, tools)
+            }
+            Protocol::Anthropic => {
+                anthropic::build_request(&self.config, instructions, history, tools)
+            }
+        }
+    }
+
+    pub fn estimate_request_tokens(
+        &self,
+        instructions: &str,
+        history: &[Message],
+        tools: &[ToolSpec],
+    ) -> u64 {
+        let (_, body, _) = self.build_request(instructions, history, tools);
+        crate::tokenize::count(&body)
+    }
+
+    pub fn input_budget(&self, safety_tokens: u64) -> u64 {
+        self.config
+            .context_window_tokens
+            .saturating_sub(self.config.max_output_tokens)
+            .saturating_sub(safety_tokens)
+    }
+}
+
+fn is_structured_context_limit(body: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let known = [
+        "context_length_exceeded",
+        "context_window_exceeded",
+        "prompt_too_long",
+        "request_too_large",
+    ];
+    [
+        value
+            .pointer("/error/code")
+            .and_then(serde_json::Value::as_str),
+        value
+            .pointer("/error/type")
+            .and_then(serde_json::Value::as_str),
+        value.get("code").and_then(serde_json::Value::as_str),
+        value.get("type").and_then(serde_json::Value::as_str),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|code| known.contains(&code))
 }
 
 /// LLM 在途调用的计数守卫：创建即 +1，销毁即 -1（规模观测）。
@@ -195,11 +316,9 @@ impl Drop for LlmInFlight {
     }
 }
 
-/// 一次进行中的调用：事件流 + 审计留痕（请求体与全部原始 SSE 负载）。
+/// 一次进行中的调用：事件流及全部原始 SSE 负载。
 /// 在途计数随请求开始与调用结束更新（规模观测）。
 pub struct Call {
-    /// 发出的请求体原文。
-    pub request_body: String,
     stream: EventStream,
     _in_flight: LlmInFlight,
 }
