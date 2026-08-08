@@ -2,7 +2,7 @@
 //! （检索「苹果」），携带工具结果的请求返回最终文本。按请求路径区分三种协议。
 //!
 //! 用法：`cargo run --example mock_llm -- [端口=18080]`，然后把
-//! FORMIC_LLM_BASE_URL 指向打印出的地址即可跑通 `formic run` 全流程。
+//! FORMIC_LLM_BASE_URL 指向打印出的地址，并设置模型名与上下文配置后即可跑通。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;

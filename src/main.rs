@@ -6,25 +6,31 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Instant;
 
+use chrono::Utc;
 use clap::Parser;
 use futures_util::FutureExt;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+mod cache;
+mod compaction;
 mod config;
 mod llm;
+mod mcp;
 mod metrics;
 mod output;
 mod plan;
 mod prompt;
 mod scheduler;
+mod structured;
 mod tokenize;
 mod tools;
 mod worker;
 
-use llm::LlmClient;
+use llm::{LlmClient, Protocol};
 use output::Summary;
 
 /// 任务说明的大小上限（结构校验的一部分，语义边界见 design.md §3）。
@@ -63,12 +69,19 @@ struct RunArgs {
     /// 并发窗口：同时运行的单元数上限，调用方唯一的策略选择（依据是 LLM 配额）
     #[arg(long)]
     concurrency: usize,
+    /// 可选的作业级 JSON Schema；启用后完成记录为 JSON
+    #[arg(long)]
+    output_schema: Option<PathBuf>,
 }
 
 #[derive(thiserror::Error, Debug)]
 enum StartupError {
     #[error(transparent)]
     Config(#[from] config::ConfigError),
+    #[error(transparent)]
+    Mcp(#[from] mcp::McpStartupError),
+    #[error(transparent)]
+    Registry(#[from] scheduler::RegistryError),
     #[error("数据目录 {0} 不存在或不是目录")]
     DataRoot(PathBuf),
     #[error("任务说明 {path} 无法读取：{source}")]
@@ -89,6 +102,13 @@ enum StartupError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("无法创建 worker 观测目录 {path}：{source}")]
+    WorkerObservation {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error(transparent)]
+    OutputContract(#[from] structured::OutputContractError),
     #[error("无法列出数据目录 {path}：{source}")]
     Listing {
         path: PathBuf,
@@ -125,22 +145,62 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         path: args.out.clone(),
         source: e,
     })?;
+    let output_contract =
+        structured::OutputContract::prepare(args.output_schema.as_deref(), &args.out)?;
     let listing = worker::list_files(&args.data).map_err(|e| StartupError::Listing {
         path: args.data.clone(),
         source: e,
     })?;
 
     let out_dir = args.out.clone();
-    let ctx = Arc::new(worker::JobContext {
-        scheduler: scheduler::Scheduler::start(tools::Roots {
+    let mcp = mcp::McpManager::initialize(&config.mcp_servers).await?;
+    let registry = scheduler::ToolRegistry::with_mcp(&config.tools, mcp)?;
+    let mut model_tools = registry.specs().to_vec();
+    if let Some(spec) = output_contract.submit_spec() {
+        model_tools.push(spec);
+        model_tools.sort_by(|left, right| left.name.cmp(&right.name));
+    }
+    let worker_run = output::WorkerRun::create(
+        &args.out,
+        output::JobReportFacts {
+            protocol: protocol_key(config.llm.protocol).into(),
+            model: config.llm.model.clone(),
+            context_window_tokens: config.llm.context_window_tokens,
+            max_output_tokens: config.llm.max_output_tokens,
+            context_safety_tokens: config.execution.context_safety_tokens,
+            concurrency: args.concurrency,
+            output_format: output_contract.format(),
+            tools: model_tools.iter().map(|tool| tool.name.clone()).collect(),
+        },
+    )
+    .map_err(|source| StartupError::WorkerObservation {
+        path: args.out.join("workers"),
+        source,
+    })?;
+    let scheduler = scheduler::Scheduler::start(
+        registry,
+        tools::Roots {
             input: args.data.clone(),
             output: args.out.clone(),
-        }),
+            output_format: output_contract.format(),
+        },
+        &config.tools,
+        &config.cache,
+        args.concurrency,
+    );
+    let instructions = prompt::instructions(output_contract.is_structured()).to_string();
+    let ctx = Arc::new(worker::JobContext {
+        scheduler,
         data_root: args.data,
         task,
         listing,
-        llm: LlmClient::new(config),
+        llm: LlmClient::new(config.llm.clone()),
         out_dir: args.out,
+        output_contract,
+        execution: config.execution.clone(),
+        model_tools: model_tools.into(),
+        worker_run,
+        instructions,
     });
 
     // 规模观测：附属证据，不参与业务状态（FORMIC_METRICS=1 时定期汇总到 stderr）
@@ -182,12 +242,41 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         running.spawn(async move {
             let _permit = permit;
             let no = unit.unit;
+            let shard = describe_shard(&unit.shard);
+            let started_at = Utc::now();
+            let started = Instant::now();
             let mut stats = output::UnitStats::default();
             let result =
                 std::panic::AssertUnwindSafe(worker::run_unit(&ctx, &unit, cancel, &mut stats))
                     .catch_unwind()
                     .await
                     .unwrap_or(Err(worker::UnitFailure::Panicked));
+            ctx.scheduler.finish_unit(no).await;
+            let finished_at = Utc::now();
+            let outcome = match &result {
+                Ok(worker::Outcome::Published) => "published",
+                Ok(worker::Outcome::Cancelled) => "cancelled",
+                Err(_) => "failed",
+            };
+            let failure_reason = result.as_ref().err().map(ToString::to_string);
+            let record_format = matches!(&result, Ok(worker::Outcome::Published))
+                .then(|| ctx.output_contract.format());
+            if let Err(error) = output::render_worker_report(
+                &ctx.worker_run,
+                &output::WorkerReport {
+                    unit: no,
+                    shard: &shard,
+                    outcome,
+                    failure_reason: failure_reason.as_deref(),
+                    started_at,
+                    finished_at,
+                    duration: started.elapsed(),
+                    stats: &stats,
+                    record_format,
+                },
+            ) {
+                eprintln!("单元 {no} 运行档案生成失败：{error}");
+            }
             // 事实发生后立即报告，不被窗口等待阻塞
             match &result {
                 Ok(worker::Outcome::Published) => eprintln!("单元 {no} 完成"),
@@ -224,6 +313,7 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
             }
         }
     }
+    ctx.scheduler.shutdown().await;
     // 失败单元按计划文件顺序呈现
     let failed_in_plan_order: Vec<u64> = order
         .iter()
@@ -258,6 +348,30 @@ fn read_task(path: &PathBuf) -> Result<String, StartupError> {
         return Err(StartupError::TaskInvalid(path.clone()));
     }
     Ok(text)
+}
+
+fn protocol_key(protocol: Protocol) -> &'static str {
+    match protocol {
+        Protocol::Completions => "completions",
+        Protocol::Responses => "responses",
+        Protocol::Anthropic => "anthropic",
+    }
+}
+
+fn describe_shard(shard: &plan::Shard) -> String {
+    match shard {
+        plan::Shard::Files(files) => format!(
+            "文件：{}",
+            files
+                .iter()
+                .map(|path| path.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        plan::Shard::Lines { file, start, end } => {
+            format!("文件 {}，第 {start}–{end} 行", file.display())
+        }
+    }
 }
 
 /// 等待一次终止信号：Ctrl+C，或 Windows 的 Ctrl+Break。

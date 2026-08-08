@@ -4,22 +4,22 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::llm::{Finish, LlmClient, LlmError, LlmEvent, Message, ToolCallReq};
-use crate::output::{self, AuditEntry, UnitStats};
+use crate::compaction::{CompactionCallUsage, CompactionError, CompactionOutcome};
+use crate::config::ExecutionConfig;
+use crate::llm::{
+    Finish, LlmClient, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq, ToolSpec,
+};
+use crate::output::{self, AuditEntry, UnitStats, WorkerState};
 use crate::plan::{PlanUnit, Shard};
 use crate::prompt::{self, ShardContent};
-use crate::scheduler::{Scheduler, SchedulerGone};
+use crate::scheduler::{Scheduler, SchedulerError};
+use crate::structured::{OutputContract, SUBMIT_RESULT_TOOL};
 use crate::tokenize;
-
-/// 停滞检测阈值：连续相同 (name, arguments) 调用达到此次数即终止（内部常量）。
-const STALL_LIMIT: u32 = 3;
-
-/// 单次 LLM 调用的总尝试次数上限（内部常量；瞬时故障重试，语义性失败不重试）。
-const RETRY_BUDGET: u32 = 3;
 
 /// 第 attempt 次尝试失败后的退避（1 起始）。无实测证据，不引入指数/抖动策略。
 fn backoff(attempt: u32) -> Duration {
@@ -34,6 +34,12 @@ pub struct JobContext {
     pub llm: LlmClient,
     pub scheduler: Scheduler,
     pub out_dir: PathBuf,
+    pub output_contract: OutputContract,
+    pub execution: ExecutionConfig,
+    pub model_tools: Arc<[ToolSpec]>,
+    pub worker_run: output::WorkerRun,
+    /// 作业启动时按输出模式冻结，全部单元字节一致。
+    pub instructions: String,
 }
 
 /// 单元结局：发布成功，或被取消（在途丢弃，不算失败）。
@@ -43,7 +49,7 @@ pub enum Outcome {
     Cancelled,
 }
 
-/// 单元失败：带对象与直接原因，细节留在审计文件。
+/// 单元失败：带对象与直接原因，细节最终进入 worker 运行档案。
 #[derive(thiserror::Error, Debug)]
 pub enum UnitFailure {
     #[error("读取分片文件 {path} 失败：{source}")]
@@ -55,21 +61,29 @@ pub enum UnitFailure {
     ShardEncoding { path: PathBuf },
     #[error(transparent)]
     Llm(#[from] LlmError),
-    #[error("模型给出的工具参数不是合法 JSON：{0}")]
-    BadToolArguments(String),
-    #[error("停滞：连续 {STALL_LIMIT} 次相同的工具调用 {name}（参数 {arguments}）")]
-    Stalled { name: String, arguments: String },
+    #[error("停滞：连续 {limit} 次相同的工具调用 {name}（参数 {arguments}）")]
+    Stalled {
+        limit: u32,
+        name: String,
+        arguments: String,
+    },
     #[error("模型输出达到协议长度上限，产出被截断")]
     Truncated,
     #[error("模型未产出任何文本")]
     EmptyOutput,
+    #[error("模型拒绝执行本单元")]
+    Refused,
+    #[error("结构化结果连续 {attempts} 次无效，未发布记录；最后错误：{last_error}")]
+    StructuredExhausted { attempts: u32, last_error: String },
+    #[error(transparent)]
+    Compaction(#[from] CompactionError),
     #[error("{cause}（重试 {retries} 次后仍失败）")]
     RetriesExhausted {
         retries: u32,
         cause: Box<UnitFailure>,
     },
     #[error("调度器故障：{0}")]
-    Scheduler(#[from] SchedulerGone),
+    Scheduler(#[from] SchedulerError),
     #[error("内部错误：worker task panic")]
     Panicked,
     #[error("写入输出区失败：{0}")]
@@ -79,23 +93,24 @@ pub enum UnitFailure {
 /// 一次 LLM 调用的失败按可重试性分类。
 enum CallFailure {
     Cancelled,
+    ContextLimit(UnitFailure),
     Retryable(UnitFailure),
     Fatal(UnitFailure),
 }
 
 fn classify(failure: UnitFailure) -> CallFailure {
     match failure {
+        UnitFailure::Llm(LlmError::ContextLimit { .. }) => CallFailure::ContextLimit(failure),
         // 429 与 5xx 之外的客户错误属配置/请求问题，重试无意义
         UnitFailure::Llm(LlmError::Http { status, .. }) if status != 429 && status < 500 => {
             CallFailure::Fatal(failure)
         }
         UnitFailure::Llm(_) => CallFailure::Retryable(failure),
-        UnitFailure::BadToolArguments(_) => CallFailure::Retryable(failure),
         other => CallFailure::Fatal(other),
     }
 }
 
-/// 执行一个单元。发布成功或取消都会照常落审计；失败不留下完成记录。
+/// 执行一个单元。发布成功、失败或取消都会记录现场；失败不留下完成记录。
 /// stats 随执行累计（指标分析的派生数据，token 为内部估算值）。
 pub async fn run_unit(
     ctx: &JobContext,
@@ -103,27 +118,69 @@ pub async fn run_unit(
     cancel: CancellationToken,
     stats: &mut UnitStats,
 ) -> Result<Outcome, UnitFailure> {
-    let shard = read_shard(&ctx.data_root, &unit.shard)?;
+    // 审计先于分片读取创建，使输入读取失败也能留下 worker 的状态现场。
+    let mut audit = output::AuditLog::create(&ctx.worker_run, unit.unit)?;
+    audit.push(&AuditEntry::State {
+        state: WorkerState::Preparing,
+        reason: "读取计划分片并构造首条用户消息".into(),
+    })?;
+    let shard = match read_shard(&ctx.data_root, &unit.shard) {
+        Ok(shard) => shard,
+        Err(failure) => {
+            audit.push(&AuditEntry::State {
+                state: WorkerState::Failed,
+                reason: failure.to_string(),
+            })?;
+            audit.finish()?;
+            return Err(failure);
+        }
+    };
     let user = prompt::build_user_message(&ctx.task, &ctx.listing, &shard);
     let mut history = vec![Message::User(user)];
-    // 审计流式落盘：不在内存累积（规模验证证明内存放大主要来自审计）
-    let mut audit = output::AuditLog::create(&ctx.out_dir, unit.unit)?;
     let mut meter = Metering {
         tracked: message_size(&history[0]),
         history_tokens: tokenize::count_message(&history[0]),
-        instructions_tokens: tokenize::count(prompt::INSTRUCTIONS),
         stats,
     };
+    audit.push(&AuditEntry::State {
+        state: WorkerState::Ready,
+        reason: format!(
+            "首条用户消息已构造，当前历史估算 {} token",
+            meter.history_tokens
+        ),
+    })?;
     // 对话历史是当前内存主导项的候选，全程计量以验证（规模观测）
     crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, meter.tracked);
 
-    let outcome = drive_loop(ctx, &mut history, &mut audit, &cancel, &mut meter).await;
+    let outcome = drive_loop(
+        ctx,
+        unit.unit,
+        &mut history,
+        &mut audit,
+        &cancel,
+        &mut meter,
+    )
+    .await;
     crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, -meter.tracked);
+    match &outcome {
+        Ok(LoopEnd::Published(_)) => audit.push(&AuditEntry::State {
+            state: WorkerState::ReadyToPublish,
+            reason: "最终结果已经满足当前输出契约".into(),
+        })?,
+        Ok(LoopEnd::Cancelled) => audit.push(&AuditEntry::State {
+            state: WorkerState::Cancelled,
+            reason: "收到取消信号，丢弃尚未发布的结果".into(),
+        })?,
+        Err(failure) => audit.push(&AuditEntry::State {
+            state: WorkerState::Failed,
+            reason: failure.to_string(),
+        })?,
+    }
     // 证据完整是契约要求：取消与失败的现场也落盘，由审计还原经过。
     audit.finish()?;
     match outcome? {
         LoopEnd::Published(text) => {
-            output::publish(&ctx.out_dir, unit.unit, &text)?;
+            output::publish(&ctx.out_dir, unit.unit, &text, ctx.output_contract.format())?;
             Ok(Outcome::Published)
         }
         LoopEnd::Cancelled => Ok(Outcome::Cancelled),
@@ -133,6 +190,7 @@ pub async fn run_unit(
 fn message_size(message: &Message) -> i64 {
     let size: usize = match message {
         Message::User(text) => text.len(),
+        Message::Compaction(text) => text.len(),
         Message::Assistant { text, tool_calls } => {
             text.len()
                 + tool_calls
@@ -154,13 +212,13 @@ enum LoopEnd {
 struct Metering<'a> {
     tracked: i64,
     history_tokens: u64,
-    instructions_tokens: u64,
     stats: &'a mut UnitStats,
 }
 
 /// 「LLM ↔ 工具调用」循环。
 async fn drive_loop(
     ctx: &JobContext,
+    unit: u64,
     history: &mut Vec<Message>,
     audit: &mut output::AuditLog,
     cancel: &CancellationToken,
@@ -168,42 +226,171 @@ async fn drive_loop(
 ) -> Result<LoopEnd, UnitFailure> {
     let mut last_call: Option<(String, String)> = None;
     let mut same_calls = 0u32;
+    let mut invalid_submissions = 0u32;
+    let mut emergency_compacted = false;
 
     loop {
+        match crate::compaction::compact_if_needed(
+            &ctx.llm,
+            &ctx.instructions,
+            &ctx.model_tools,
+            &ctx.execution,
+            history,
+            audit,
+            cancel,
+            false,
+        )
+        .await
+        {
+            Ok(CompactionOutcome::Unchanged) => {}
+            Ok(CompactionOutcome::Replaced {
+                before_tokens,
+                after_tokens,
+                calls,
+            }) => refresh_after_compaction(history, meter, before_tokens, after_tokens, &calls),
+            Err(CompactionError::Cancelled) => {
+                return Ok(LoopEnd::Cancelled);
+            }
+            Err(error) => return Err(error.into()),
+        }
         // 单次 LLM 调用 + 重试预算：同一历史重发，每次尝试独立留痕
         let mut attempt = 0u32;
         let turn = loop {
             attempt += 1;
             meter.stats.llm_calls += 1;
-            meter.stats.input_tokens += meter.instructions_tokens + meter.history_tokens;
+            let request_tokens =
+                ctx.llm
+                    .estimate_request_tokens(&ctx.instructions, history, &ctx.model_tools);
+            meter.stats.input_tokens += request_tokens;
             if attempt > 1 {
                 meter.stats.retries += 1;
             }
+            audit.push(&AuditEntry::State {
+                state: WorkerState::RequestingModel,
+                reason: format!(
+                    "第 {attempt} 次尝试，消息 {} 条，完整请求估算 {request_tokens} token",
+                    history.len()
+                ),
+            })?;
             match one_turn(ctx, history, audit, attempt, cancel).await {
                 Ok(turn) => break turn,
                 Err(CallFailure::Cancelled) => return Ok(LoopEnd::Cancelled),
+                Err(CallFailure::ContextLimit(failure)) => {
+                    if emergency_compacted {
+                        return Err(failure);
+                    }
+                    emergency_compacted = true;
+                    match crate::compaction::compact_if_needed(
+                        &ctx.llm,
+                        &ctx.instructions,
+                        &ctx.model_tools,
+                        &ctx.execution,
+                        history,
+                        audit,
+                        cancel,
+                        true,
+                    )
+                    .await
+                    {
+                        Ok(CompactionOutcome::Replaced {
+                            before_tokens,
+                            after_tokens,
+                            calls,
+                        }) => {
+                            refresh_after_compaction(
+                                history,
+                                meter,
+                                before_tokens,
+                                after_tokens,
+                                &calls,
+                            );
+                            continue;
+                        }
+                        Err(CompactionError::Cancelled) => {
+                            return Ok(LoopEnd::Cancelled);
+                        }
+                        Ok(CompactionOutcome::Unchanged) => return Err(failure),
+                        Err(error) => return Err(error.into()),
+                    }
+                }
                 Err(CallFailure::Fatal(f)) => return Err(f),
                 Err(CallFailure::Retryable(f)) => {
-                    if attempt >= RETRY_BUDGET {
+                    if attempt >= ctx.execution.llm_attempts {
                         return Err(UnitFailure::RetriesExhausted {
                             retries: attempt - 1,
                             cause: Box::new(f),
                         });
                     }
+                    let delay = backoff(attempt);
+                    audit.push(&AuditEntry::Retry {
+                        attempt,
+                        next_attempt: attempt + 1,
+                        delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        reason: f.to_string(),
+                    })?;
+                    audit.push(&AuditEntry::State {
+                        state: WorkerState::RetryingModel,
+                        reason: format!("第 {attempt} 次模型调用失败，等待后重试：{f}"),
+                    })?;
                     eprintln!("第 {attempt} 次调用失败（{f}），退避后重试");
                     tokio::select! {
                         _ = cancel.cancelled() => return Ok(LoopEnd::Cancelled),
-                        _ = tokio::time::sleep(backoff(attempt)) => {}
+                        _ = tokio::time::sleep(delay) => {}
                     }
                 }
             }
         };
+        let (turn, usage) = turn;
+        meter.stats.record_provider_usage(&usage);
         meter.stats.turns += 1;
+        audit.push(&AuditEntry::State {
+            state: WorkerState::InterpretingModel,
+            reason: match &turn {
+                TurnEnd::FinalText(text) => {
+                    format!("模型返回最终文本，正文 {} bytes", text.len())
+                }
+                TurnEnd::ToolCalls { text, calls } => format!(
+                    "模型返回 {} 个工具调用，伴随文本 {} bytes",
+                    calls.len(),
+                    text.len()
+                ),
+            },
+        })?;
 
         match turn {
             TurnEnd::FinalText(text) => {
                 meter.stats.output_tokens += tokenize::count(&text);
-                return Ok(LoopEnd::Published(text));
+                if !ctx.output_contract.is_structured() {
+                    return Ok(LoopEnd::Published(text));
+                }
+                let reason = "结构化模式不能用最终文本提交结果；请单独调用 formic_submit_result";
+                audit.push(&AuditEntry::OutputValidation {
+                    valid: false,
+                    instance_path: None,
+                    schema_path: None,
+                    reason: reason.into(),
+                })?;
+                audit.push(&AuditEntry::State {
+                    state: WorkerState::CorrectingOutput,
+                    reason: reason.into(),
+                })?;
+                invalid_submissions += 1;
+                meter.stats.structured_corrections += 1;
+                if invalid_submissions >= ctx.execution.llm_attempts {
+                    return Err(UnitFailure::StructuredExhausted {
+                        attempts: invalid_submissions,
+                        last_error: reason.into(),
+                    });
+                }
+                push_history(
+                    history,
+                    meter,
+                    Message::Assistant {
+                        text,
+                        tool_calls: Vec::new(),
+                    },
+                );
+                push_history(history, meter, Message::User(reason.into()));
             }
             TurnEnd::ToolCalls { text, calls } => {
                 meter.stats.output_tokens += tokenize::count(&text)
@@ -211,55 +398,213 @@ async fn drive_loop(
                         .iter()
                         .map(|c| tokenize::count_tool_call(&c.req))
                         .sum::<u64>();
+                let has_submit = calls.iter().any(|call| call.req.name == SUBMIT_RESULT_TOOL);
+                let mixed_submit = has_submit && (calls.len() != 1 || !text.trim().is_empty());
                 let assistant = Message::Assistant {
                     text,
                     tool_calls: calls.iter().map(|c| c.req.clone()).collect(),
                 };
-                let size = message_size(&assistant);
-                let tokens = tokenize::count_message(&assistant);
-                history.push(assistant);
-                meter.tracked += size;
-                meter.history_tokens += tokens;
-                crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, size);
+                push_history(history, meter, assistant);
+                let mut submission_error = None;
                 for prepared in calls {
                     let tc = prepared.req;
                     audit.push(&AuditEntry::ToolCall {
                         name: tc.name.clone(),
-                        arguments: tc.arguments.clone(),
+                        source: if tc.name == SUBMIT_RESULT_TOOL {
+                            Some("internal".into())
+                        } else {
+                            ctx.scheduler.source(&tc.name).map(|source| match source {
+                                crate::scheduler::ToolSource::Builtin => "builtin".to_string(),
+                                crate::scheduler::ToolSource::Mcp {
+                                    server,
+                                    remote_name,
+                                } => format!("mcp:{server}/{remote_name}"),
+                            })
+                        },
+                        arguments: prepared.raw_arguments.clone(),
                     })?;
+                    if tc.name == SUBMIT_RESULT_TOOL && ctx.output_contract.is_structured() {
+                        last_call = None;
+                        same_calls = 0;
+                        let (validation, validation_issue) = if mixed_submit {
+                            (
+                                Err(
+                                    "formic_submit_result 必须在不含文本和其他工具调用的回合中单独出现"
+                                        .to_string(),
+                                ),
+                                None,
+                            )
+                        } else if let Some(error) = &prepared.argument_error {
+                            (Err(error.clone()), None)
+                        } else {
+                            match ctx.output_contract.validate_submission(&prepared.arguments) {
+                                Ok(content) => (Ok(content), None),
+                                Err(issue) => (Err(issue.to_string()), Some(issue)),
+                            }
+                        };
+                        match validation {
+                            Ok(content) => {
+                                audit.push(&AuditEntry::OutputValidation {
+                                    valid: true,
+                                    instance_path: None,
+                                    schema_path: None,
+                                    reason: "结构化结果验证通过".into(),
+                                })?;
+                                return Ok(LoopEnd::Published(content));
+                            }
+                            Err(reason) => {
+                                let (instance_path, schema_path, audit_reason) = validation_issue
+                                    .map(|issue| {
+                                        (
+                                            Some(issue.instance_path),
+                                            Some(issue.schema_path),
+                                            issue.reason,
+                                        )
+                                    })
+                                    .unwrap_or_else(|| (None, None, reason.clone()));
+                                audit.push(&AuditEntry::OutputValidation {
+                                    valid: false,
+                                    instance_path,
+                                    schema_path,
+                                    reason: audit_reason,
+                                })?;
+                                audit.push(&AuditEntry::State {
+                                    state: WorkerState::CorrectingOutput,
+                                    reason: reason.clone(),
+                                })?;
+                                let result = format!("错误：{reason}；请修正后单独提交");
+                                audit.push(&AuditEntry::ToolResult(result.clone()))?;
+                                push_history(
+                                    history,
+                                    meter,
+                                    Message::ToolResult {
+                                        call_id: tc.call_id,
+                                        content: result,
+                                    },
+                                );
+                                submission_error = Some(reason);
+                            }
+                        }
+                        continue;
+                    }
                     *meter.stats.tool_calls.entry(tc.name.clone()).or_default() += 1;
-                    let current = (tc.name.clone(), tc.arguments.clone());
+                    let current = (tc.name.clone(), prepared.raw_arguments.clone());
                     if last_call.as_ref() == Some(&current) {
                         same_calls += 1;
                     } else {
                         same_calls = 1;
                         last_call = Some(current);
                     }
-                    if same_calls >= STALL_LIMIT {
+                    if same_calls >= ctx.execution.identical_tool_call_limit {
                         return Err(UnitFailure::Stalled {
+                            limit: ctx.execution.identical_tool_call_limit,
                             name: tc.name,
-                            arguments: tc.arguments,
+                            arguments: prepared.raw_arguments,
                         });
                     }
-                    // 参数 JSON 已在 one_turn 校验（LLM 边界），这里直接信任
-                    let result = tokio::select! {
-                        _ = cancel.cancelled() => return Ok(LoopEnd::Cancelled),
-                        r = ctx.scheduler.execute(&tc.name, prepared.arguments) => r?,
+                    let result = if let Some(error) = prepared.argument_error {
+                        audit.push(&AuditEntry::State {
+                            state: WorkerState::CorrectingToolCall,
+                            reason: format!("工具 {} 的参数无效：{error}", tc.name),
+                        })?;
+                        crate::scheduler::ToolResponse {
+                            content: format!("错误：{error}"),
+                            cache: crate::scheduler::CacheDisposition::Bypassed,
+                            cache_evictions: 0,
+                            wait_ms: 0,
+                            execution_ms: 0,
+                            mcp_server: None,
+                            mcp_current_in_flight: None,
+                            mcp_peak_in_flight: None,
+                        }
+                    } else {
+                        audit.push(&AuditEntry::State {
+                            state: WorkerState::WaitingForTool,
+                            reason: format!("工具 {} 已进入调度器，等待准入和执行", tc.name),
+                        })?;
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Ok(LoopEnd::Cancelled),
+                            result = ctx.scheduler.execute(unit, &tc.name, prepared.arguments, cancel.clone()) => result?,
+                        }
                     };
-                    audit.push(&AuditEntry::ToolResult(result.clone()))?;
-                    let tool_result = Message::ToolResult {
-                        call_id: tc.call_id,
-                        content: result,
-                    };
-                    let size = message_size(&tool_result);
-                    let tokens = tokenize::count_message(&tool_result);
-                    history.push(tool_result);
-                    meter.tracked += size;
-                    meter.history_tokens += tokens;
-                    crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, size);
+                    audit.push(&AuditEntry::ToolExecution {
+                        name: tc.name.clone(),
+                        cache: cache_disposition_key(result.cache).into(),
+                        wait_ms: result.wait_ms,
+                        execution_ms: result.execution_ms,
+                        result_bytes: result.content.len(),
+                        mcp_server: result.mcp_server.clone(),
+                    })?;
+                    audit.push(&AuditEntry::ToolResult(result.content.clone()))?;
+                    meter.stats.record_tool_response(&tc.name, &result);
+                    push_history(
+                        history,
+                        meter,
+                        Message::ToolResult {
+                            call_id: tc.call_id,
+                            content: result.content,
+                        },
+                    );
+                    audit.push(&AuditEntry::State {
+                        state: WorkerState::Ready,
+                        reason: format!("工具 {} 的结果已附加到对话历史", tc.name),
+                    })?;
+                }
+                if let Some(last_error) = submission_error {
+                    invalid_submissions += 1;
+                    meter.stats.structured_corrections += 1;
+                    if invalid_submissions >= ctx.execution.llm_attempts {
+                        return Err(UnitFailure::StructuredExhausted {
+                            attempts: invalid_submissions,
+                            last_error,
+                        });
+                    }
                 }
             }
         }
+    }
+}
+
+fn push_history(history: &mut Vec<Message>, meter: &mut Metering<'_>, message: Message) {
+    let size = message_size(&message);
+    let tokens = tokenize::count_message(&message);
+    history.push(message);
+    meter.tracked += size;
+    meter.history_tokens += tokens;
+    crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, size);
+}
+
+fn cache_disposition_key(disposition: crate::scheduler::CacheDisposition) -> &'static str {
+    match disposition {
+        crate::scheduler::CacheDisposition::Disabled => "disabled",
+        crate::scheduler::CacheDisposition::Bypassed => "bypassed",
+        crate::scheduler::CacheDisposition::Hit => "hit",
+        crate::scheduler::CacheDisposition::Miss => "miss",
+        crate::scheduler::CacheDisposition::Joined => "joined",
+    }
+}
+
+fn refresh_after_compaction(
+    history: &[Message],
+    meter: &mut Metering<'_>,
+    before_tokens: u64,
+    after_tokens: u64,
+    calls: &[CompactionCallUsage],
+) {
+    let new_tracked: i64 = history.iter().map(message_size).sum();
+    crate::metrics::gauge_add(
+        &crate::metrics::HISTORY_BYTES,
+        new_tracked.saturating_sub(meter.tracked),
+    );
+    meter.tracked = new_tracked;
+    meter.history_tokens = history.iter().map(tokenize::count_message).sum();
+    meter.stats.compactions += 1;
+    meter.stats.compaction_before_tokens += before_tokens;
+    meter.stats.compaction_after_tokens += after_tokens;
+    for call in calls {
+        meter.stats.llm_calls += 1;
+        meter.stats.input_tokens += call.estimated_input_tokens;
+        meter.stats.record_provider_usage(&call.provider_usage);
     }
 }
 
@@ -274,7 +619,9 @@ enum TurnEnd {
 
 struct PreparedCall {
     req: ToolCallReq,
+    raw_arguments: String,
     arguments: serde_json::Value,
+    argument_error: Option<String>,
 }
 
 /// 一个回合：发起一次流式调用，收完事件，解释结局。可取消。
@@ -284,23 +631,23 @@ async fn one_turn(
     audit: &mut output::AuditLog,
     attempt: u32,
     cancel: &CancellationToken,
-) -> Result<TurnEnd, CallFailure> {
-    let specs = ctx.scheduler.specs();
+) -> Result<(TurnEnd, ProviderUsage), CallFailure> {
+    let prepared = ctx
+        .llm
+        .prepare_call(&ctx.instructions, history, &ctx.model_tools);
+    audit
+        .push_llm_request(attempt, prepared.body())
+        .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
     let mut call = tokio::select! {
         _ = cancel.cancelled() => return Err(CallFailure::Cancelled),
-        r = ctx.llm.call(prompt::INSTRUCTIONS, history, &specs) => r,
+        r = ctx.llm.send(prepared) => r,
     }
     .map_err(|e| classify(e.into()))?;
-    audit
-        .push(&AuditEntry::LlmRequest {
-            attempt,
-            body: call.request_body.clone(),
-        })
-        .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
 
     let mut text = String::new();
     let mut tool_calls: Vec<ToolCallReq> = Vec::new();
     let mut finish = None;
+    let mut usage = ProviderUsage::default();
     loop {
         let next = tokio::select! {
             _ = cancel.cancelled() => return Err(CallFailure::Cancelled),
@@ -309,34 +656,34 @@ async fn one_turn(
         match next {
             Ok(Some(LlmEvent::TextDelta(delta))) => text.push_str(&delta),
             Ok(Some(LlmEvent::ToolCall(tc))) => tool_calls.push(tc),
+            Ok(Some(LlmEvent::Usage(update))) => usage.merge(update),
             Ok(Some(LlmEvent::Finished(f))) => finish = Some(f),
             Ok(None) => break,
             Err(e) => {
-                for raw in call.raw_log() {
-                    audit
-                        .push(&AuditEntry::LlmEvent(raw.clone()))
-                        .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
-                }
+                audit
+                    .push_llm_event_stream(call.raw_log())
+                    .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
                 return Err(classify(e.into()));
             }
         }
     }
-    for raw in call.raw_log() {
-        audit
-            .push(&AuditEntry::LlmEvent(raw.clone()))
-            .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
-    }
+    audit
+        .push_llm_event_stream(call.raw_log())
+        .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
 
     if finish == Some(Finish::MaxTokens) {
         return Err(CallFailure::Fatal(UnitFailure::Truncated));
     }
+    if finish == Some(Finish::Refusal) {
+        return Err(CallFailure::Fatal(UnitFailure::Refused));
+    }
     if tool_calls.is_empty() {
         return match finish {
             Some(Finish::Stop) => {
-                if text.is_empty() {
+                if text.is_empty() && !ctx.output_contract.is_structured() {
                     Err(CallFailure::Fatal(UnitFailure::EmptyOutput))
                 } else {
-                    Ok(TurnEnd::FinalText(text))
+                    Ok((TurnEnd::FinalText(text), usage))
                 }
             }
             Some(Finish::ToolUse) => Err(CallFailure::Retryable(UnitFailure::Llm(
@@ -349,15 +696,28 @@ async fn one_turn(
         };
     }
 
-    // 参数 JSON 合法性在 LLM 边界校验一次，历史与执行都直接信任
+    // 参数在 LLM 边界只解析一次。非法 JSON 以合成工具结果回注，历史中使用合法空 object。
     let mut calls = Vec::with_capacity(tool_calls.len());
-    for tc in tool_calls {
-        let arguments = serde_json::from_str(&tc.arguments)
-            .map_err(|_| UnitFailure::BadToolArguments(tc.arguments.clone()))
-            .map_err(classify)?;
-        calls.push(PreparedCall { req: tc, arguments });
+    for mut tc in tool_calls {
+        let raw_arguments = tc.arguments.clone();
+        let (arguments, argument_error) = match serde_json::from_str(&raw_arguments) {
+            Ok(arguments) => (arguments, None),
+            Err(error) => {
+                tc.arguments = "{}".into();
+                (
+                    serde_json::json!({}),
+                    Some(format!("模型给出的工具参数不是合法 JSON：{error}")),
+                )
+            }
+        };
+        calls.push(PreparedCall {
+            req: tc,
+            raw_arguments,
+            arguments,
+            argument_error,
+        });
     }
-    Ok(TurnEnd::ToolCalls { text, calls })
+    Ok((TurnEnd::ToolCalls { text, calls }, usage))
 }
 
 fn read_shard(root: &Path, shard: &Shard) -> Result<ShardContent, UnitFailure> {
@@ -471,11 +831,52 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         fs::create_dir_all(&out).unwrap();
         fs::write(data.join("a.txt"), "苹果是水果。\n").unwrap();
-        let ctx = JobContext {
-            scheduler: Scheduler::start(Roots {
+        let tools = crate::config::ToolsConfig {
+            max_in_flight: 4,
+            search: crate::config::SearchToolConfig {
+                enabled: true,
+                max_result_bytes: 32768,
+                max_in_flight: 4,
+                max_matches: 100,
+                max_context_lines: 20,
+            },
+            read: crate::config::ReadToolConfig {
+                enabled: true,
+                max_result_bytes: 32768,
+                max_in_flight: 4,
+            },
+        };
+        let scheduler = Scheduler::start(
+            crate::scheduler::ToolRegistry::builtins(&tools),
+            Roots {
                 input: data.clone(),
                 output: out.clone(),
-            }),
+                output_format: crate::output::RecordFormat::Markdown,
+            },
+            &tools,
+            &crate::config::CacheConfig {
+                enabled: true,
+                max_bytes: 1024 * 1024,
+            },
+            4,
+        );
+        let model_tools = scheduler.specs();
+        let worker_run = crate::output::WorkerRun::create(
+            &out,
+            crate::output::JobReportFacts {
+                protocol: "completions".into(),
+                model: "m".into(),
+                context_window_tokens: 131072,
+                max_output_tokens: 16384,
+                context_safety_tokens: 4096,
+                concurrency: 4,
+                output_format: crate::output::RecordFormat::Markdown,
+                tools: model_tools.iter().map(|tool| tool.name.clone()).collect(),
+            },
+        )
+        .unwrap();
+        let ctx = JobContext {
+            scheduler,
             data_root: data,
             task: "任务。".into(),
             listing: vec!["a.txt".into()],
@@ -484,8 +885,19 @@ mod tests {
                 base_url: format!("http://127.0.0.1:{port}"),
                 model: "m".into(),
                 api_key: None,
+                context_window_tokens: 131072,
+                max_output_tokens: 16384,
             }),
             out_dir: out,
+            output_contract: OutputContract::Text,
+            execution: ExecutionConfig {
+                llm_attempts: 3,
+                identical_tool_call_limit: 3,
+                context_safety_tokens: 4096,
+            },
+            model_tools,
+            worker_run,
+            instructions: crate::prompt::instructions(false).to_string(),
         };
         (dir, ctx)
     }
@@ -515,14 +927,7 @@ mod tests {
             !dir.path().join("out").join("1.md").exists(),
             "取消单元不得留下记录"
         );
-        assert!(
-            dir.path()
-                .join("out")
-                .join("audit")
-                .join("1.jsonl")
-                .exists(),
-            "取消现场仍应落审计"
-        );
+        assert!(ctx.worker_run.audit_path(1).exists(), "取消现场仍应落审计");
     }
 
     #[tokio::test]
@@ -566,7 +971,7 @@ mod tests {
         assert!(text.contains("重试 2 次"), "{text}");
         assert_eq!(
             count.load(Ordering::SeqCst),
-            RETRY_BUDGET as usize,
+            ctx.execution.llm_attempts as usize,
             "500 应尝试到预算上限"
         );
     }

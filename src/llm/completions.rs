@@ -2,7 +2,7 @@
 //! 兼容讲同一形状的供应商（OpenAI、DeepSeek、Moonshot、OpenRouter、vLLM 等）。
 //! 工具调用的流式增量按 index 缓冲组装，finish_reason=tool_calls 时一次性放出。
 
-use super::{Finish, LlmConfig, LlmError, LlmEvent, Message, ToolCallReq, ToolSpec};
+use super::{Finish, LlmConfig, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq, ToolSpec};
 
 pub fn build_request(
     config: &LlmConfig,
@@ -15,6 +15,12 @@ pub fn build_request(
         match message {
             Message::User(text) => {
                 messages.push(serde_json::json!({"role": "user", "content": text}));
+            }
+            Message::Compaction(text) => {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": format!("此前历史的已验证压缩摘要：\n{text}"),
+                }));
             }
             Message::Assistant { text, tool_calls } => {
                 let mut msg = serde_json::json!({"role": "assistant"});
@@ -48,6 +54,7 @@ pub fn build_request(
     }
     let mut body = serde_json::json!({
         "model": config.model,
+        "max_tokens": config.max_output_tokens,
         "stream": true,
         "messages": messages,
     });
@@ -79,11 +86,24 @@ pub fn build_request(
 #[derive(Default)]
 pub struct Transform {
     partial: Vec<(String, String, String)>,
+    saw_refusal: bool,
+    pending_usage: Option<ProviderUsage>,
 }
 
 impl Transform {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn finish_with_usage(&mut self, finish: Finish) -> Vec<LlmEvent> {
+        let mut events = self
+            .pending_usage
+            .take()
+            .map(LlmEvent::Usage)
+            .into_iter()
+            .collect::<Vec<_>>();
+        events.push(LlmEvent::Finished(finish));
+        events
     }
 }
 
@@ -94,6 +114,32 @@ impl super::Transform for Transform {
         }
         let v: serde_json::Value = serde_json::from_str(payload)
             .map_err(|e| LlmError::protocol(format!("JSON 解析失败：{e}"), payload))?;
+        if let Some(usage) = v.get("usage").filter(|usage| usage.is_object()) {
+            let event = LlmEvent::Usage(ProviderUsage {
+                input_tokens: usage
+                    .get("prompt_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                output_tokens: usage
+                    .get("completion_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                cache_read_tokens: usage
+                    .pointer("/prompt_tokens_details/cached_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                cache_creation_tokens: usage
+                    .pointer("/prompt_tokens_details/cache_creation_tokens")
+                    .and_then(serde_json::Value::as_u64),
+            });
+            if v.get("choices")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(Vec::is_empty)
+            {
+                return Ok(vec![event]);
+            }
+            let LlmEvent::Usage(usage) = event else {
+                unreachable!()
+            };
+            self.pending_usage = Some(usage);
+        }
         let choices = v["choices"]
             .as_array()
             .ok_or_else(|| LlmError::protocol("缺少 choices 数组", payload))?;
@@ -126,12 +172,17 @@ impl super::Transform for Transform {
             {
                 return Ok(vec![LlmEvent::TextDelta(content.to_string())]);
             }
+            if delta.get("refusal").is_some_and(|value| !value.is_null()) {
+                self.saw_refusal = true;
+            }
         }
 
         match choice.get("finish_reason") {
             Some(serde_json::Value::String(reason)) => match reason.as_str() {
-                "stop" => Ok(vec![LlmEvent::Finished(Finish::Stop)]),
-                "length" => Ok(vec![LlmEvent::Finished(Finish::MaxTokens)]),
+                "stop" if self.saw_refusal => Ok(self.finish_with_usage(Finish::Refusal)),
+                "stop" => Ok(self.finish_with_usage(Finish::Stop)),
+                "length" => Ok(self.finish_with_usage(Finish::MaxTokens)),
+                "content_filter" | "refusal" => Ok(self.finish_with_usage(Finish::Refusal)),
                 "tool_calls" | "function_call" => {
                     if self.partial.is_empty() {
                         return Err(LlmError::protocol(
@@ -150,6 +201,9 @@ impl super::Transform for Transform {
                             })
                         })
                         .collect();
+                    if let Some(usage) = self.pending_usage.take() {
+                        events.push(LlmEvent::Usage(usage));
+                    }
                     events.push(LlmEvent::Finished(Finish::ToolUse));
                     Ok(events)
                 }
@@ -232,12 +286,40 @@ mod tests {
     }
 
     #[test]
+    fn usage_and_refusal_are_preserved_on_final_choice() {
+        let mut usage = Transform::new();
+        let events = usage
+            .push("{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2,\"prompt_tokens_details\":{\"cached_tokens\":7,\"cache_creation_tokens\":1}},\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}")
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::Usage(ProviderUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(2),
+                    cache_read_tokens: Some(7),
+                    cache_creation_tokens: Some(1),
+                }),
+                LlmEvent::Finished(Finish::Stop),
+            ]
+        );
+
+        let mut refusal = Transform::new();
+        let events = refusal
+            .push("{\"choices\":[{\"delta\":{\"refusal\":\"no\"},\"finish_reason\":\"stop\"}]}")
+            .unwrap();
+        assert_eq!(events, vec![LlmEvent::Finished(Finish::Refusal)]);
+    }
+
+    #[test]
     fn history_maps_to_messages() {
         let config = LlmConfig {
             protocol: super::super::Protocol::Completions,
             base_url: "http://x/v1".into(),
             model: "m".into(),
             api_key: None,
+            context_window_tokens: 131072,
+            max_output_tokens: 16384,
         };
         let history = vec![
             Message::User("任务".into()),
