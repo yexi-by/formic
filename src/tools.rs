@@ -1,9 +1,12 @@
 //! Formic 内置只读工具。这里唯一拥有参数语义、路径边界、结果截断和缓存键规范化。
 
 use std::fs;
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 
+use cap_std::ambient_authority;
+use cap_std::fs::Dir;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, SearcherBuilder, Sink, SinkMatch};
 use serde_json::Value;
@@ -16,9 +19,81 @@ use crate::output::RecordFormat;
 /// 两棵只读根：input 是输入数据集；output 是已完成单元记录所在目录。
 #[derive(Clone)]
 pub struct Roots {
-    pub input: PathBuf,
-    pub output: PathBuf,
+    pub input: ReadRoot,
+    pub output: ReadRoot,
     pub output_format: RecordFormat,
+}
+
+/// 启动时打开一次的只读目录能力。后续所有文件访问都相对此句柄完成；保存的路径
+/// 只用于错误信息和测试准备，不参与文件打开或目录遍历。
+#[derive(Clone)]
+pub struct ReadRoot {
+    dir: Arc<Dir>,
+}
+
+impl ReadRoot {
+    /// 使用 ambient authority 打开根目录。这是读取边界唯一一次按环境路径打开根；
+    /// 调用方应在启动阶段创建并在整个作业中复用返回值。
+    pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
+        let path = path.into();
+        let dir = Dir::open_ambient_dir(&path, ambient_authority())?;
+        Ok(Self { dir: Arc::new(dir) })
+    }
+
+    pub(crate) fn from_dir(dir: Dir) -> Self {
+        Self { dir: Arc::new(dir) }
+    }
+
+    fn open_file(&self, relative: &Path) -> io::Result<fs::File> {
+        validate_relative_path(relative)?;
+        self.reject_link_components(relative)?;
+        let file = self.dir.open(relative)?.into_std();
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other(format!(
+                "路径 {} 不是文件",
+                crate::prompt::slash_path(relative)
+            )));
+        }
+        Ok(file)
+    }
+
+    /// 静态目录树中的链接仍按产品契约拒绝；路径被并发替换时，根句柄相对打开
+    /// 继续保证结果无法逃逸 capability 根。
+    fn reject_link_components(&self, relative: &Path) -> io::Result<()> {
+        let mut current = PathBuf::new();
+        for component in relative.components() {
+            current.push(component.as_os_str());
+            let metadata = self.dir.symlink_metadata(&current).map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!(
+                        "路径 {} 不可用：{error}",
+                        crate::prompt::slash_path(relative)
+                    ),
+                )
+            })?;
+            if metadata.file_type().is_symlink() {
+                return Err(io::Error::other(format!(
+                    "路径 {} 包含符号链接或目录联接",
+                    crate::prompt::slash_path(relative)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clone_dir(&self) -> io::Result<Dir> {
+        self.dir.try_clone()
+    }
+
+    fn open_dir(&self, relative: &Path) -> io::Result<Dir> {
+        if relative.as_os_str().is_empty() {
+            return self.clone_dir();
+        }
+        validate_relative_path(relative)?;
+        self.reject_link_components(relative)?;
+        self.dir.open_dir(relative)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -141,13 +216,11 @@ impl BuiltinTool {
     ) -> ToolOutput {
         match self {
             Self::Search(config) => match parse_search(arguments, config) {
-                Ok(args) => search(roots, config, &args, cancel)
-                    .unwrap_or_else(|message| ToolOutput::error(message)),
+                Ok(args) => search(roots, config, &args, cancel).unwrap_or_else(ToolOutput::error),
                 Err(message) => ToolOutput::error(message),
             },
             Self::Read(config) => match parse_read(arguments) {
-                Ok(args) => read(roots, config, &args, cancel)
-                    .unwrap_or_else(|message| ToolOutput::error(message)),
+                Ok(args) => read(roots, config, &args, cancel).unwrap_or_else(ToolOutput::error),
                 Err(message) => ToolOutput::error(message),
             },
         }
@@ -374,9 +447,9 @@ fn search(
         {
             continue;
         }
-        let Ok(bytes) = fs::read(root.join(relative)) else {
-            continue;
-        };
+        let file = open_root_file(root, relative).map_err(|error| {
+            format!("无法读取 {}：{error}", crate::prompt::slash_path(relative))
+        })?;
         let mut sink = MatchSink {
             path: crate::prompt::slash_path(relative),
             context: args.context,
@@ -392,9 +465,26 @@ fn search(
             .line_number(true)
             .before_context(args.context)
             .after_context(args.context)
+            .heap_limit(Some(config.max_result_bytes.max(64 * 1024)))
             .binary_detection(BinaryDetection::quit(b'\0'))
             .build();
-        let _ = searcher.search_reader(&matcher, &bytes[..], &mut sink);
+        let reader = CancellableReader {
+            inner: file,
+            cancel,
+        };
+        searcher
+            .search_reader(&matcher, reader, &mut sink)
+            .map_err(|error| {
+                if cancel.is_cancelled() {
+                    "工具调用已取消".to_string()
+                } else {
+                    format!(
+                        "搜索 {} 失败：{error}；文件单行不得超过搜索内存上限 {} 字节",
+                        crate::prompt::slash_path(relative),
+                        config.max_result_bytes.max(64 * 1024)
+                    )
+                }
+            })?;
         if truncated.is_some() {
             break 'files;
         }
@@ -431,53 +521,18 @@ fn read(
         validate_output_record(&args.path, roots.output_format)?;
     }
     let root = scope_root(roots, args.scope);
-    let target = resolve_no_symlink(root, &args.path)?;
-    let file = fs::File::open(&target).map_err(|error| {
-        format!(
-            "无法读取 {}：{error}",
-            crate::prompt::slash_path(&args.path)
-        )
-    })?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    let mut line_number = 0u64;
-    let mut out = String::new();
-    let mut truncated = false;
-    loop {
-        if cancel.is_cancelled() {
-            return Err("工具调用已取消".into());
-        }
-        line.clear();
-        let bytes = reader.read_line(&mut line).map_err(|error| {
-            if error.kind() == io::ErrorKind::InvalidData {
-                format!("{} 不是合法 UTF-8", crate::prompt::slash_path(&args.path))
-            } else {
-                format!(
-                    "读取 {} 失败：{error}",
-                    crate::prompt::slash_path(&args.path)
-                )
-            }
-        })?;
-        if bytes == 0 {
-            break;
-        }
-        line_number += 1;
-        let selected =
-            line_number >= args.start_line && args.end_line.is_none_or(|end| line_number <= end);
-        if selected && !truncated {
-            let text = line.trim_end_matches(['\n', '\r']);
-            let rendered = format!("{line_number}: {text}\n");
-            if out.len() + rendered.len() > config.max_result_bytes {
-                let remaining = config.max_result_bytes.saturating_sub(out.len());
-                if remaining > 0 {
-                    out.push_str(truncate_utf8(&rendered, remaining));
-                }
-                truncated = true;
-            } else {
-                out.push_str(&rendered);
-            }
-        }
-    }
+    let result = read_utf8_lines(
+        root,
+        &args.path,
+        args.start_line,
+        args.end_line,
+        LineRender::Numbered,
+        Some(config.max_result_bytes),
+        cancel,
+    )
+    .map_err(|error| format_read_error(&args.path, error))?;
+    let mut out = result.content;
+    let truncated = result.truncated;
     if out.is_empty() && !truncated {
         out.push_str("无内容。");
     }
@@ -495,7 +550,7 @@ fn read(
     ))
 }
 
-fn scope_root(roots: &Roots, scope: Scope) -> &Path {
+fn scope_root(roots: &Roots, scope: Scope) -> &ReadRoot {
     match scope {
         Scope::Input => &roots.input,
         Scope::Output => &roots.output,
@@ -519,37 +574,357 @@ fn validate_output_record(path: &Path, format: RecordFormat) -> Result<(), Strin
     Ok(())
 }
 
-fn resolve_no_symlink(root: &Path, relative: &Path) -> Result<PathBuf, String> {
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        current.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&current).map_err(|error| {
-            format!(
-                "路径 {} 不可用：{error}",
-                crate::prompt::slash_path(relative)
-            )
-        })?;
-        if metadata.file_type().is_symlink() {
-            return Err(format!(
-                "路径 {} 包含符号链接",
-                crate::prompt::slash_path(relative)
-            ));
+fn validate_relative_path(relative: &Path) -> io::Result<()> {
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(io::Error::other("路径必须是根内不含 . 或 .. 的相对路径"));
+    }
+    Ok(())
+}
+
+/// 通过启动时打开的根 capability 打开文件。安全边界来自目录句柄相对解析，
+/// 不依赖可被并发替换的 ambient 路径复查。
+pub(crate) fn open_root_file(root: &ReadRoot, relative: &Path) -> io::Result<fs::File> {
+    root.open_file(relative)
+}
+
+struct CancellableReader<'a> {
+    inner: fs::File,
+    cancel: &'a CancellationToken,
+}
+
+impl Read for CancellableReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if self.cancel.is_cancelled() {
+            // grep-searcher 会自动重试 Interrupted；使用 Other 才能让取消立即终止搜索。
+            return Err(io::Error::other("工具调用已取消"));
+        }
+        self.inner.read(buffer)
+    }
+}
+
+#[derive(Default)]
+struct Utf8StreamDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8StreamDecoder {
+    /// 返回 false 表示调用方已经取得足够内容，读取应立即停止。
+    fn push(&mut self, bytes: &[u8], mut emit: impl FnMut(&str) -> bool) -> io::Result<bool> {
+        if bytes.is_empty() {
+            return Ok(true);
+        }
+        if self.pending.is_empty() {
+            return match std::str::from_utf8(bytes) {
+                Ok(text) => Ok(emit(text)),
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    if valid > 0
+                        && !emit(std::str::from_utf8(&bytes[..valid]).expect("已确认 UTF-8 前缀"))
+                    {
+                        return Ok(false);
+                    }
+                    if error.error_len().is_some() {
+                        Err(io::Error::new(io::ErrorKind::InvalidData, "不是合法 UTF-8"))
+                    } else {
+                        self.pending.extend_from_slice(&bytes[valid..]);
+                        Ok(true)
+                    }
+                }
+            };
+        }
+        let mut combined = Vec::with_capacity(self.pending.len() + bytes.len());
+        combined.append(&mut self.pending);
+        combined.extend_from_slice(bytes);
+        match std::str::from_utf8(&combined) {
+            Ok(text) => return Ok(emit(text)),
+            Err(error) => {
+                let valid = error.valid_up_to();
+                if valid > 0
+                    && !emit(std::str::from_utf8(&combined[..valid]).expect("已确认 UTF-8 前缀"))
+                {
+                    return Ok(false);
+                }
+                if error.error_len().is_some() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "不是合法 UTF-8"));
+                }
+                self.pending.extend_from_slice(&combined[valid..]);
+            }
+        }
+        Ok(true)
+    }
+
+    fn finish(&self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::InvalidData, "不是合法 UTF-8"))
         }
     }
-    if !current.is_file() {
-        return Err(format!(
-            "路径 {} 不是文件",
-            crate::prompt::slash_path(relative)
-        ));
+}
+
+/// 逐块解码 UTF-8 文件。emit 返回 false 时不再读取剩余内容。
+pub(crate) fn stream_utf8_file(
+    root: &ReadRoot,
+    relative: &Path,
+    cancel: &CancellationToken,
+    mut emit: impl FnMut(&str) -> bool,
+) -> io::Result<bool> {
+    let mut file = open_root_file(root, relative)?;
+    let mut decoder = Utf8StreamDecoder::default();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "读取已取消"));
+        }
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            decoder.finish()?;
+            return Ok(true);
+        }
+        if !decoder.push(&buffer[..count], &mut emit)? {
+            return Ok(false);
+        }
     }
-    let canonical_root =
-        fs::canonicalize(root).map_err(|error| format!("无法解析根目录：{error}"))?;
-    let canonical_target =
-        fs::canonicalize(&current).map_err(|error| format!("无法解析文件路径：{error}"))?;
-    if !canonical_target.starts_with(canonical_root) {
-        return Err("路径逃逸出只读根目录".into());
+}
+
+pub(crate) enum LineRender {
+    Plain,
+    Numbered,
+}
+
+pub(crate) struct StreamedText {
+    pub content: String,
+    pub truncated: bool,
+}
+
+/// 流式读取闭区间行范围。只保留选中内容；到达 end 或字节上限后立即停止。
+pub(crate) fn read_utf8_lines(
+    root: &ReadRoot,
+    relative: &Path,
+    start: u64,
+    end: Option<u64>,
+    render: LineRender,
+    max_bytes: Option<usize>,
+    cancel: &CancellationToken,
+) -> io::Result<StreamedText> {
+    let mut output = String::new();
+    let mut truncated = false;
+    stream_utf8_lines(root, relative, start, end, render, cancel, |text| {
+        if let Some(limit) = max_bytes {
+            let remaining = limit.saturating_sub(output.len());
+            if text.len() > remaining {
+                output.push_str(truncate_utf8(text, remaining));
+                truncated = true;
+                return false;
+            }
+        }
+        output.push_str(text);
+        true
+    })?;
+    Ok(StreamedText {
+        content: output,
+        truncated,
+    })
+}
+
+/// 流式读取闭区间行范围。emit 返回 false 时立即停止，不读取剩余内容。
+pub(crate) fn stream_utf8_lines(
+    root: &ReadRoot,
+    relative: &Path,
+    start: u64,
+    end: Option<u64>,
+    render: LineRender,
+    cancel: &CancellationToken,
+    mut emit: impl FnMut(&str) -> bool,
+) -> io::Result<bool> {
+    let mut file = open_root_file(root, relative)?;
+    let mut buffer = [0u8; 64 * 1024];
+    let mut decoder = Utf8StreamDecoder::default();
+    let mut line_number = 1u64;
+    let mut line_has_bytes = false;
+    let mut line_started = false;
+    let mut selected_any = false;
+    let mut held_cr = false;
+
+    'read: loop {
+        if cancel.is_cancelled() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "读取已取消"));
+        }
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            if line_has_bytes {
+                if !begin_selected_line(
+                    line_number,
+                    start,
+                    end,
+                    &render,
+                    &mut selected_any,
+                    &mut line_started,
+                    &mut emit,
+                ) {
+                    return Ok(false);
+                }
+                if held_cr {
+                    let selected =
+                        line_number >= start && end.is_none_or(|limit| line_number <= limit);
+                    if !decoder.push(b"\r", |text| !selected || emit(text))? {
+                        return Ok(false);
+                    }
+                }
+                decoder.finish()?;
+                if !finish_selected_line(line_number, start, end, &render, &mut emit) {
+                    return Ok(false);
+                }
+            } else {
+                decoder.finish()?;
+            }
+            break;
+        }
+
+        let mut offset = 0usize;
+        while offset < count {
+            if cancel.is_cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "读取已取消"));
+            }
+            let rest = &buffer[offset..count];
+            let newline = rest.iter().position(|byte| *byte == b'\n');
+            let length = newline.unwrap_or(rest.len());
+            let segment = &rest[..length];
+            line_has_bytes |= !segment.is_empty();
+            if !begin_selected_line(
+                line_number,
+                start,
+                end,
+                &render,
+                &mut selected_any,
+                &mut line_started,
+                &mut emit,
+            ) {
+                return Ok(false);
+            }
+
+            if held_cr && !segment.is_empty() {
+                let selected = line_number >= start && end.is_none_or(|limit| line_number <= limit);
+                if !decoder.push(b"\r", |text| !selected || emit(text))? {
+                    return Ok(false);
+                }
+            }
+            let (content, ends_with_cr) = segment
+                .strip_suffix(b"\r")
+                .map_or((segment, false), |content| (content, true));
+            let selected = line_number >= start && end.is_none_or(|limit| line_number <= limit);
+            if !decoder.push(content, |text| !selected || emit(text))? {
+                return Ok(false);
+            }
+            held_cr = ends_with_cr;
+
+            if newline.is_some() {
+                decoder.finish()?;
+                decoder = Utf8StreamDecoder::default();
+                held_cr = false;
+                if !finish_selected_line(line_number, start, end, &render, &mut emit) {
+                    return Ok(false);
+                }
+                if end.is_some_and(|limit| line_number >= limit) {
+                    break 'read;
+                }
+                line_number = line_number.saturating_add(1);
+                line_has_bytes = false;
+                line_started = false;
+                offset += length + 1;
+            } else {
+                offset = count;
+            }
+        }
     }
-    Ok(current)
+
+    Ok(true)
+}
+
+fn begin_selected_line(
+    line_number: u64,
+    start: u64,
+    end: Option<u64>,
+    render: &LineRender,
+    selected_any: &mut bool,
+    line_started: &mut bool,
+    emit: &mut impl FnMut(&str) -> bool,
+) -> bool {
+    if *line_started || line_number < start || end.is_some_and(|limit| line_number > limit) {
+        return true;
+    }
+    *line_started = true;
+    let keep_reading = match render {
+        LineRender::Plain => {
+            if *selected_any {
+                emit("\n")
+            } else {
+                true
+            }
+        }
+        LineRender::Numbered => emit(&format!("{line_number}: ")),
+    };
+    *selected_any = true;
+    keep_reading
+}
+
+fn finish_selected_line(
+    line_number: u64,
+    start: u64,
+    end: Option<u64>,
+    render: &LineRender,
+    emit: &mut impl FnMut(&str) -> bool,
+) -> bool {
+    if matches!(render, LineRender::Numbered)
+        && line_number >= start
+        && end.is_none_or(|limit| line_number <= limit)
+    {
+        emit("\n")
+    } else {
+        true
+    }
+}
+
+pub(crate) fn count_utf8_lines(root: &ReadRoot, relative: &Path) -> io::Result<u64> {
+    let mut file = open_root_file(root, relative)?;
+    let mut decoder = Utf8StreamDecoder::default();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut newlines = 0u64;
+    let mut saw_bytes = false;
+    let mut ended_with_newline = false;
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            decoder.finish()?;
+            return Ok(newlines + u64::from(saw_bytes && !ended_with_newline));
+        }
+        saw_bytes = true;
+        ended_with_newline = buffer[count - 1] == b'\n';
+        newlines = newlines.saturating_add(
+            u64::try_from(
+                buffer[..count]
+                    .iter()
+                    .filter(|byte| **byte == b'\n')
+                    .count(),
+            )
+            .unwrap_or(u64::MAX),
+        );
+        decoder.push(&buffer[..count], |_| true)?;
+    }
+}
+
+fn format_read_error(path: &Path, error: io::Error) -> String {
+    if error.kind() == io::ErrorKind::Interrupted {
+        "工具调用已取消".into()
+    } else if error.kind() == io::ErrorKind::InvalidData {
+        format!("{} 不是合法 UTF-8", crate::prompt::slash_path(path))
+    } else {
+        format!("读取 {} 失败：{error}", crate::prompt::slash_path(path))
+    }
 }
 
 fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
@@ -576,7 +951,7 @@ fn apply_truncation_marker(output: &mut String, reason: &str, max_bytes: usize) 
 }
 
 fn scope_files(
-    root: &Path,
+    root: &ReadRoot,
     scope: Scope,
     format: RecordFormat,
     cancel: Option<&CancellationToken>,
@@ -585,23 +960,24 @@ fn scope_files(
         Scope::Input => walk_files_cancellable(root, cancel),
         Scope::Output => {
             let mut files = Vec::new();
-            for entry in fs::read_dir(root)? {
+            for entry in root.clone_dir()?.entries()? {
                 if cancel.is_some_and(CancellationToken::is_cancelled) {
                     break;
                 }
                 let entry = entry?;
-                if entry.file_type()?.is_symlink() {
+                let kind = entry.file_type()?;
+                if kind.is_symlink() {
                     continue;
                 }
-                let path = entry.path();
+                let path = PathBuf::from(entry.file_name());
                 let Some(name) = path.file_stem().and_then(|value| value.to_str()) else {
                     continue;
                 };
-                if path.is_file()
+                if kind.is_file()
                     && path.extension().and_then(|value| value.to_str()) == Some(format.extension())
                     && name.parse::<u64>().is_ok_and(|unit| unit > 0)
                 {
-                    files.push(path.strip_prefix(root).expect("目录项在根内").to_path_buf());
+                    files.push(path);
                 }
             }
             files.sort();
@@ -611,18 +987,20 @@ fn scope_files(
 }
 
 /// 递归列出根内普通文件；符号链接不跟随。
-pub fn walk_files(root: &Path) -> io::Result<Vec<PathBuf>> {
+pub fn walk_files(root: &ReadRoot) -> io::Result<Vec<PathBuf>> {
     walk_files_cancellable(root, None)
 }
 
 fn walk_files_cancellable(
-    root: &Path,
+    root: &ReadRoot,
     cancel: Option<&CancellationToken>,
 ) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(directory) = stack.pop() {
-        for entry in fs::read_dir(directory)? {
+    // 栈只保留相对路径；宽目录或深目录不会同时占用大量句柄。
+    let mut stack = vec![PathBuf::new()];
+    while let Some(relative_dir) = stack.pop() {
+        let directory = root.open_dir(&relative_dir)?;
+        for entry in directory.entries()? {
             if cancel.is_some_and(CancellationToken::is_cancelled) {
                 return Ok(files);
             }
@@ -631,15 +1009,11 @@ fn walk_files_cancellable(
             if kind.is_symlink() {
                 continue;
             }
-            let path = entry.path();
+            let path = relative_dir.join(entry.file_name());
             if kind.is_dir() {
                 stack.push(path);
             } else if kind.is_file() {
-                files.push(
-                    path.strip_prefix(root)
-                        .expect("遍历结果在根内")
-                        .to_path_buf(),
-                );
+                files.push(path);
             }
         }
     }
@@ -673,9 +1047,11 @@ impl MatchSink<'_> {
         }
         let separator = if matched { ':' } else { '-' };
         let line_text = format!("{line}{separator} {text}\n");
-        let header_bytes = (!self.header_written)
-            .then_some(self.path.len() + 7)
-            .unwrap_or(0);
+        let header_bytes = if self.header_written {
+            0
+        } else {
+            self.path.len() + 7
+        };
         if self.out.len() + header_bytes + line_text.len() > self.max_bytes {
             *self.truncated = Some(format!("结果达到 {} 字节上限", self.max_bytes));
             return false;
@@ -734,6 +1110,7 @@ mod tests {
 
     struct Fixture {
         _directory: tempfile::TempDir,
+        input_path: PathBuf,
         roots: Roots,
         config: ToolsConfig,
     }
@@ -777,9 +1154,10 @@ mod tests {
         };
         Fixture {
             _directory: directory,
+            input_path: input.clone(),
             roots: Roots {
-                input,
-                output,
+                input: ReadRoot::open(input).unwrap(),
+                output: ReadRoot::open(output).unwrap(),
                 output_format: format,
             },
             config: ToolsConfig {
@@ -845,7 +1223,7 @@ mod tests {
                 output.content
             );
         }
-        fs::write(fixture.roots.input.join("bad.txt"), [0xff, 0xfe]).unwrap();
+        fs::write(fixture.input_path.join("bad.txt"), [0xff, 0xfe]).unwrap();
         let output = execute(&fixture, "read", r#"{"scope":"input","path":"bad.txt"}"#);
         assert!(output.content.contains("UTF-8"), "{}", output.content);
     }
@@ -856,12 +1234,41 @@ mod tests {
         use std::os::unix::fs::symlink;
         let fixture = fixture(RecordFormat::Markdown);
         symlink(
-            fixture.roots.input.join("a.txt"),
-            fixture.roots.input.join("link.txt"),
+            fixture.input_path.join("a.txt"),
+            fixture.input_path.join("link.txt"),
         )
         .unwrap();
         let output = execute(&fixture, "read", r#"{"scope":"input","path":"link.txt"}"#);
         assert!(output.content.contains("符号链接"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_root_is_not_rebound_when_ambient_path_is_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let ambient = directory.path().join("data");
+        let original = directory.path().join("original-data");
+        fs::create_dir(&ambient).unwrap();
+        fs::write(ambient.join("value.txt"), "原目录").unwrap();
+        let root = ReadRoot::open(ambient.clone()).unwrap();
+
+        fs::rename(&ambient, &original).unwrap();
+        fs::create_dir(&ambient).unwrap();
+        fs::write(ambient.join("value.txt"), "替换目录").unwrap();
+
+        let mut value = String::new();
+        stream_utf8_file(
+            &root,
+            Path::new("value.txt"),
+            &CancellationToken::new(),
+            |text| {
+                value.push_str(text);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(value, "原目录");
+        assert_eq!(walk_files(&root).unwrap(), [PathBuf::from("value.txt")]);
     }
 
     #[test]
@@ -876,6 +1283,100 @@ mod tests {
         assert!(read.content.contains("[cut]"));
         assert!(read.content.len() <= 8);
         assert!(!read.cacheable);
+    }
+
+    #[test]
+    fn read_stops_at_end_line_and_bounds_a_giant_line() {
+        let mut fixture = fixture(RecordFormat::Markdown);
+        fs::write(fixture.input_path.join("early.txt"), b"first\n\xff").unwrap();
+        let early = execute(
+            &fixture,
+            "read",
+            r#"{"scope":"input","path":"early.txt","end_line":1}"#,
+        );
+        assert_eq!(early.content, "1: first\n");
+
+        fixture.config.read.max_result_bytes = 32;
+        fs::write(
+            fixture.input_path.join("giant.txt"),
+            format!("{}\n不会读取到这里", "苹".repeat(100_000)),
+        )
+        .unwrap();
+        let giant = execute(
+            &fixture,
+            "read",
+            r#"{"scope":"input","path":"giant.txt","end_line":1}"#,
+        );
+        assert!(giant.content.contains("已截断") || giant.content.contains("[cut]"));
+        assert!(giant.content.len() <= 32, "{}", giant.content.len());
+        assert!(!giant.cacheable);
+
+        fs::write(fixture.input_path.join("carriage.txt"), b"tail\r").unwrap();
+        let carriage = execute(
+            &fixture,
+            "read",
+            r#"{"scope":"input","path":"carriage.txt"}"#,
+        );
+        assert_eq!(carriage.content, "1: tail\r\n");
+    }
+
+    #[test]
+    fn search_rejects_a_line_over_its_heap_boundary() {
+        let mut fixture = fixture(RecordFormat::Markdown);
+        fixture.config.search.max_result_bytes = 1024;
+        fs::write(
+            fixture.input_path.join("one-line.txt"),
+            "x".repeat(128 * 1024),
+        )
+        .unwrap();
+        let found = execute(
+            &fixture,
+            "search",
+            r#"{"pattern":"never-present","scope":"input","glob":"one-line.txt"}"#,
+        );
+        assert!(found.content.starts_with("错误：搜索"), "{}", found.content);
+        assert!(found.content.contains("内存上限"), "{}", found.content);
+        assert!(!found.cacheable);
+    }
+
+    #[test]
+    fn cancelled_read_returns_an_uncacheable_error() {
+        let fixture = fixture(RecordFormat::Markdown);
+        let tool = registrations(&fixture.config)
+            .into_iter()
+            .find(|entry| entry.spec.name == "read")
+            .unwrap()
+            .executor;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let output = tool.execute_cancellable(
+            &fixture.roots,
+            &serde_json::json!({"scope":"input","path":"a.txt"}),
+            &cancel,
+        );
+        assert!(output.content.contains("取消"), "{}", output.content);
+        assert!(!output.cacheable);
+    }
+
+    #[test]
+    fn streamed_file_checks_cancellation_between_chunks() {
+        let fixture = fixture(RecordFormat::Markdown);
+        fs::write(fixture.input_path.join("large.txt"), "x".repeat(256 * 1024)).unwrap();
+        let cancel = CancellationToken::new();
+        let mut chunks = 0usize;
+        let error = stream_utf8_file(
+            &fixture.roots.input,
+            Path::new("large.txt"),
+            &cancel,
+            |_| {
+                chunks += 1;
+                cancel.cancel();
+                true
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(chunks, 1, "取消后不得再解码下一块");
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! 字节一致，分片内容与定位永远在消息末尾——这是 prompt cache 跨单元命中的前提。
 //! Formic 对任务说明只做机械搬运，不理解其中的自然语言。
 
+use std::fmt;
 use std::path::Path;
 
 /// 文本模式系统提示词：Formic 拥有的静态文本，全 worker 字节一致、作业内不改。
@@ -39,6 +40,7 @@ pub fn instructions(structured: bool) -> &'static str {
 }
 
 /// 已读出的分片内容，路径均为面向模型的根内相对表示。
+#[cfg(test)]
 pub enum ShardContent {
     Files(Vec<(String, String)>),
     Lines {
@@ -49,23 +51,50 @@ pub enum ShardContent {
     },
 }
 
+/// 写入任务说明、文件清单和分片标题。调用方可在每次 write 时实施预算。
+pub(crate) fn write_user_prefix(
+    output: &mut impl fmt::Write,
+    task: &str,
+    listing: &[String],
+) -> fmt::Result {
+    output.write_str(task.trim_end_matches('\n'))?;
+    output.write_str("\n\n# 数据集文件清单\n")?;
+    for file in listing {
+        output.write_str(file)?;
+        output.write_char('\n')?;
+    }
+    output.write_str("\n# 你的分片\n")
+}
+
+pub(crate) fn write_file_header(
+    output: &mut impl fmt::Write,
+    index: usize,
+    path: &str,
+) -> fmt::Result {
+    if index > 0 {
+        output.write_char('\n')?;
+    }
+    writeln!(output, "## 文件 {path}")
+}
+
+pub(crate) fn write_line_header(
+    output: &mut impl fmt::Write,
+    file: &str,
+    start: u64,
+    end: u64,
+) -> fmt::Result {
+    writeln!(output, "## 文件 {file} 第 {start}-{end} 行")
+}
+
 /// 装配用户消息：任务说明原文 + 数据集文件清单 + 分片内容与定位。
+#[cfg(test)]
 pub fn build_user_message(task: &str, listing: &[String], shard: &ShardContent) -> String {
     let mut msg = String::new();
-    msg.push_str(task.trim_end_matches('\n'));
-    msg.push_str("\n\n# 数据集文件清单\n");
-    for f in listing {
-        msg.push_str(f);
-        msg.push('\n');
-    }
-    msg.push_str("\n# 你的分片\n");
+    write_user_prefix(&mut msg, task, listing).expect("String 写入不会失败");
     match shard {
         ShardContent::Files(files) => {
             for (i, (path, content)) in files.iter().enumerate() {
-                if i > 0 {
-                    msg.push('\n');
-                }
-                msg.push_str(&format!("## 文件 {path}\n"));
+                write_file_header(&mut msg, i, path).expect("String 写入不会失败");
                 msg.push_str(content.trim_end_matches('\n'));
                 msg.push('\n');
             }
@@ -76,7 +105,7 @@ pub fn build_user_message(task: &str, listing: &[String], shard: &ShardContent) 
             end,
             content,
         } => {
-            msg.push_str(&format!("## 文件 {file} 第 {start}-{end} 行\n"));
+            write_line_header(&mut msg, file, *start, *end).expect("String 写入不会失败");
             msg.push_str(content.trim_end_matches('\n'));
             msg.push('\n');
         }

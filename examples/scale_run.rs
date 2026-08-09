@@ -51,7 +51,6 @@ fn main() {
         )
         .env("FORMIC_LLM_MODEL", "scale-model")
         .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env("FORMIC_LLM_MAX_OUTPUT_TOKENS", "16384")
         .env("FORMIC_METRICS", "1")
         .env_remove("FORMIC_LLM_API_KEY")
         // 本地 mock 必须直连，避免开发机代理把规模实验变成代理压力测试。
@@ -258,7 +257,11 @@ fn start_scale_mock(turns: usize, delay_ms: u64) -> ScaleMock {
 
 fn tool_call_sse(k: usize) -> String {
     // 按回合交替等价 glob（字节不同、结果相同），规避连续相同调用的停滞检测
-    let glob = if k % 2 == 0 { "*.txt" } else { "**/*.txt" };
+    let glob = if k.is_multiple_of(2) {
+        "*.txt"
+    } else {
+        "**/*.txt"
+    };
     let args = format!(
         "{{\\\"pattern\\\":\\\"苹果\\\",\\\"scope\\\":\\\"input\\\",\\\"glob\\\":\\\"{glob}\\\"}}"
     );

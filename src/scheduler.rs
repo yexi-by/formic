@@ -622,8 +622,8 @@ mod tests {
         let scheduler = Scheduler::start(
             registry,
             Roots {
-                input,
-                output,
+                input: crate::tools::ReadRoot::open(input).unwrap(),
+                output: crate::tools::ReadRoot::open(output).unwrap(),
                 output_format: RecordFormat::Markdown,
             },
             &tools,

@@ -27,7 +27,7 @@
   `{"unit":1,"files":["a.txt",...]}` 或
   `{"unit":2,"file":"big.txt","start":100,"end":200}`（1 起始、双端闭区间，
   end 允许超过文件行数视为到文件尾）。校验：单元号是不重复的自然数；路径为
-  数据根内相对路径、canonicalize 后不逃逸数据根、指向存在的文件；分片非空。
+  数据根内相对路径、通过启动时打开的根目录 capability 解析且不能逃逸、指向存在的文件；分片非空。
   错误报计划文件、行号、单元号与原因。空白行跳过。
 - **环境变量**（缺失必填项启动即失败，报变量名与用途）：
   - `FORMIC_LLM_PROTOCOL`：`completions` / `responses` / `anthropic`；
@@ -58,8 +58,8 @@
 | `src/output.rs` | 原子发布、审计落盘、汇总（输出区不变量唯一所有者） |
 
 内部事件枚举：`TextDelta / ToolCall / Finished(Stop|MaxTokens)`；worker 不感知
-后端差异。Anthropic 的 `max_tokens = 16384` 为协议必填内部参数，由代码固定
-（`src/llm/anthropic.rs`），非配置项。
+后端差异。Anthropic 的 `max_tokens` 是协议专用必填参数，由部署配置明确提供
+（`src/llm/anthropic.rs`），也是唯一允许的供应商专用生成参数配置。
 
 ## 验证证据
 

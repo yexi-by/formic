@@ -9,7 +9,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::llm::ToolSpec;
-use crate::output::RecordFormat;
+use crate::output::{OutputRoot, RecordFormat};
 
 pub const SUBMIT_RESULT_TOOL: &str = "formic_submit_result";
 const SCHEMA_RECORD: &str = "output-schema.json";
@@ -69,11 +69,11 @@ pub enum OutputContractError {
 impl OutputContract {
     pub fn prepare(
         schema_path: Option<&Path>,
-        out_dir: &Path,
+        out_root: &OutputRoot,
     ) -> Result<Self, OutputContractError> {
         match schema_path {
             None => {
-                enforce_text_directory(out_dir)?;
+                enforce_text_directory(out_root)?;
                 Ok(Self::Text)
             }
             Some(path) => {
@@ -97,7 +97,7 @@ impl OutputContract {
                     "{}\n",
                     serde_json::to_string_pretty(&schema).expect("JSON Value 可序列化")
                 );
-                enforce_structured_directory(out_dir, &schema, &pretty_schema)?;
+                enforce_structured_directory(out_root, &schema, &pretty_schema)?;
                 Ok(Self::Structured(Arc::new(StructuredOutput {
                     schema,
                     validator,
@@ -269,16 +269,16 @@ fn reject_object_keywords(
     Ok(())
 }
 
-fn enforce_text_directory(out_dir: &Path) -> Result<(), OutputContractError> {
-    if out_dir.join(SCHEMA_RECORD).exists() {
+fn enforce_text_directory(out_root: &OutputRoot) -> Result<(), OutputContractError> {
+    if out_root.exists(Path::new(SCHEMA_RECORD)) {
         return Err(directory_error(
-            out_dir,
+            out_root.path(),
             "存在 output-schema.json，不能以文本模式继续",
         ));
     }
-    if let Some(record) = numbered_record(out_dir, "json")? {
+    if let Some(record) = numbered_record(out_root, "json")? {
         return Err(directory_error(
-            out_dir,
+            out_root.path(),
             &format!("存在结构化完成记录 {}", record.display()),
         ));
     }
@@ -286,74 +286,87 @@ fn enforce_text_directory(out_dir: &Path) -> Result<(), OutputContractError> {
 }
 
 fn enforce_structured_directory(
-    out_dir: &Path,
+    out_root: &OutputRoot,
     schema: &Value,
     pretty_schema: &str,
 ) -> Result<(), OutputContractError> {
-    if let Some(record) = numbered_record(out_dir, "md")? {
+    if let Some(record) = numbered_record(out_root, "md")? {
         return Err(directory_error(
-            out_dir,
+            out_root.path(),
             &format!("存在文本完成记录 {}", record.display()),
         ));
     }
-    let record = out_dir.join(SCHEMA_RECORD);
-    if record.exists() {
-        let existing = fs::read(&record).map_err(|source| OutputContractError::Read {
-            path: record.clone(),
-            source,
-        })?;
+    let record = Path::new(SCHEMA_RECORD);
+    let display_record = out_root.display(record);
+    if out_root.exists(record) {
+        let existing = out_root
+            .read(record)
+            .map_err(|source| OutputContractError::Read {
+                path: display_record.clone(),
+                source,
+            })?;
         let existing: Value =
             serde_json::from_slice(&existing).map_err(|_| OutputContractError::Directory {
-                path: out_dir.to_path_buf(),
+                path: out_root.path().to_path_buf(),
                 reason: "现有 output-schema.json 不是合法 JSON".into(),
             })?;
         if &existing != schema {
             return Err(directory_error(
-                out_dir,
+                out_root.path(),
                 "现有 output-schema.json 与本次 schema 不同",
             ));
         }
         return Ok(());
     }
-    if numbered_record(out_dir, "json")?.is_some() {
+    if numbered_record(out_root, "json")?.is_some() {
         return Err(directory_error(
-            out_dir,
+            out_root.path(),
             "已有结构化完成记录但缺少 output-schema.json，无法确认其契约",
         ));
     }
-    let temporary = out_dir.join(".tmp-output-schema");
-    fs::write(&temporary, pretty_schema).map_err(|source| OutputContractError::Write {
-        path: temporary.clone(),
-        source,
-    })?;
-    fs::rename(&temporary, &record).map_err(|source| OutputContractError::Write {
-        path: record,
-        source,
-    })
+    let temporary = Path::new(".tmp-output-schema");
+    out_root
+        .write(temporary, pretty_schema)
+        .map_err(|source| OutputContractError::Write {
+            path: out_root.display(temporary),
+            source,
+        })?;
+    out_root
+        .rename(temporary, record)
+        .map_err(|source| OutputContractError::Write {
+            path: display_record,
+            source,
+        })
 }
 
 fn numbered_record(
-    out_dir: &Path,
+    out_root: &OutputRoot,
     extension: &str,
 ) -> Result<Option<PathBuf>, OutputContractError> {
-    let entries = fs::read_dir(out_dir).map_err(|source| OutputContractError::Read {
-        path: out_dir.to_path_buf(),
-        source,
-    })?;
+    let entries =
+        out_root
+            .read_dir(Path::new("."))
+            .map_err(|source| OutputContractError::Read {
+                path: out_root.path().to_path_buf(),
+                source,
+            })?;
     for entry in entries {
         let entry = entry.map_err(|source| OutputContractError::Read {
-            path: out_dir.to_path_buf(),
+            path: out_root.path().to_path_buf(),
             source,
         })?;
-        let path = entry.path();
-        if path.is_file()
-            && path.extension().and_then(|value| value.to_str()) == Some(extension)
-            && path
+        let name = entry.file_name();
+        if entry.file_type().is_ok_and(|kind| kind.is_file())
+            && Path::new(&name)
+                .extension()
+                .and_then(|value| value.to_str())
+                == Some(extension)
+            && Path::new(&name)
                 .file_stem()
                 .and_then(|value| value.to_str())
                 .is_some_and(|value| value.parse::<u64>().is_ok_and(|unit| unit > 0))
         {
-            return Ok(Some(path));
+            return Ok(Some(out_root.display(Path::new(&name))));
         }
     }
     Ok(None)
@@ -405,7 +418,8 @@ mod tests {
         fs::write(&schema_path, serde_json::to_vec(&valid_schema()).unwrap()).unwrap();
         let out = directory.path().join("out");
         fs::create_dir(&out).unwrap();
-        let contract = OutputContract::prepare(Some(&schema_path), &out).unwrap();
+        let out_root = OutputRoot::open(out).unwrap();
+        let contract = OutputContract::prepare(Some(&schema_path), &out_root).unwrap();
         let issue = contract
             .validate_submission(&serde_json::json!({"answer":1,"facts":[]}))
             .unwrap_err();
@@ -421,14 +435,34 @@ mod tests {
         let out = directory.path().join("out");
         fs::create_dir(&out).unwrap();
         fs::write(out.join("1.md"), "text").unwrap();
-        assert!(OutputContract::prepare(Some(&schema_path), &out).is_err());
+        let out_root = OutputRoot::open(out.clone()).unwrap();
+        assert!(OutputContract::prepare(Some(&schema_path), &out_root).is_err());
         fs::remove_file(out.join("1.md")).unwrap();
-        OutputContract::prepare(Some(&schema_path), &out).unwrap();
-        assert!(OutputContract::prepare(None, &out).is_err());
+        OutputContract::prepare(Some(&schema_path), &out_root).unwrap();
+        assert!(OutputContract::prepare(None, &out_root).is_err());
         let other = serde_json::json!({
             "type":"object","properties":{},"required":[],"additionalProperties":false
         });
         fs::write(&schema_path, serde_json::to_vec(&other).unwrap()).unwrap();
-        assert!(OutputContract::prepare(Some(&schema_path), &out).is_err());
+        assert!(OutputContract::prepare(Some(&schema_path), &out_root).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_record_stays_with_opened_output_root_after_path_is_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let schema_path = directory.path().join("schema.json");
+        fs::write(&schema_path, serde_json::to_vec(&valid_schema()).unwrap()).unwrap();
+        let ambient = directory.path().join("out");
+        let opened_directory = directory.path().join("opened-out");
+        fs::create_dir(&ambient).unwrap();
+        let out_root = OutputRoot::open(ambient.clone()).unwrap();
+
+        fs::rename(&ambient, &opened_directory).unwrap();
+        fs::create_dir(&ambient).unwrap();
+        OutputContract::prepare(Some(&schema_path), &out_root).unwrap();
+
+        assert!(opened_directory.join(SCHEMA_RECORD).exists());
+        assert!(!ambient.join(SCHEMA_RECORD).exists());
     }
 }

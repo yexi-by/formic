@@ -12,6 +12,7 @@ use crate::llm::{
     Finish, LlmClient, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq, ToolSpec,
 };
 use crate::output::{AuditEntry, AuditLog, WorkerState};
+use crate::structured::SUBMIT_RESULT_TOOL;
 
 pub const SUBMIT_COMPACTION_TOOL: &str = "formic_submit_compaction";
 
@@ -113,12 +114,20 @@ pub async fn compact_if_needed(
     }
     let tool = compaction_spec();
     let tools = [tool];
+    let output_contract = normal_tools
+        .iter()
+        .find(|tool| tool.name == SUBMIT_RESULT_TOOL);
     let overflow = before_tokens.saturating_sub(budget);
     let mut chosen = None;
     let mut largest_fitting = None;
     for end in ends {
         let transcript = render_transcript(&history[1..end]);
-        let compact_history = vec![Message::User(transcript)];
+        let compact_history = vec![Message::User(render_compaction_input(
+            normal_instructions,
+            &history[0],
+            output_contract,
+            &transcript,
+        ))];
         let request_tokens = llm.estimate_request_tokens(INSTRUCTIONS, &compact_history, &tools);
         if request_tokens > budget {
             break;
@@ -190,7 +199,14 @@ fn complete_prefix_ends(history: &[Message]) -> Vec<usize> {
         if tool_calls.is_empty() {
             break;
         }
-        let result_start = index + 1;
+        let result_start = if matches!(
+            history.get(index + 1),
+            Some(Message::ResponseOutputItems(_))
+        ) {
+            index + 2
+        } else {
+            index + 1
+        };
         let result_end = result_start + tool_calls.len();
         if result_end > history.len() {
             break;
@@ -226,11 +242,40 @@ fn render_transcript(history: &[Message]) -> String {
                     ));
                 }
             }
+            // 原始 Responses item 只用于供应商原生重放，其中可能包含 opaque 的
+            // encrypted_content；压缩提示使用相邻 Assistant 的可见语义即可。
+            Message::ResponseOutputItems(_) => {}
             Message::ToolResult { call_id, content } => {
                 output.push_str(&format!("\n[tool_result id={call_id}]\n{content}\n"));
             }
         }
     }
+    output
+}
+
+fn render_compaction_input(
+    normal_instructions: &str,
+    initial: &Message,
+    output_contract: Option<&ToolSpec>,
+    transcript: &str,
+) -> String {
+    let mut output = String::from("# 当前执行契约\n\n## 正常执行说明\n");
+    output.push_str(normal_instructions);
+    output.push_str("\n\n## 初始任务与数据\n");
+    output.push_str(&render_transcript(std::slice::from_ref(initial)));
+    output.push_str("\n## 最终输出契约\n");
+    if let Some(tool) = output_contract {
+        output.push_str(&format!(
+            "工具名：{}\n说明：{}\n参数 schema：\n{}\n",
+            tool.name,
+            tool.description,
+            serde_json::to_string_pretty(&tool.parameters).expect("工具 schema 可以序列化")
+        ));
+    } else {
+        output.push_str("最终结果按正常执行说明直接输出文本。\n");
+    }
+    output.push('\n');
+    output.push_str(transcript);
     output
 }
 
@@ -284,7 +329,10 @@ async fn request_compaction(
         let mut provider_usage = ProviderUsage::default();
         loop {
             let next = tokio::select! {
-                _ = cancel.cancelled() => return Err(CompactionError::Cancelled),
+                _ = cancel.cancelled() => {
+                    write_call_audit(audit, &mut call)?;
+                    return Err(CompactionError::Cancelled);
+                },
                 result = call.next_event() => result,
             };
             match next {
@@ -299,7 +347,12 @@ async fn request_compaction(
                 }
             }
         }
-        write_raw_events(audit, call.raw_log())?;
+        write_call_audit(audit, &mut call)?;
+        let response_output_items = if finish.is_some() {
+            call.response_output_items().to_vec()
+        } else {
+            Vec::new()
+        };
         call_usage.push(CompactionCallUsage {
             estimated_input_tokens,
             provider_usage,
@@ -324,7 +377,13 @@ async fn request_compaction(
                     reason: reason.clone(),
                 })?;
                 if attempt < attempts {
-                    append_compaction_correction(&mut history, text, calls, &reason);
+                    append_compaction_correction(
+                        &mut history,
+                        text,
+                        calls,
+                        response_output_items,
+                        &reason,
+                    );
                 }
             }
         }
@@ -362,11 +421,11 @@ fn validate_turn(
     match finish {
         Some(Finish::Refusal) => return Err("模型拒绝压缩".into()),
         Some(Finish::MaxTokens) => return Err("压缩输出达到长度上限".into()),
-        Some(Finish::Stop) if calls.is_empty() => {
+        Some(Finish::Stop) => {
             return Err("必须调用 formic_submit_compaction，不能用最终文本提交".into());
         }
         None => return Err("压缩响应没有完成事件".into()),
-        _ => {}
+        Some(Finish::ToolUse) => {}
     }
     if calls.len() != 1 || calls[0].name != SUBMIT_COMPACTION_TOOL || !text.trim().is_empty() {
         return Err("formic_submit_compaction 必须单独调用且不能同时输出文本".into());
@@ -383,6 +442,7 @@ fn append_compaction_correction(
     history: &mut Vec<Message>,
     text: String,
     calls: Vec<ToolCallReq>,
+    response_output_items: Vec<serde_json::Value>,
     reason: &str,
 ) {
     if calls.is_empty() {
@@ -390,6 +450,9 @@ fn append_compaction_correction(
             text,
             tool_calls: Vec::new(),
         });
+        if !response_output_items.is_empty() {
+            history.push(Message::ResponseOutputItems(response_output_items));
+        }
         history.push(Message::User(format!("压缩结果无效：{reason}；请重新提交")));
         return;
     }
@@ -403,6 +466,9 @@ fn append_compaction_correction(
         text,
         tool_calls: sanitized.clone(),
     });
+    if !response_output_items.is_empty() {
+        history.push(Message::ResponseOutputItems(response_output_items));
+    }
     for call in sanitized {
         history.push(Message::ToolResult {
             call_id: call.call_id,
@@ -411,15 +477,15 @@ fn append_compaction_correction(
     }
 }
 
-fn write_raw_events(audit: &mut AuditLog, events: &[String]) -> io::Result<()> {
-    audit.push_llm_event_stream(events)
+fn write_call_audit(audit: &mut AuditLog, call: &mut crate::llm::Call) -> io::Result<()> {
+    audit.push_llm_event_stream(&call.take_audit_snapshot())
 }
 
 fn retryable(error: &LlmError) -> bool {
     match error {
-        LlmError::Transport(_) | LlmError::Protocol { .. } => true,
+        LlmError::Transport(_) | LlmError::Protocol { .. } | LlmError::Timeout { .. } => true,
         LlmError::Http { status, .. } => *status == 429 || *status >= 500,
-        LlmError::ContextLimit { .. } => false,
+        LlmError::ContextLimit { .. } | LlmError::StreamLimit { .. } => false,
     }
 }
 
@@ -474,6 +540,48 @@ mod tests {
     }
 
     #[test]
+    fn responses_output_items_stay_inside_complete_group() {
+        let history = vec![
+            Message::User("task".into()),
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![call("a")],
+            },
+            Message::ResponseOutputItems(vec![serde_json::json!({
+                "type":"reasoning","id":"reasoning-1"
+            })]),
+            Message::ToolResult {
+                call_id: "a".into(),
+                content: "one".into(),
+            },
+        ];
+        assert_eq!(complete_prefix_ends(&history), [4]);
+    }
+
+    #[test]
+    fn compaction_input_keeps_task_instructions_and_output_contract() {
+        let contract = ToolSpec {
+            name: SUBMIT_RESULT_TOOL.into(),
+            description: "提交最终结果".into(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "required":["answer"]
+            }),
+        };
+        let rendered = render_compaction_input(
+            "必须依据证据回答",
+            &Message::User("检查 data/a.txt".into()),
+            Some(&contract),
+            "# 待压缩的原始历史\n[assistant]\n已读取文件",
+        );
+        assert!(rendered.contains("必须依据证据回答"));
+        assert!(rendered.contains("检查 data/a.txt"));
+        assert!(rendered.contains(SUBMIT_RESULT_TOOL));
+        assert!(rendered.contains("\"answer\""));
+        assert!(rendered.contains("已读取文件"));
+    }
+
+    #[test]
     fn compaction_submission_is_strict() {
         let valid = ToolCallReq {
             call_id: "c".into(),
@@ -483,7 +591,8 @@ mod tests {
             })
             .to_string(),
         };
-        assert!(validate_turn("", &[valid], Some(Finish::ToolUse)).is_ok());
+        assert!(validate_turn("", std::slice::from_ref(&valid), Some(Finish::ToolUse)).is_ok());
+        assert!(validate_turn("", &[valid], Some(Finish::Stop)).is_err());
         assert!(validate_turn("extra", &[], Some(Finish::Stop)).is_err());
     }
 }

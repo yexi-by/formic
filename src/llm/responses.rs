@@ -11,7 +11,7 @@ pub fn build_request(
     tools: &[ToolSpec],
 ) -> (String, String, Vec<(String, String)>) {
     let mut input = Vec::new();
-    for message in history {
+    for (index, message) in history.iter().enumerate() {
         match message {
             Message::User(text) => {
                 input.push(serde_json::json!({
@@ -28,6 +28,13 @@ pub fn build_request(
                 }));
             }
             Message::Assistant { text, tool_calls } => {
+                // 有完整供应商 output item 时只重放原始项，避免再合成一份重复历史。
+                if matches!(
+                    history.get(index + 1),
+                    Some(Message::ResponseOutputItems(items)) if !items.is_empty()
+                ) {
+                    continue;
+                }
                 if !text.is_empty() {
                     input.push(serde_json::json!({
                         "type": "message",
@@ -44,6 +51,7 @@ pub fn build_request(
                     }));
                 }
             }
+            Message::ResponseOutputItems(items) => input.extend(items.iter().cloned()),
             Message::ToolResult { call_id, content } => {
                 input.push(serde_json::json!({
                     "type": "function_call_output",
@@ -55,7 +63,6 @@ pub fn build_request(
     }
     let mut body = serde_json::json!({
         "model": config.model,
-        "max_output_tokens": config.max_output_tokens,
         "stream": true,
         "instructions": instructions,
         "input": input,
@@ -90,6 +97,11 @@ pub fn build_request(
 pub struct Transform {
     saw_tool_call: bool,
     saw_refusal: bool,
+    terminal: bool,
+    output_items: Vec<serde_json::Value>,
+    next_output_index: u64,
+    tool_call_ids: std::collections::HashSet<String>,
+    pending_tool_calls: Vec<ToolCallReq>,
 }
 
 impl Transform {
@@ -105,6 +117,12 @@ impl super::Transform for Transform {
         let ty = v["type"]
             .as_str()
             .ok_or_else(|| LlmError::protocol("缺少 type 字段", payload))?;
+        if self.terminal {
+            return Err(LlmError::protocol(
+                "Responses 终态之后又收到协议事件",
+                payload,
+            ));
+        }
         match ty {
             "response.output_text.delta" => {
                 let delta = v["delta"].as_str().unwrap_or_default();
@@ -118,52 +136,124 @@ impl super::Transform for Transform {
                 Ok(Vec::new())
             }
             "response.output_item.done" => {
-                if v["item"]["type"].as_str() == Some("function_call") {
-                    self.saw_tool_call = true;
-                    Ok(vec![LlmEvent::ToolCall(ToolCallReq {
-                        call_id: v["item"]["call_id"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string(),
-                        name: v["item"]["name"].as_str().unwrap_or_default().to_string(),
-                        arguments: v["item"]["arguments"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .to_string(),
-                    })])
+                let output_index = v["output_index"].as_u64().ok_or_else(|| {
+                    LlmError::protocol("完成事件缺少非负整数 output_index", payload)
+                })?;
+                if output_index != self.next_output_index {
+                    return Err(LlmError::protocol(
+                        format!(
+                            "完成项 output_index 必须稠密递增，期望 {}，实际为 {output_index}",
+                            self.next_output_index
+                        ),
+                        payload,
+                    ));
+                }
+                let item = v
+                    .get("item")
+                    .filter(|item| item.is_object())
+                    .ok_or_else(|| LlmError::protocol("完成事件缺少 item object", payload))?;
+                let item_type = item["type"]
+                    .as_str()
+                    .ok_or_else(|| LlmError::protocol("完成的 item 缺少字符串 type", payload))?;
+                let tool_call = if item_type == "function_call" {
+                    let tool_call = ToolCallReq {
+                        call_id: required_nonempty_string(item, "call_id", payload)?,
+                        name: required_nonempty_string(item, "name", payload)?,
+                        arguments: required_nonempty_string(item, "arguments", payload)?,
+                    };
+                    if self.tool_call_ids.contains(&tool_call.call_id) {
+                        return Err(LlmError::protocol(
+                            format!("同一回合重复提供工具调用 id {:?}", tool_call.call_id),
+                            payload,
+                        ));
+                    }
+                    Some(tool_call)
                 } else {
-                    if v["item"]["type"].as_str() == Some("refusal") {
+                    None
+                };
+                self.next_output_index = self
+                    .next_output_index
+                    .checked_add(1)
+                    .ok_or_else(|| LlmError::protocol("output_index 已耗尽", payload))?;
+                self.output_items.push(item.clone());
+                if let Some(tool_call) = tool_call {
+                    self.tool_call_ids.insert(tool_call.call_id.clone());
+                    self.saw_tool_call = true;
+                    self.pending_tool_calls.push(tool_call);
+                    Ok(Vec::new())
+                } else {
+                    if item_type == "refusal" {
                         self.saw_refusal = true;
                     }
                     Ok(Vec::new())
                 }
             }
             "response.completed" => {
-                let mut events = response_usage(&v)
-                    .into_iter()
-                    .map(LlmEvent::Usage)
-                    .collect::<Vec<_>>();
-                events.push(LlmEvent::Finished(if self.saw_refusal {
+                self.terminal = true;
+                let finish = if self.saw_refusal {
                     Finish::Refusal
                 } else if self.saw_tool_call {
                     Finish::ToolUse
                 } else {
                     Finish::Stop
-                }));
+                };
+                let mut events: Vec<LlmEvent> = if finish == Finish::ToolUse {
+                    self.pending_tool_calls
+                        .drain(..)
+                        .map(LlmEvent::ToolCall)
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                events.extend(response_usage(&v).into_iter().map(LlmEvent::Usage));
+                events.push(LlmEvent::Finished(finish));
                 Ok(events)
             }
-            "response.incomplete" => match v["response"]["incomplete_details"]["reason"].as_str() {
-                Some("max_output_tokens") => Ok(vec![LlmEvent::Finished(Finish::MaxTokens)]),
-                Some("content_filter") => Ok(vec![LlmEvent::Finished(Finish::Refusal)]),
-                other => Err(LlmError::protocol(
-                    format!("响应未完成，原因 {other:?}"),
-                    payload,
-                )),
-            },
+            "response.incomplete" => {
+                let finish = match v["response"]["incomplete_details"]["reason"].as_str() {
+                    Some("max_output_tokens") => Finish::MaxTokens,
+                    Some("content_filter") => Finish::Refusal,
+                    other => {
+                        return Err(LlmError::protocol(
+                            format!("响应未完成，原因 {other:?}"),
+                            payload,
+                        ));
+                    }
+                };
+                self.terminal = true;
+                Ok(vec![LlmEvent::Finished(finish)])
+            }
             "response.failed" | "error" => Err(LlmError::protocol("响应失败事件", payload)),
             _ => Ok(Vec::new()),
         }
     }
+
+    fn response_output_items(&self) -> &[serde_json::Value] {
+        &self.output_items
+    }
+}
+
+fn required_nonempty_string(
+    item: &serde_json::Value,
+    field: &str,
+    payload: &str,
+) -> Result<String, LlmError> {
+    let value = item
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LlmError::protocol(
+                format!("完成的 function_call.{field} 必须是字符串"),
+                payload,
+            )
+        })?;
+    if value.is_empty() {
+        return Err(LlmError::protocol(
+            format!("完成的 function_call.{field} 不得为空"),
+            payload,
+        ));
+    }
+    Ok(value.to_string())
 }
 
 fn response_usage(value: &serde_json::Value) -> Option<ProviderUsage> {
@@ -239,6 +329,140 @@ mod tests {
     }
 
     #[test]
+    fn completed_function_call_requires_nonempty_string_fields() {
+        for item in [
+            serde_json::json!({"type":"function_call","name":"search","arguments":"{}"}),
+            serde_json::json!({"type":"function_call","call_id":"","name":"search","arguments":"{}"}),
+            serde_json::json!({"type":"function_call","call_id":1,"name":"search","arguments":"{}"}),
+            serde_json::json!({"type":"function_call","call_id":"call_1","arguments":"{}"}),
+            serde_json::json!({"type":"function_call","call_id":"call_1","name":"","arguments":"{}"}),
+            serde_json::json!({"type":"function_call","call_id":"call_1","name":"search"}),
+            serde_json::json!({"type":"function_call","call_id":"call_1","name":"search","arguments":""}),
+            serde_json::json!({"type":"function_call","call_id":"call_1","name":"search","arguments":{}}),
+        ] {
+            let mut transform = Transform::new();
+            let result = transform.push(
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": item,
+                })
+                .to_string(),
+            );
+            assert!(matches!(result, Err(LlmError::Protocol { .. })));
+            assert!(
+                transform.response_output_items().is_empty(),
+                "非法完成项不得进入可重放历史"
+            );
+        }
+    }
+
+    #[test]
+    fn function_arguments_json_is_left_for_the_worker_to_parse_once() {
+        let mut transform = Transform::new();
+        let events = transform
+            .push(
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_1","name":"search","arguments":"{"}}"#,
+            )
+            .unwrap();
+        assert!(events.is_empty(), "终态确认前不得释放工具调用");
+        let events = transform
+            .push(r#"{"type":"response.completed","response":{}}"#)
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::ToolCall(ToolCallReq {
+                    call_id: "call_1".into(),
+                    name: "search".into(),
+                    arguments: "{".into(),
+                }),
+                LlmEvent::Finished(Finish::ToolUse),
+            ]
+        );
+    }
+
+    #[test]
+    fn completed_output_indices_must_be_dense_and_cannot_repeat() {
+        for invalid_index in [0, 2] {
+            let mut transform = Transform::new();
+            transform
+                .push(
+                    r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"r1"}}"#,
+                )
+                .unwrap();
+            let result = transform.push(
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": invalid_index,
+                    "item": {"type":"message","id":"m1"},
+                })
+                .to_string(),
+            );
+            assert!(matches!(result, Err(LlmError::Protocol { .. })));
+        }
+
+        let mut missing = Transform::new();
+        assert!(matches!(
+            missing.push(
+                r#"{"type":"response.output_item.done","item":{"type":"message","id":"m1"}}"#
+            ),
+            Err(LlmError::Protocol { .. })
+        ));
+    }
+
+    #[test]
+    fn output_item_after_terminal_is_rejected_without_mutating_replay_state() {
+        let reasoning = serde_json::json!({
+            "type": "reasoning",
+            "id": "reasoning-1",
+            "encrypted_content": "opaque-state",
+        });
+        let mut transform = Transform::new();
+        transform
+            .push(
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": reasoning,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            transform
+                .push(r#"{"type":"response.completed","response":{}}"#)
+                .unwrap(),
+            vec![LlmEvent::Finished(Finish::Stop)]
+        );
+
+        let result = transform.push(
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"late-call","name":"search","arguments":"{}"}}"#,
+        );
+
+        assert!(matches!(result, Err(LlmError::Protocol { .. })));
+        assert_eq!(transform.response_output_items(), &[reasoning]);
+        assert_eq!(transform.next_output_index, 1);
+        assert!(transform.pending_tool_calls.is_empty());
+        assert!(!transform.tool_call_ids.contains("late-call"));
+    }
+
+    #[test]
+    fn duplicate_tool_call_ids_are_rejected_without_releasing_the_first_call() {
+        let mut transform = Transform::new();
+        let first = transform
+            .push(
+                r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"same","name":"first","arguments":"{}"}}"#,
+            )
+            .unwrap();
+        assert!(first.is_empty());
+        let result = transform.push(
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"same","name":"second","arguments":"{}"}}"#,
+        );
+        assert!(matches!(result, Err(LlmError::Protocol { .. })));
+    }
+
+    #[test]
     fn incomplete_max_output_tokens() {
         let mut t = Transform::new();
         let events = t
@@ -283,7 +507,7 @@ mod tests {
             model: "m".into(),
             api_key: None,
             context_window_tokens: 131072,
-            max_output_tokens: 16384,
+            anthropic_max_tokens: None,
         };
         let history = vec![
             Message::User("任务".into()),
@@ -309,5 +533,88 @@ mod tests {
         assert_eq!(v["input"][2]["call_id"], "call_1");
         assert_eq!(v["input"][3]["type"], "function_call_output");
         assert_eq!(v["input"][3]["output"], "结果");
+        let keys = v
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["input", "instructions", "model", "stream"]),
+            "Responses 请求不得夹带生成控制字段"
+        );
+    }
+
+    #[test]
+    fn completed_output_items_are_preserved_and_replayed_verbatim() {
+        let reasoning = serde_json::json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "opaque-provider-state",
+            "summary": [],
+        });
+        let function_call = serde_json::json!({
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "search",
+            "arguments": "{\"pattern\":\"x\"}",
+            "status": "completed",
+        });
+        let mut transform = Transform::new();
+        transform
+            .push(
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": reasoning,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        transform
+            .push(
+                &serde_json::json!({
+                    "type": "response.output_item.done",
+                    "output_index": 1,
+                    "item": function_call,
+                })
+                .to_string(),
+            )
+            .unwrap();
+        let preserved = transform.response_output_items().to_vec();
+        assert_eq!(preserved, vec![reasoning.clone(), function_call.clone()]);
+
+        let config = LlmConfig {
+            protocol: super::super::Protocol::Responses,
+            base_url: "http://x/v1".into(),
+            model: "m".into(),
+            api_key: None,
+            context_window_tokens: 131072,
+            anthropic_max_tokens: None,
+        };
+        let history = vec![
+            Message::User("任务".into()),
+            Message::Assistant {
+                text: "不会重复发送".into(),
+                tool_calls: vec![ToolCallReq {
+                    call_id: "call_1".into(),
+                    name: "search".into(),
+                    arguments: "{\"pattern\":\"x\"}".into(),
+                }],
+            },
+            Message::ResponseOutputItems(preserved),
+            Message::ToolResult {
+                call_id: "call_1".into(),
+                content: "结果".into(),
+            },
+        ];
+        let (_url, body, _headers) = build_request(&config, "说明", &history, &[]);
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["input"][1], reasoning);
+        assert_eq!(value["input"][2], function_call);
+        assert_eq!(value["input"][3]["type"], "function_call_output");
+        assert_eq!(value["input"].as_array().unwrap().len(), 4);
     }
 }

@@ -33,11 +33,11 @@ formic run --data <dir> --plan <jsonl> --task <file> --out <dir>
            --concurrency <n> [--output-schema <schema.json>]
 ```
 
-Formic 只读取当前工作目录的 `config.toml`，不接受配置路径参数，也不热加载。LLM 的非空环境变量逐字段覆盖文件值。协议由 `FORMIC_LLM_PROTOCOL` 选择；上下文窗口和最大输出必须由配置或环境变量明确给出。
+Formic 只读取当前工作目录的 `config.toml`，不接受配置路径参数，也不热加载。LLM 的非空环境变量逐字段覆盖文件值。协议由 `FORMIC_LLM_PROTOCOL` 选择；上下文窗口必须由配置或环境变量明确给出。只有 Anthropic Messages 另需供应商专用的 `anthropic_max_tokens`，其他协议不接受输出 token 配置。
 
 计划是一行一个 object 的 JSONL。单元可以指定文件集合，或一个文件的 1 起始闭区间行范围。启动边界会拒绝空分片、重复/零单元号、缺失文件、绝对路径和根目录逃逸。
 
-文本模式的完成事实是 `out/<unit>.md`。结构化模式的完成事实是 `out/<unit>.json`，并由 `out/output-schema.json` 记录该目录唯一的 schema。两种模式不得在同一输出目录混用。每次任务另建 `out/workers/<UTC任务时间戳>/`，每个计划单元对应一个 `<unit>.md` 运行档案。
+文本模式的完成事实是 `out/<unit>.md`。结构化模式的完成事实是 `out/<unit>.json`，并由 `out/output-schema.json` 记录该目录唯一的 schema。两种模式不得在同一输出目录混用。输出目录与数据目录不得相同或互相包含，并由进程锁保证同一时刻只有一个作业使用；锁、schema、审计、报告、统计和完成记录都相对启动时打开的同一输出目录句柄操作，运行中替换 ambient 路径不能改写写入位置或绕过锁。每次任务另建 `out/workers/<UTC任务时间戳>/`，每个计划单元对应一个 `<unit>.md` 运行档案。
 
 ## 3. 执行与取消
 
@@ -70,19 +70,21 @@ Scheduler 有界收件箱（容量 = worker 并发）
 
 每个 worker 可见两棵只读根：`input` 是完整输入数据集，`output` 是当前模式下已发布的顶层数字编号记录。worker 运行档案、stats、schema、临时文件和其他扩展名不向模型暴露。
 
-`search` 支持正则/字面匹配、glob 和上下文行。`read` 支持 UTF-8 文本及可选闭区间行号。参数在工具边界解析一次；绝对路径、`.`、`..`、符号链接和 canonical path 逃逸都被拒绝。遍历不跟随符号链接。
+`search` 支持正则/字面匹配、glob 和上下文行。`read` 支持 UTF-8 文本及可选闭区间行号。input 与 output 根在启动时各打开一次目录 capability，计划校验、遍历和实际读取始终相对同一根句柄完成；输出写入也使用这个固定根。运行期间替换 ambient 路径既不能把访问引向根外，也不能改变发布位置。参数在工具边界解析一次；绝对路径、`.`、`..` 和符号链接被拒绝，遍历不跟随链接。
 
 匹配数、上下文行数、结果字节数、全局并发和逐工具并发来自当前配置。结果达到边界时带明确截断标记。两项工具在 blocking task 中运行，不占用 Tokio runtime worker 线程。
 
 ## 6. 通用 MCP
 
-每个启用的 `[mcp_servers.<name>]` 必须选择且只选择一种传输：直接启动的 stdio 命令，或 Streamable HTTP URL。stdio 的 `command`/`args` 不经过 shell；stderr 持续排空；Windows 使用 Job Object、Unix 使用进程组，以便会话关闭时回收进程树。HTTP 支持 bearer 与自定义 headers，且禁止 session 过期后自动重放原请求。
+每个启用的 `[mcp_servers.<name>]` 必须选择且只选择一种传输：直接启动的 stdio 命令，或 Streamable HTTP URL。stdio 的 `command`/`args` 不经过 shell，只继承启动所需的系统环境变量和该 server 显式配置的环境变量；stderr 按固定单行上限持续排空；Windows 使用 Job Object、Unix 使用进程组，以便会话关闭时回收进程树。HTTP 支持 bearer 与自定义 headers，且禁止 session 过期后自动重放原请求。stdio JSON、HTTP JSON 和 SSE 都在解析前执行 server 级消息字节上限；公共结果流无法诚实提供互不相同的单工具解码上限，因此 `tool_limits` 只配置并发。
 
 作业启动时，Formic 对所有启用 server 完成 initialize、分页 `tools/list`、可选 `enabled_tools` 筛选、显式别名处理和稳定排序；未配置筛选时暴露发现的全部工具。任一 server 失败则 worker 不启动。模型名称固定为 `<server>__<alias_or_remote_name>`；非法、过长或碰撞会明确失败。`tools/list_changed` 只产生诊断，当前作业继续使用冻结目录。
 
-`session_scope=job` 复用一个会话。`unit` 在活动单元第一次调用时建立独立会话，并在单元成功、失败、取消或 panic 后回收。server semaphore 跨所有 unit 会话共享。
+`session_scope=job` 复用一个会话。`unit` 在活动单元第一次调用时建立独立会话，并在单元成功、失败、取消或 panic 后回收。server semaphore 跨所有 unit 会话共享。工具调用期限从进入调用开始，包含等待 session slot、连接或重连、发送请求和等待响应；期限到达后立即使旧会话不可复用并向调用方返回。已经发送的工具调用会发送协议取消并中止本地 transport，无 session 的 Streamable HTTP server 也会收到取消通知。配置的重连只为下一次新调用建立会话，绝不重放状态未知的旧调用。明确的工具结果一旦到达，后续本地有界转换不再改写为远端超时；本地处理失败会明确标记远端调用已经完成、不得重放。
 
-MCP 结果接受 text 与 `structuredContent`。纯结构数据稳定序列化；两者并存时生成固定 object 包装。text 可按 UTF-8 边界截断；结构数据不能在保持合法 JSON 的前提下进入限制时返回工具错误。图片、音频、资源和 resource link 返回不支持的结果类型。`isError` 是可回注模型的工具失败；超时、传输和会话故障是单元运行错误。
+Streamable HTTP 有一个明确限制：如果 `initialize` 请求已经写入连接、但 server 一直不返回响应，取消 rmcp/reqwest future 不能保证 Hyper 立即关闭底层 TCP 连接。作业启动按 `startup_timeout_sec` 返回；工具调用中的重连还受该次 `tool_timeout_sec` 限制。该连接不会成为可复用的 Formic session，但连接本身可能继续存在，直到远端、Hyper 或操作系统结束它。当前不把“超时后固定时间内收到 TCP EOF”作为 Formic 契约。
+
+MCP 结果接受 text 与 `structuredContent`。纯结构数据稳定序列化；两者并存时生成固定 object 包装。text 可按 UTF-8 边界截断；结构数据不能在保持合法 JSON 的前提下进入限制时返回工具错误。图片、音频、资源和 resource link 返回不支持的结果类型。正常结果、`isError` 前缀和客户端生成的工具错误都受同一个最终字节上限约束。`isError` 是可回注模型的工具失败；超时、传输和会话故障是单元运行错误。
 
 中断或超时的调用绝不自动重放。`reconnect=true` 只允许下一次新调用在同一 session slot 内单飞重连，并重新获取允许工具、确认 schema 与冻结目录一致。
 
@@ -100,6 +102,11 @@ MCP 结果接受 text 与 `structuredContent`。纯结构数据稳定序列化�
 
 工具目录、工具 schema、输出 schema、名称和顺序在作业内不变。系统 instructions、任务说明和数据清单位于分片前；动态分片与后续历史只追加在末尾。当前不发送供应商专有 cache hint，避免将后端特性冒充公共契约。
 
+Completions 与 Responses 的请求只包含模型名、实际消息或 input、工具目录和 `stream`；
+不发送 temperature、top_p、任何 max token、reasoning、verbosity、seed、stop、penalty 或
+tool choice 等生成控制字段。Anthropic Messages 只额外发送其协议必填且显式配置的
+`max_tokens`。
+
 `scope=input` 的 `search`/`read` 在参数解析和默认值合并后生成规范键。第一个调用成为 owner，相同在途调用等待同一结果；完整成功结果进入作业内存 LRU，并按 `cache.max_bytes` 淘汰。输出根调用、MCP、错误和截断结果不会留在完成缓存。取消 owner 会唤醒等待者重新竞争，不留下永远 pending 的条目。
 
 三种 LLM transform 独立解析供应商明确报告的 input、output、cache-read 和 cache-creation token。缺失字段保持缺失；本地 `o200k` 估算使用独立统计字段，不冒充计费值。
@@ -109,7 +116,8 @@ MCP 结果接受 text 与 `structuredContent`。纯结构数据稳定序列化�
 每次调用前，LLM client 先构造最终协议请求 JSON，再用它估算输入 token。安全预算为：
 
 ```text
-context_window_tokens - max_output_tokens - context_safety_tokens
+completions/responses: context_window_tokens - context_safety_tokens
+anthropic: context_window_tokens - anthropic_max_tokens - context_safety_tokens
 ```
 
 因此 instructions、初始消息、完整历史、工具 schema、结构化 schema、协议包装和压缩工具都参与预算。初始任务/分片与冻结工具目录本身超过预算时明确失败。
@@ -122,9 +130,9 @@ context_window_tokens - max_output_tokens - context_safety_tokens
 
 ## 10. Worker 运行档案、统计与验证
 
-worker 运行时把状态变化、上下文预算、LLM 请求、原始 SSE、工具参数/来源/结果、排队与执行时间、缓存决定、重试、结构校验和压缩事件写入当前任务目录中的临时 JSONL。普通请求与压缩请求分别以第一份完整正文为基准，后续同类请求保存可逆字节增量；上一份请求只放在磁盘临时基准中，不随历史增长占用 worker 内存。一次调用的 SSE data 负载按到达顺序合并为一个事件流审计项。每个时间线项带自然序号和相对 worker 启动时间；审计写入失败会阻止单元发布。
+worker 运行时把状态变化、上下文预算、LLM 请求、原始 SSE、工具参数/来源/结果、排队与执行时间、缓存决定、重试、结构校验和压缩事件写入当前任务目录中的临时 JSONL。普通请求与压缩请求分别以第一份完整正文为基准，后续同类请求保存可逆字节增量；上一份请求只放在磁盘临时基准中，不随历史增长占用 worker 内存。一次调用的 SSE data 负载按到达顺序合并为一个事件流审计项。响应流超过 64 MiB 时调用失败；审计保存此前全部字节，并为触发超限的网络块保存最多 64 KiB 原始前缀及块长度、遗漏长度、超限量和编码，避免静默丢失证据或再次产生无界分配。每个时间线项带自然序号和相对 worker 启动时间；审计写入失败会阻止单元发布。
 
-worker 结束后，运行时流式读取临时事件并原子生成 `workers/<UTC任务时间戳>/<unit>.md`。文档先呈现结局、冻结配置、统计和按时间排序的逻辑状态；首份请求、后续请求变化量和每次完整原始响应流放在折叠区，不推测模型不可见的内部思维。请求增量按记录中的前缀、删除量和插入原文可逐字还原，因此去重不以丢失审计证据为代价。Markdown 成功后删除临时 JSONL，因此一个 worker 最终只有一份完整证据；渲染失败会产生用户可见诊断并保留临时文件，避免现场丢失。成功、失败、取消和 panic 都走同一渲染入口。
+worker 结束后，运行时流式读取临时事件并原子生成 `workers/<UTC任务时间戳>/<unit>.md`。文档先呈现结局、冻结配置、统计和按时间排序的逻辑状态；首份请求、后续请求变化量和未触发流上限的完整原始响应流放在折叠区，不推测模型不可见的内部思维。请求增量按记录中的前缀、删除量和插入原文可逐字还原，因此去重不以丢失审计证据为代价。Markdown 成功后删除临时 JSONL，因此一个 worker 最终只有一份完整证据；渲染失败会产生用户可见诊断并保留临时文件，避免现场丢失。成功、失败、取消和 panic 都走同一渲染入口。
 
 `stats.jsonl` 保存回合、调用、重试、工具计数、本地 token 估算、供应商 usage、缓存命中/合并/淘汰、工具等待/执行时间、MCP 在途峰值以及压缩前后 token。stats 是派生观测，写入失败只产生诊断，不改写已经确定的业务结果。
 

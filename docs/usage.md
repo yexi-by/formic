@@ -55,12 +55,16 @@ url = "https://api.example.com/v1"
 api_key = ""
 model = "model-name"
 context_window_tokens = 131072
-max_output_tokens = 16384
 ```
 
-`context_window_tokens` 和 `max_output_tokens` 必填，且前者必须大于最大输出与安全余量
-之和。协议形状由 `FORMIC_LLM_PROTOCOL` 指定，可选 `completions`、`responses` 或
-`anthropic`。
+`context_window_tokens` 是本地预算依据，不会发送给供应商。协议形状由
+`FORMIC_LLM_PROTOCOL` 指定，可选 `completions`、`responses` 或 `anthropic`。
+Anthropic Messages 还必须单独配置 `anthropic_max_tokens`；该字段只用于 Anthropic，
+其他协议出现它会直接报错。
+
+Completions 与 Responses 请求不发送 temperature、top_p、任何输出 token 上限、reasoning、
+verbosity、seed、stop、penalty、tool_choice 等生成控制字段。Anthropic 除协议必填的
+`max_tokens` 外也不发送这些字段。
 
 下列非空环境变量按字段覆盖 `config.toml`：
 
@@ -71,7 +75,7 @@ max_output_tokens = 16384
 | `FORMIC_LLM_API_KEY` | 覆盖 `api_key` |
 | `FORMIC_LLM_MODEL` | 覆盖 `model` |
 | `FORMIC_LLM_CONTEXT_WINDOW_TOKENS` | 覆盖模型上下文大小 |
-| `FORMIC_LLM_MAX_OUTPUT_TOKENS` | 覆盖每次调用的最大输出 |
+| `FORMIC_ANTHROPIC_MAX_TOKENS` | 仅 Anthropic Messages；覆盖其必填 `max_tokens` |
 | `FORMIC_METRICS=1` | 每 250 ms 向 stderr 输出进程级观测值 |
 
 配置采用严格字段校验：未知字段、`0`、互斥传输字段或缺失的必填项都会在读取作业前
@@ -127,7 +131,9 @@ worker → 冻结的 ToolRegistry → Scheduler 有界收件箱
 - `search`：在 `input` 或 `output` 根搜索正则或字面文本，可设置 glob 和上下文行数；
 - `read`：读取根内相对路径的 UTF-8 文本，可指定 1 起始的闭区间行号。
 
-两者拒绝绝对路径、`.`、`..`、符号链接和根目录逃逸。`output` 只暴露当前输出模式下
+两者拒绝绝对路径、`.`、`..`、符号链接和根目录逃逸。input 与 output 在启动时打开为
+目录 capability；计划校验、遍历、读取以及 output 的锁和全部写入都相对固定根句柄执行，
+运行中替换路径既不能把访问引到根外，也不能改变发布位置。`output` 只暴露当前输出模式下
 顶层的数字编号完成记录，不暴露 worker 档案、stats 或 schema。
 
 `[mcp_servers.<name>]` 可以配置任意 MCP server。当前支持直接启动的 stdio 子进程和
@@ -140,9 +146,20 @@ initialize、分页发现、可选筛选和别名校验，并为当前任务冻�
 MCP，也可以主动筛选；Formic 不依据产品名替用户限制能力。提示词说明工具的使用条件，
 配置才决定模型实际拥有的能力。
 
-MCP 调用可配置 job/unit 会话、server/tool 并发、超时、结果大小及只服务后续调用的
-重连。中断调用绝不自动重放。当前结果支持 text 与 `structuredContent`；图片、音频和
-资源返回明确的工具错误。
+MCP 调用可配置 job/unit 会话、server/tool 并发、server 级结果大小、超时及只服务后续调用的
+重连。stdio 子进程不会继承父进程中的 LLM 密钥等任意环境变量，只得到必要系统变量和
+server 显式配置；stderr 单行、stdio JSON、HTTP JSON 与 SSE 在解析前受大小约束。调用
+达到超时就返回，已发送的工具请求会收到协议取消，旧会话立即停止复用，中断调用绝不自动
+重放。已经收到明确工具结果后，本地结果处理不再把它改报为远端超时；本地处理失败会明确
+说明远端调用已经完成、不得重放。当前结果支持 text 与 `structuredContent`；图片、音频、
+资源和客户端工具错误也受最终结果字节上限约束。
+结果流可能同时承载多个工具，因此每个 server 只有一个统一的解码前与最终结果上限；
+`tool_limits` 只收紧单工具并发。
+
+Streamable HTTP 的慢速 `initialize` 有一项底层限制：作业启动按 `startup_timeout_sec` 返回，
+工具调用中的重连还受该次 `tool_timeout_sec` 限制；但 rmcp/reqwest future 被取消后，Hyper
+不保证已经写入请求的 TCP 连接立即关闭。该连接可能继续存在到远端、Hyper 或操作系统超时；
+Formic 不复用它，也不承诺超时后固定时间内出现 TCP EOF。
 
 ## 结构化输出
 
@@ -159,7 +176,8 @@ schema 负责结果形状，`task.md` 负责解释字段的业务含义、证据
 确定的字段放入单元 schema。
 
 `out/output-schema.json` 保存输出目录的权威 schema。同一输出目录不能混用 Markdown
-与 JSON 完成记录，也不能在已有 JSON 记录上更换 schema。
+与 JSON 完成记录，也不能在已有 JSON 记录上更换 schema。输出目录与数据目录不能相同或
+互相包含；一个输出目录同一时刻只允许一个 Formic 作业使用。
 
 ## 缓存与上下文压缩
 
@@ -167,8 +185,8 @@ schema 负责结果形状，`task.md` 负责解释字段的业务含义、证据
 完整成功结果进入按字节容量淘汰的内存 LRU。`scope=output`、MCP、错误和截断结果不进入
 完成缓存。
 
-每次 LLM 调用前，Formic 按最终协议请求估算完整输入，并预留 `max_output_tokens` 与
-`context_safety_tokens`。预计越界时只压缩最旧的完整
+每次 LLM 调用前，Formic 按最终协议请求估算完整输入，并预留
+`context_safety_tokens`；Anthropic 另外预留其 `anthropic_max_tokens`。预计越界时只压缩最旧的完整
 `assistant(tool_calls) → tool_result` 组，保留初始任务、分片和最近历史。压缩使用同一
 模型，但只开放内部 `formic_submit_compaction`，结果必须通过固定结构和本地校验。
 

@@ -29,6 +29,9 @@ pub fn count_message(message: &Message) -> u64 {
         Message::Assistant { text, tool_calls } => {
             count(text) + tool_calls.iter().map(count_tool_call).sum::<u64>()
         }
+        Message::ResponseOutputItems(items) => {
+            count(&serde_json::to_string(items).expect("Responses output item 可以序列化"))
+        }
         Message::ToolResult { call_id, content } => count(call_id) + count(content),
     };
     content + MESSAGE_OVERHEAD

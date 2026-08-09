@@ -43,6 +43,8 @@ pub fn build_request(
                 }
                 messages.push(msg);
             }
+            // 这是 Responses 专属的无损历史；本协议使用紧邻它之前的 Assistant。
+            Message::ResponseOutputItems(_) => {}
             Message::ToolResult { call_id, content } => {
                 messages.push(serde_json::json!({
                     "role": "tool",
@@ -54,7 +56,6 @@ pub fn build_request(
     }
     let mut body = serde_json::json!({
         "model": config.model,
-        "max_tokens": config.max_output_tokens,
         "stream": true,
         "messages": messages,
     });
@@ -82,10 +83,19 @@ pub fn build_request(
     )
 }
 
-/// 每个 index 一条在组装的工具调用：(id, name, arguments)。
+/// 每个 index 一条在组装的工具调用。`arguments_seen` 区分供应商实际发送了空字符串，
+/// 还是从未发送 arguments 字段；参数 JSON 的语义校验仍由 worker 统一负责。
+#[derive(Default)]
+struct PartialToolCall {
+    call_id: String,
+    name: String,
+    arguments: String,
+    arguments_seen: bool,
+}
+
 #[derive(Default)]
 pub struct Transform {
-    partial: Vec<(String, String, String)>,
+    partial: Vec<PartialToolCall>,
     saw_refusal: bool,
     pending_usage: Option<ProviderUsage>,
 }
@@ -147,37 +157,90 @@ impl super::Transform for Transform {
             return Ok(Vec::new()); // 纯用量等无 choices 的帧，与产出无关
         };
 
+        let mut events = Vec::new();
         if let Some(delta) = choice.get("delta") {
-            if let Some(tool_calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+            if let Some(tool_calls_value) = delta.get("tool_calls") {
+                let tool_calls = tool_calls_value
+                    .as_array()
+                    .ok_or_else(|| LlmError::protocol("delta.tool_calls 必须是数组", payload))?;
+                let mut frame_indices = std::collections::HashSet::with_capacity(tool_calls.len());
                 for part in tool_calls {
-                    let index = part["index"].as_u64().unwrap_or(0) as usize;
-                    if self.partial.len() <= index {
-                        self.partial.resize_with(index + 1, Default::default);
+                    let part = part.as_object().ok_or_else(|| {
+                        LlmError::protocol("tool_calls 元素必须是 object", payload)
+                    })?;
+                    let index_u64 = part
+                        .get("index")
+                        .and_then(serde_json::Value::as_u64)
+                        .ok_or_else(|| {
+                            LlmError::protocol("tool_calls 元素缺少非负整数 index", payload)
+                        })?;
+                    let index = usize::try_from(index_u64).map_err(|_| {
+                        LlmError::protocol("tool_calls index 超出本机可表示范围", payload)
+                    })?;
+                    if !frame_indices.insert(index) {
+                        return Err(LlmError::protocol(
+                            format!("同一增量帧重复提供 tool_calls index {index}"),
+                            payload,
+                        ));
+                    }
+                    if index > self.partial.len() {
+                        return Err(LlmError::protocol(
+                            format!(
+                                "tool_calls index 必须稠密递增，期望不大于 {}，实际为 {index}",
+                                self.partial.len()
+                            ),
+                            payload,
+                        ));
+                    }
+                    if index == self.partial.len() {
+                        self.partial.push(PartialToolCall::default());
+                    }
+                    if let Some(call_type) = part.get("type")
+                        && call_type.as_str() != Some("function")
+                    {
+                        return Err(LlmError::protocol(
+                            "tool_calls.type 必须是 function",
+                            payload,
+                        ));
                     }
                     let slot = &mut self.partial[index];
-                    if let Some(id) = part["id"].as_str() {
-                        slot.0.push_str(id);
+                    if let Some(id) = part.get("id") {
+                        slot.call_id.push_str(id.as_str().ok_or_else(|| {
+                            LlmError::protocol("tool_calls.id 必须是字符串", payload)
+                        })?);
                     }
-                    if let Some(name) = part["function"]["name"].as_str() {
-                        slot.1.push_str(name);
-                    }
-                    if let Some(args) = part["function"]["arguments"].as_str() {
-                        slot.2.push_str(args);
+                    if let Some(function) = part.get("function") {
+                        let function = function.as_object().ok_or_else(|| {
+                            LlmError::protocol("tool_calls.function 必须是 object", payload)
+                        })?;
+                        if let Some(name) = function.get("name") {
+                            slot.name.push_str(name.as_str().ok_or_else(|| {
+                                LlmError::protocol("tool_calls.function.name 必须是字符串", payload)
+                            })?);
+                        }
+                        if let Some(args) = function.get("arguments") {
+                            slot.arguments.push_str(args.as_str().ok_or_else(|| {
+                                LlmError::protocol(
+                                    "tool_calls.function.arguments 必须是字符串",
+                                    payload,
+                                )
+                            })?);
+                            slot.arguments_seen = true;
+                        }
                     }
                 }
-                return Ok(Vec::new());
             }
             if let Some(content) = delta["content"].as_str()
                 && !content.is_empty()
             {
-                return Ok(vec![LlmEvent::TextDelta(content.to_string())]);
+                events.push(LlmEvent::TextDelta(content.to_string()));
             }
             if delta.get("refusal").is_some_and(|value| !value.is_null()) {
                 self.saw_refusal = true;
             }
         }
 
-        match choice.get("finish_reason") {
+        let terminal_events = match choice.get("finish_reason") {
             Some(serde_json::Value::String(reason)) => match reason.as_str() {
                 "stop" if self.saw_refusal => Ok(self.finish_with_usage(Finish::Refusal)),
                 "stop" => Ok(self.finish_with_usage(Finish::Stop)),
@@ -190,14 +253,41 @@ impl super::Transform for Transform {
                             payload,
                         ));
                     }
+                    let mut call_ids = std::collections::HashSet::new();
+                    for (index, call) in self.partial.iter().enumerate() {
+                        if call.call_id.is_empty() {
+                            return Err(LlmError::protocol(
+                                format!("完成的工具调用 {index} 缺少非空 id"),
+                                payload,
+                            ));
+                        }
+                        if call.name.is_empty() {
+                            return Err(LlmError::protocol(
+                                format!("完成的工具调用 {index} 缺少非空 function.name"),
+                                payload,
+                            ));
+                        }
+                        if !call.arguments_seen {
+                            return Err(LlmError::protocol(
+                                format!("完成的工具调用 {index} 从未提供 function.arguments"),
+                                payload,
+                            ));
+                        }
+                        if !call_ids.insert(call.call_id.as_str()) {
+                            return Err(LlmError::protocol(
+                                format!("同一回合重复提供工具调用 id {:?}", call.call_id),
+                                payload,
+                            ));
+                        }
+                    }
                     let mut events: Vec<LlmEvent> = self
                         .partial
                         .drain(..)
-                        .map(|(call_id, name, arguments)| {
+                        .map(|call| {
                             LlmEvent::ToolCall(ToolCallReq {
-                                call_id,
-                                name,
-                                arguments,
+                                call_id: call.call_id,
+                                name: call.name,
+                                arguments: call.arguments,
                             })
                         })
                         .collect();
@@ -213,7 +303,9 @@ impl super::Transform for Transform {
                 )),
             },
             _ => Ok(Vec::new()),
-        }
+        }?;
+        events.extend(terminal_events);
+        Ok(events)
     }
 }
 
@@ -277,6 +369,128 @@ mod tests {
     }
 
     #[test]
+    fn sparse_or_duplicate_tool_call_indices_are_protocol_errors() {
+        let mut sparse = Transform::new();
+        let result = sparse.push(
+            "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":1000000000,\"id\":\"call\"}]},\"finish_reason\":null}]}",
+        );
+        assert!(matches!(result, Err(LlmError::Protocol { .. })));
+        assert!(sparse.partial.is_empty(), "跳号不得触发 resize 或留下空槽");
+
+        let mut duplicate = Transform::new();
+        let result = duplicate.push(
+            "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"a\"},{\"index\":0,\"id\":\"b\"}]},\"finish_reason\":null}]}",
+        );
+        assert!(matches!(result, Err(LlmError::Protocol { .. })));
+    }
+
+    #[test]
+    fn completed_tool_calls_require_nonempty_id_name_and_an_arguments_field() {
+        for first_delta in [
+            r#"{"index":0,"id":"","type":"function","function":{"name":"search","arguments":"{}"}}"#,
+            r#"{"index":0,"id":"call_1","type":"function","function":{"name":"","arguments":"{}"}}"#,
+            r#"{"index":0,"id":"call_1","type":"function","function":{"name":"search"}}"#,
+        ] {
+            let mut transform = Transform::new();
+            transform
+                .push(&format!(
+                    r#"{{"choices":[{{"delta":{{"tool_calls":[{first_delta}]}},"finish_reason":null}}]}}"#
+                ))
+                .unwrap();
+            let result =
+                transform.push(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#);
+            assert!(matches!(result, Err(LlmError::Protocol { .. })));
+        }
+    }
+
+    #[test]
+    fn duplicate_tool_call_ids_are_rejected_before_any_call_is_released() {
+        let mut transform = Transform::new();
+        let events = transform
+            .push(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"same","type":"function","function":{"name":"first","arguments":"{}"}},{"index":1,"id":"same","type":"function","function":{"name":"second","arguments":"{}"}}]},"finish_reason":null}]}"#,
+            )
+            .unwrap();
+        assert!(events.is_empty());
+        assert!(matches!(
+            transform.push(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#),
+            Err(LlmError::Protocol { .. })
+        ));
+    }
+
+    #[test]
+    fn final_text_delta_usage_and_finish_from_one_choice_are_all_preserved() {
+        let mut transform = Transform::new();
+        let events = transform
+            .push(
+                r#"{"usage":{"prompt_tokens":3,"completion_tokens":1},"choices":[{"delta":{"content":"最后一段"},"finish_reason":"stop"}]}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::TextDelta("最后一段".into()),
+                LlmEvent::Usage(ProviderUsage {
+                    input_tokens: Some(3),
+                    output_tokens: Some(1),
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                }),
+                LlmEvent::Finished(Finish::Stop),
+            ]
+        );
+    }
+
+    #[test]
+    fn final_arguments_delta_and_tool_finish_from_one_choice_are_both_processed() {
+        let mut transform = Transform::new();
+        transform
+            .push(
+                r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"search","arguments":"{"}}]},"finish_reason":null}]}"#,
+            )
+            .unwrap();
+        let events = transform
+            .push(
+                r#"{"usage":{"completion_tokens":2},"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            )
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::ToolCall(ToolCallReq {
+                    call_id: "call_1".into(),
+                    name: "search".into(),
+                    arguments: "{}".into(),
+                }),
+                LlmEvent::Usage(ProviderUsage {
+                    input_tokens: None,
+                    output_tokens: Some(2),
+                    cache_read_tokens: None,
+                    cache_creation_tokens: None,
+                }),
+                LlmEvent::Finished(Finish::ToolUse),
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_call_fields_with_wrong_json_types_are_protocol_errors() {
+        for part in [
+            r#"{"index":"0"}"#,
+            r#"{"index":0,"id":1}"#,
+            r#"{"index":0,"function":{"name":1}}"#,
+            r#"{"index":0,"function":{"arguments":{}}}"#,
+            r#"{"index":0,"type":"custom"}"#,
+        ] {
+            let mut transform = Transform::new();
+            let result = transform.push(&format!(
+                r#"{{"choices":[{{"delta":{{"tool_calls":[{part}]}},"finish_reason":null}}]}}"#
+            ));
+            assert!(matches!(result, Err(LlmError::Protocol { .. })), "{part}");
+        }
+    }
+
+    #[test]
     fn length_finish_is_max_tokens() {
         let mut t = Transform::new();
         let events = t
@@ -319,7 +533,7 @@ mod tests {
             model: "m".into(),
             api_key: None,
             context_window_tokens: 131072,
-            max_output_tokens: 16384,
+            anthropic_max_tokens: None,
         };
         let history = vec![
             Message::User("任务".into()),
@@ -346,5 +560,16 @@ mod tests {
         assert_eq!(v["messages"][3]["tool_call_id"], "call_1");
         assert_eq!(v["messages"][3]["content"], "结果");
         assert!(v.get("tools").is_none(), "无工具时不发 tools 字段");
+        let keys = v
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            std::collections::BTreeSet::from(["messages", "model", "stream"]),
+            "Chat Completions 请求不得夹带生成控制字段"
+        );
     }
 }

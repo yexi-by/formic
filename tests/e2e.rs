@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -100,10 +100,11 @@ const COMPLETIONS_COMPACTION_SUBMIT: &str = concat!(
 
 const RESPONSES_TOOLCALL: &str = concat!(
     "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"status\":\"in_progress\"}}\n\n",
-    "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc1\",\"call_id\":\"call_1\",\"name\":\"search\",\"arguments\":\"\"}}\n\n",
-    "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc1\",\"output_index\":0,\"delta\":\"{\\\"pattern\\\":\\\"苹果\\\"\"}\n\n",
-    "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc1\",\"output_index\":0,\"delta\":\",\\\"scope\\\":\\\"input\\\"}\"}\n\n",
-    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc1\",\"call_id\":\"call_1\",\"name\":\"search\",\"arguments\":\"{\\\"pattern\\\":\\\"苹果\\\",\\\"scope\\\":\\\"input\\\"}\"}}\n\n",
+    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"reasoning\",\"id\":\"rs_provider_1\",\"encrypted_content\":\"provider-only-state\",\"summary\":[]}}\n\n",
+    "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc1\",\"call_id\":\"call_1\",\"name\":\"search\",\"arguments\":\"\"}}\n\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc1\",\"output_index\":1,\"delta\":\"{\\\"pattern\\\":\\\"苹果\\\"\"}\n\n",
+    "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc1\",\"output_index\":1,\"delta\":\",\\\"scope\\\":\\\"input\\\"}\"}\n\n",
+    "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc1\",\"call_id\":\"call_1\",\"name\":\"search\",\"arguments\":\"{\\\"pattern\\\":\\\"苹果\\\",\\\"scope\\\":\\\"input\\\"}\"}}\n\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\"}}\n\n",
 );
 
@@ -244,6 +245,32 @@ fn tool_result_marker(path: &str) -> &'static str {
 
 fn tools_value(body: &str) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(body).unwrap()["tools"].clone()
+}
+
+fn assert_minimal_llm_body(protocol: &str, body: &str) {
+    let value: serde_json::Value = serde_json::from_str(body).unwrap();
+    let allowed: &[&str] = match protocol {
+        "completions" => &["model", "stream", "messages", "tools"],
+        "responses" => &["model", "stream", "instructions", "input", "tools"],
+        "anthropic" => &[
+            "model",
+            "max_tokens",
+            "stream",
+            "system",
+            "messages",
+            "tools",
+        ],
+        other => panic!("未知测试协议 {other}"),
+    };
+    for key in value.as_object().unwrap().keys() {
+        assert!(
+            allowed.contains(&key.as_str()),
+            "{protocol} 不得发送额外请求字段 {key}：{body}"
+        );
+    }
+    if protocol == "anthropic" {
+        assert_eq!(value["max_tokens"], 16384);
+    }
 }
 
 struct Recorded {
@@ -594,8 +621,12 @@ fn run_formic(
         .env("FORMIC_LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
         .env("FORMIC_LLM_MODEL", "test-model")
         .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env("FORMIC_LLM_MAX_OUTPUT_TOKENS", "16384")
         .env_remove("FORMIC_LLM_API_KEY");
+    if protocol == "anthropic" {
+        command.env("FORMIC_ANTHROPIC_MAX_TOKENS", "16384");
+    } else {
+        command.env_remove("FORMIC_ANTHROPIC_MAX_TOKENS");
+    }
     command.output().unwrap()
 }
 
@@ -608,7 +639,7 @@ fn formic_command(
 ) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_formic"));
     command
-        .current_dir(out.parent().expect("测试输出目录有父目录"))
+        .current_dir(plan.parent().expect("测试计划文件有父目录"))
         .arg("run")
         .arg("--data")
         .arg(data)
@@ -640,8 +671,12 @@ fn run_structured_formic(
         .env("FORMIC_LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
         .env("FORMIC_LLM_MODEL", "test-model")
         .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env("FORMIC_LLM_MAX_OUTPUT_TOKENS", "16384")
         .env_remove("FORMIC_LLM_API_KEY");
+    if protocol == "anthropic" {
+        command.env("FORMIC_ANTHROPIC_MAX_TOKENS", "16384");
+    } else {
+        command.env_remove("FORMIC_ANTHROPIC_MAX_TOKENS");
+    }
     command.output().unwrap()
 }
 
@@ -835,6 +870,9 @@ fn assert_success(protocol: &str, expected_path: &str) {
         requests.iter().all(|r| r.path.ends_with(expected_path)),
         "{protocol} 请求路径应为 {expected_path}"
     );
+    for request in requests.iter() {
+        assert_minimal_llm_body(protocol, &request.body);
+    }
     // 并发下请求不按单元顺序到达，按多重集断言：两个首轮（携带 tools schema），
     // 两个次轮（携带协议工具结果消息与 search 命中行）
     let marker = tool_result_marker(expected_path);
@@ -856,6 +894,22 @@ fn assert_success(protocol: &str, expected_path: &str) {
         second_turns.iter().all(|r| r.body.contains("苹果是水果")),
         "{protocol} 次轮请求应回注 search 结果"
     );
+    if protocol == "responses" {
+        assert!(
+            second_turns
+                .iter()
+                .all(|request| request.body.contains("provider-only-state")),
+            "Responses 次轮必须原样重放供应商 reasoning item"
+        );
+        assert!(
+            second_turns.iter().all(|request| request
+                .body
+                .matches("\"type\":\"function_call\"")
+                .count()
+                == 1),
+            "Responses 原始 function_call 不得再合成一份重复项"
+        );
+    }
     let frozen_tools = tools_value(&requests[0].body);
     assert!(
         requests
@@ -901,21 +955,7 @@ fn structured_output_succeeds_for_all_protocols() {
         )
         .unwrap();
         let mock = start_mock();
-        let mut command = formic_command(2, &data, &plan, &task, &out);
-        let output = command
-            .arg("--output-schema")
-            .arg(&schema)
-            .env("FORMIC_LLM_PROTOCOL", protocol)
-            .env(
-                "FORMIC_LLM_BASE_URL",
-                format!("http://127.0.0.1:{}/v1", mock.port),
-            )
-            .env("FORMIC_LLM_MODEL", "test-model")
-            .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-            .env("FORMIC_LLM_MAX_OUTPUT_TOKENS", "16384")
-            .env_remove("FORMIC_LLM_API_KEY")
-            .output()
-            .unwrap();
+        let output = run_structured_formic(protocol, mock.port, &data, &plan, &task, &out, &schema);
         assert_eq!(
             output.status.code(),
             Some(0),
@@ -1018,10 +1058,10 @@ fn refusal_truncation_and_structured_exhaustion_publish_nothing() {
         let mock = start_mock();
         let output = run_structured_formic(protocol, mock.port, &data, &plan, &task, &out, &schema);
         assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
-        assert!(stderr_of(&output).contains("连续 3 次无效"));
+        assert!(stderr_of(&output).contains("连续 5 次无效"));
         assert!(!out.join("1.json").exists());
         assert!(!out.join("2.json").exists());
-        assert_eq!(mock.requests.lock().unwrap().len(), 6);
+        assert_eq!(mock.requests.lock().unwrap().len(), 10);
     }
 }
 
@@ -1061,8 +1101,8 @@ fn context_budget_compacts_complete_tool_group_then_continues() {
             format!("http://127.0.0.1:{}/v1", mock.port),
         )
         .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "6200")
-        .env("FORMIC_LLM_MAX_OUTPUT_TOKENS", "500")
+        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "5700")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
         .env_remove("FORMIC_LLM_API_KEY")
         .output()
         .unwrap();
@@ -1114,7 +1154,7 @@ fn config_file_supplies_http_settings() {
     fs::write(
         dir.path().join("config.toml"),
         format!(
-            "url = \"http://127.0.0.1:{}/v1\"\napi_key = \"config-key\"\nmodel = \"config-model\"\ncontext_window_tokens = 131072\nmax_output_tokens = 16384\n",
+            "url = \"http://127.0.0.1:{}/v1\"\napi_key = \"config-key\"\nmodel = \"config-model\"\ncontext_window_tokens = 131072\n",
             mock.port
         ),
     )
@@ -1128,7 +1168,7 @@ fn config_file_supplies_http_settings() {
         .env_remove("FORMIC_LLM_API_KEY")
         .env_remove("FORMIC_LLM_MODEL")
         .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_LLM_MAX_OUTPUT_TOKENS")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
         .output()
         .unwrap();
 
@@ -1176,7 +1216,6 @@ fn custom_stdio_mcp_auto_discovers_all_tools_and_is_audited() {
                 "url = \"http://127.0.0.1:{}/v1\"\n",
                 "model = \"test-model\"\n",
                 "context_window_tokens = 131072\n",
-                "max_output_tokens = 16384\n",
                 "[tools.search]\nenabled = false\n",
                 "[tools.read]\nenabled = false\n",
                 "[mcp_servers.demo]\n",
@@ -1204,7 +1243,7 @@ fn custom_stdio_mcp_auto_discovers_all_tools_and_is_audited() {
         .env_remove("FORMIC_LLM_MODEL")
         .env_remove("FORMIC_LLM_API_KEY")
         .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_LLM_MAX_OUTPUT_TOKENS")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
         .output()
         .unwrap();
 
@@ -1268,7 +1307,7 @@ fn stdio_mcp_unit_scope_creates_and_reclaims_one_session_per_unit() {
         format!(
             concat!(
                 "url = \"http://127.0.0.1:{}/v1\"\n",
-                "model = \"test-model\"\ncontext_window_tokens = 131072\nmax_output_tokens = 16384\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
                 "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
                 "[mcp_servers.demo]\nenabled = true\ncommand = {}\n",
                 "env = {{ FAKE_MCP_START_LOG = {}, FAKE_MCP_CALL_LOG = {} }}\n",
@@ -1288,7 +1327,7 @@ fn stdio_mcp_unit_scope_creates_and_reclaims_one_session_per_unit() {
         .env_remove("FORMIC_LLM_MODEL")
         .env_remove("FORMIC_LLM_API_KEY")
         .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_LLM_MAX_OUTPUT_TOKENS")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
@@ -1314,7 +1353,7 @@ fn timed_out_mcp_call_is_not_replayed() {
         format!(
             concat!(
                 "url = \"http://127.0.0.1:{}/v1\"\n",
-                "model = \"test-model\"\ncontext_window_tokens = 131072\nmax_output_tokens = 16384\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
                 "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
                 "[mcp_servers.demo]\nenabled = true\ncommand = {}\n",
                 "env = {{ FAKE_MCP_CALL_LOG = {} }}\n",
@@ -1327,15 +1366,39 @@ fn timed_out_mcp_call_is_not_replayed() {
     )
     .unwrap();
     let mut command = formic_command(1, &data, &plan, &task, &out);
-    let output = command
+    let mut child = command
         .env("FORMIC_LLM_PROTOCOL", "completions")
         .env_remove("FORMIC_LLM_BASE_URL")
         .env_remove("FORMIC_LLM_MODEL")
         .env_remove("FORMIC_LLM_API_KEY")
         .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_LLM_MAX_OUTPUT_TOKENS")
-        .output()
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .unwrap();
+    let observation_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while fs::metadata(&call_log).map_or(true, |metadata| metadata.len() == 0)
+        && std::time::Instant::now() < observation_deadline
+    {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let call_seen = fs::metadata(&call_log).is_ok_and(|metadata| metadata.len() > 0);
+    let call_started = std::time::Instant::now();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        call_seen,
+        "fake MCP 未收到预期的 tools/call：{}",
+        stderr_of(&output)
+    );
+    assert!(
+        call_started.elapsed() < std::time::Duration::from_millis(3500),
+        "tools/call 发出后，1 秒工具超时不应再等待旧 stdio 调用；实际耗时 {:?}",
+        call_started.elapsed()
+    );
     assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
     assert!(stderr_of(&output).contains("调用超时"));
     assert!(!out.join("1.md").exists());
@@ -1360,7 +1423,6 @@ fn custom_streamable_http_mcp_uses_session_auth_and_frozen_catalog() {
                 "url = \"http://127.0.0.1:{}/v1\"\n",
                 "model = \"test-model\"\n",
                 "context_window_tokens = 131072\n",
-                "max_output_tokens = 16384\n",
                 "[tools.search]\nenabled = false\n",
                 "[tools.read]\nenabled = false\n",
                 "[mcp_servers.demo]\n",
@@ -1383,7 +1445,7 @@ fn custom_streamable_http_mcp_uses_session_auth_and_frozen_catalog() {
         .env_remove("FORMIC_LLM_MODEL")
         .env_remove("FORMIC_LLM_API_KEY")
         .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_LLM_MAX_OUTPUT_TOKENS")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
         .output()
         .unwrap();
     assert_eq!(
@@ -1464,21 +1526,21 @@ fn failed_unit_leaves_no_record() {
     );
     assert!(stderr.contains("500"), "失败诊断应含直接原因：{stderr}");
     assert!(
-        stderr.contains("重试 2 次"),
+        stderr.contains("重试 4 次"),
         "瞬时故障应重试到预算耗尽：{stderr}"
     );
 
-    // 单元 1 两轮 2 次请求 + 单元 2 三次尝试均 500
+    // 单元 1 两轮 2 次请求 + 单元 2 五次尝试均 500
     let requests = mock.requests.lock().unwrap();
-    assert_eq!(requests.len(), 5, "重试预算应耗尽：{:?}", requests.len());
+    assert_eq!(requests.len(), 7, "重试预算应耗尽：{:?}", requests.len());
     drop(requests);
 
     let stats = stats_lines(&out);
     assert_eq!(stats_of(&stats, 1)["outcome"], "published");
     let failed = stats_of(&stats, 2);
     assert_eq!(failed["outcome"], "failed", "{failed}");
-    assert_eq!(failed["llm_calls"], 3, "失败单元应尝试 3 次：{failed}");
-    assert_eq!(failed["retries"], 2, "失败单元应重试 2 次：{failed}");
+    assert_eq!(failed["llm_calls"], 5, "失败单元应尝试 5 次：{failed}");
+    assert_eq!(failed["retries"], 4, "失败单元应重试 4 次：{failed}");
 }
 
 /// 瞬时故障重试成功：首次 500 → 重发 → 正常完成两轮。
@@ -1559,8 +1621,8 @@ fn stalled_unit_is_terminated() {
     let s = stats_of(&stats, 2);
     assert_eq!(s["outcome"], "failed", "{s}");
     assert_eq!(
-        s["tool_calls"]["search"], 3,
-        "停滞前应执行 3 次相同调用：{s}"
+        s["tool_calls"]["search"], 16,
+        "停滞前应执行 16 次相同调用：{s}"
     );
 }
 
@@ -1590,7 +1652,102 @@ fn invalid_plan_reports_unit_and_exits_2() {
     assert_eq!(output.status.code(), Some(2), "启动失败退出码应为 2");
     let stderr = stderr_of(&output);
     assert!(stderr.contains("单元 7"), "错误应含单元号：{stderr}");
-    assert!(stderr.contains("逃逸"), "错误应说明原因：{stderr}");
+    assert!(
+        stderr.contains("不含 . 或 .. 的数据根内相对路径"),
+        "错误应说明原因：{stderr}"
+    );
+}
+
+#[test]
+fn output_directory_cannot_overlap_input_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, _out) = write_job(dir.path(), None);
+    let mock = start_mock();
+    let output = run_formic("completions", mock.port, 1, &data, &plan, &task, &data);
+
+    assert_eq!(output.status.code(), Some(2), "启动失败退出码应为 2");
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("不能相同或互相包含"),
+        "错误应明确说明目录边界：{stderr}"
+    );
+    assert!(data.join("a.txt").exists(), "输入文件不得被覆盖");
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn rejected_nested_output_directory_is_not_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, _out) = write_job(dir.path(), None);
+    let nested_out = data.join("generated").join("out");
+    let mock = start_mock();
+
+    let output = run_formic(
+        "completions",
+        mock.port,
+        1,
+        &data,
+        &plan,
+        &task,
+        &nested_out,
+    );
+
+    assert_eq!(output.status.code(), Some(2), "启动失败退出码应为 2");
+    assert!(
+        stderr_of(&output).contains("不能相同或互相包含"),
+        "错误应明确说明目录边界：{}",
+        stderr_of(&output)
+    );
+    assert!(!nested_out.exists(), "拒绝参数时不得污染输入目录");
+    assert!(!data.join("generated").exists());
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn concurrent_jobs_cannot_share_an_output_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_job(dir.path(), None);
+    fs::write(&plan, "{\"unit\":1,\"files\":[\"a.txt\"]}\n").unwrap();
+    let mock = start_mock_with_delay(1000);
+
+    let mut first_command = formic_command(1, &data, &plan, &task, &out);
+    first_command
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env(
+            "FORMIC_LLM_BASE_URL",
+            format!("http://127.0.0.1:{}/v1", mock.port),
+        )
+        .env("FORMIC_LLM_MODEL", "test-model")
+        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
+        .env_remove("FORMIC_LLM_API_KEY")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut first = first_command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while mock.requests.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        !mock.requests.lock().unwrap().is_empty(),
+        "首个作业应已取得输出目录锁并开始调用模型"
+    );
+    assert!(first.try_wait().unwrap().is_none(), "首个作业应仍在运行");
+
+    let second = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+    let first_output = first.wait_with_output().unwrap();
+    assert_eq!(
+        first_output.status.code(),
+        Some(0),
+        "首个作业应正常完成：{}",
+        stderr_of(&first_output)
+    );
+    assert_eq!(second.status.code(), Some(2));
+    assert!(
+        stderr_of(&second).contains("正在被另一个 Formic 作业使用"),
+        "第二个作业应报告输出目录冲突：{}",
+        stderr_of(&second)
+    );
 }
 
 /// 窗口证据：mock 端在途请求峰值 == 并发窗口（真实入口验证，不是单元推断）。

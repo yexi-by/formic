@@ -93,7 +93,6 @@ pub enum SessionScope {
 #[derive(Debug, Clone)]
 pub struct McpToolLimit {
     pub max_in_flight: usize,
-    pub max_result_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -117,7 +116,8 @@ struct FileConfig {
     api_key: Option<String>,
     model: Option<String>,
     context_window_tokens: Option<u64>,
-    max_output_tokens: Option<u64>,
+    /// Anthropic Messages 协议要求的必填参数；其他协议不得配置。
+    anthropic_max_tokens: Option<u64>,
     execution: FileExecutionConfig,
     tools: FileToolsConfig,
     cache: FileCacheConfig,
@@ -252,9 +252,9 @@ pub enum ConfigError {
     )]
     MissingContextWindow,
     #[error(
-        "缺少模型最大输出：请设置 FORMIC_LLM_MAX_OUTPUT_TOKENS，或填写 config.toml 的 max_output_tokens"
+        "Anthropic Messages 缺少 max_tokens：请设置 FORMIC_ANTHROPIC_MAX_TOKENS，或填写 config.toml 的 anthropic_max_tokens"
     )]
-    MissingMaxOutput,
+    MissingAnthropicMaxTokens,
     #[error("配置无效：{0}")]
     Invalid(String),
 }
@@ -289,21 +289,34 @@ fn resolve(
     get_env: impl Fn(&str) -> Option<String>,
 ) -> Result<AppConfig, ConfigError> {
     let env_value = |name: &str| get_env(name).filter(|value| !value.is_empty());
-    let protocol = env_value("FORMIC_LLM_PROTOCOL").ok_or(ConfigError::MissingProtocol)?;
+    let protocol_name = env_value("FORMIC_LLM_PROTOCOL").ok_or(ConfigError::MissingProtocol)?;
+    let protocol = Protocol::parse(&protocol_name).map_err(ConfigError::InvalidProtocol)?;
     let context_window_tokens = parse_env_u64(
         env_value("FORMIC_LLM_CONTEXT_WINDOW_TOKENS"),
         "FORMIC_LLM_CONTEXT_WINDOW_TOKENS",
     )?
     .or(file.context_window_tokens)
     .ok_or(ConfigError::MissingContextWindow)?;
-    let max_output_tokens = parse_env_u64(
-        env_value("FORMIC_LLM_MAX_OUTPUT_TOKENS"),
-        "FORMIC_LLM_MAX_OUTPUT_TOKENS",
-    )?
-    .or(file.max_output_tokens)
-    .ok_or(ConfigError::MissingMaxOutput)?;
     require_positive(context_window_tokens, "context_window_tokens")?;
-    require_positive(max_output_tokens, "max_output_tokens")?;
+
+    let configured_anthropic_max_tokens = parse_env_u64(
+        env_value("FORMIC_ANTHROPIC_MAX_TOKENS"),
+        "FORMIC_ANTHROPIC_MAX_TOKENS",
+    )?
+    .or(file.anthropic_max_tokens);
+    let anthropic_max_tokens = match (protocol, configured_anthropic_max_tokens) {
+        (Protocol::Anthropic, Some(value)) => {
+            require_positive(value, "anthropic_max_tokens")?;
+            Some(value)
+        }
+        (Protocol::Anthropic, None) => return Err(ConfigError::MissingAnthropicMaxTokens),
+        (_, Some(_)) => {
+            return Err(ConfigError::Invalid(
+                "anthropic_max_tokens 只允许用于 anthropic 协议".into(),
+            ));
+        }
+        (_, None) => None,
+    };
 
     let execution = ExecutionConfig {
         llm_attempts: positive_or(
@@ -322,12 +335,18 @@ fn resolve(
             "execution.context_safety_tokens",
         )?,
     };
-    let reserved = max_output_tokens
+    let reserved = anthropic_max_tokens
+        .unwrap_or(0)
         .checked_add(execution.context_safety_tokens)
-        .ok_or_else(|| ConfigError::Invalid("模型 token 配置发生整数溢出".into()))?;
+        .ok_or_else(|| ConfigError::Invalid("上下文保留配置发生整数溢出".into()))?;
     if reserved >= context_window_tokens {
+        let components = if anthropic_max_tokens.is_some() {
+            "anthropic_max_tokens 与 execution.context_safety_tokens 之和"
+        } else {
+            "execution.context_safety_tokens"
+        };
         return Err(ConfigError::Invalid(format!(
-            "context_window_tokens 必须大于 max_output_tokens 与 execution.context_safety_tokens 之和（当前保留 {reserved}）"
+            "context_window_tokens 必须大于 {components}（当前保留 {reserved}）"
         )));
     }
 
@@ -396,7 +415,7 @@ fn resolve(
 
     Ok(AppConfig {
         llm: LlmConfig {
-            protocol: Protocol::parse(&protocol).map_err(ConfigError::InvalidProtocol)?,
+            protocol,
             base_url: env_value("FORMIC_LLM_BASE_URL")
                 .or_else(|| non_empty(file.url))
                 .ok_or(ConfigError::MissingUrl)?,
@@ -405,7 +424,7 @@ fn resolve(
                 .ok_or(ConfigError::MissingModel)?,
             api_key: env_value("FORMIC_LLM_API_KEY").or_else(|| non_empty(file.api_key)),
             context_window_tokens,
-            max_output_tokens,
+            anthropic_max_tokens,
         },
         execution,
         tools,
@@ -469,6 +488,11 @@ fn resolve_mcp_server(
     )?;
     let mut tool_limits = BTreeMap::new();
     for (tool, limit) in file.tool_limits {
+        if limit.max_result_bytes.is_some() {
+            return Err(ConfigError::Invalid(format!(
+                "mcp_servers.{name}.tool_limits.{tool}.max_result_bytes 无效；结果字节上限必须统一配置在 mcp_servers.{name}.max_result_bytes"
+            )));
+        }
         tool_limits.insert(
             tool.clone(),
             McpToolLimit {
@@ -476,11 +500,6 @@ fn resolve_mcp_server(
                     limit.max_in_flight,
                     server_in_flight,
                     &format!("mcp_servers.{name}.tool_limits.{tool}.max_in_flight"),
-                )?,
-                max_result_bytes: positive_or(
-                    limit.max_result_bytes,
-                    server_result,
-                    &format!("mcp_servers.{name}.tool_limits.{tool}.max_result_bytes"),
                 )?,
             },
         );
@@ -658,7 +677,6 @@ url = "https://file.example/v1"
 api_key = "file-key"
 model = "file-model"
 context_window_tokens = 131072
-max_output_tokens = 16384
 "#;
 
     #[test]
@@ -671,6 +689,7 @@ max_output_tokens = 16384
         assert_eq!(config.llm.api_key.as_deref(), Some("file-key"));
         assert_eq!(config.llm.model, "file-model");
         assert_eq!(config.llm.context_window_tokens, 131072);
+        assert_eq!(config.llm.anthropic_max_tokens, None);
         assert_eq!(config.execution.llm_attempts, 5);
         assert_eq!(config.execution.identical_tool_call_limit, 16);
         assert_eq!(config.execution.context_safety_tokens, 2048);
@@ -696,7 +715,6 @@ max_output_tokens = 16384
                 ("FORMIC_LLM_API_KEY", "env-key"),
                 ("FORMIC_LLM_MODEL", "env-model"),
                 ("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "200000"),
-                ("FORMIC_LLM_MAX_OUTPUT_TOKENS", "20000"),
             ],
         )
         .unwrap();
@@ -705,13 +723,13 @@ max_output_tokens = 16384
         assert_eq!(config.llm.api_key.as_deref(), Some("env-key"));
         assert_eq!(config.llm.model, "env-model");
         assert_eq!(config.llm.context_window_tokens, 200000);
-        assert_eq!(config.llm.max_output_tokens, 20000);
+        assert_eq!(config.llm.anthropic_max_tokens, None);
     }
 
     #[test]
     fn missing_context_names_both_sources() {
         let error = load_fixture(
-            Some("url='x'\nmodel='m'\nmax_output_tokens=100\n"),
+            Some("url='x'\nmodel='m'\n"),
             &[("FORMIC_LLM_PROTOCOL", "responses")],
         )
         .err()
@@ -740,8 +758,44 @@ max_output_tokens = 16384
 
     #[test]
     fn context_reserve_must_leave_input_room() {
-        let file = "url='x'\nmodel='m'\ncontext_window_tokens=100\nmax_output_tokens=90\n[execution]\ncontext_safety_tokens=10\n";
+        let file = "url='x'\nmodel='m'\ncontext_window_tokens=100\n[execution]\ncontext_safety_tokens=100\n";
         let error = load_fixture(Some(file), &[("FORMIC_LLM_PROTOCOL", "responses")])
+            .err()
+            .expect("应拒绝无效配置");
+        assert!(error.to_string().contains("必须大于"));
+    }
+
+    #[test]
+    fn anthropic_max_tokens_is_required_and_protocol_specific() {
+        let missing = load_fixture(Some(BASE_FILE), &[("FORMIC_LLM_PROTOCOL", "anthropic")])
+            .err()
+            .expect("Anthropic 必须显式配置协议必填参数");
+        assert!(
+            missing.to_string().contains("FORMIC_ANTHROPIC_MAX_TOKENS"),
+            "{missing}"
+        );
+
+        let config = load_fixture(
+            Some(BASE_FILE),
+            &[
+                ("FORMIC_LLM_PROTOCOL", "anthropic"),
+                ("FORMIC_ANTHROPIC_MAX_TOKENS", "20000"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(config.llm.anthropic_max_tokens, Some(20000));
+
+        let file = format!("{BASE_FILE}\nanthropic_max_tokens=1000\n");
+        let error = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")])
+            .err()
+            .expect("其他协议不得携带 Anthropic 专属参数");
+        assert!(error.to_string().contains("只允许用于 anthropic"));
+    }
+
+    #[test]
+    fn anthropic_reserve_must_leave_input_room() {
+        let file = "url='x'\nmodel='m'\ncontext_window_tokens=100\nanthropic_max_tokens=90\n[execution]\ncontext_safety_tokens=10\n";
+        let error = load_fixture(Some(file), &[("FORMIC_LLM_PROTOCOL", "anthropic")])
             .err()
             .expect("应拒绝无效配置");
         assert!(error.to_string().contains("必须大于"));
@@ -817,14 +871,28 @@ max_output_tokens = 16384
     }
 
     #[test]
-    fn tool_limit_inherits_server_values() {
+    fn tool_concurrency_limit_inherits_server_value() {
         let file = format!(
             "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\ncommand='server'\nenabled_tools=['search']\nmax_in_flight=7\nmax_result_bytes=4567\n[mcp_servers.demo.tool_limits.search]\n"
         );
         let config = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]).unwrap();
         let limit = &config.mcp_servers["demo"].tool_limits["search"];
         assert_eq!(limit.max_in_flight, 7);
-        assert_eq!(limit.max_result_bytes, 4567);
+    }
+
+    #[test]
+    fn result_limit_cannot_be_configured_per_tool() {
+        let file = format!(
+            "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\ncommand='server'\nenabled_tools=['search']\nmax_result_bytes=1024\n[mcp_servers.demo.tool_limits.search]\nmax_result_bytes=512\n"
+        );
+        let error = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")])
+            .err()
+            .expect("公共 MCP 结果流无法提供互不相同的解码前上限");
+        assert!(
+            error
+                .to_string()
+                .contains("结果字节上限必须统一配置在 mcp_servers.demo.max_result_bytes")
+        );
     }
 
     #[test]

@@ -8,7 +8,138 @@ use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use chrono::{DateTime, SecondsFormat, Utc};
+use fs2::FileExt;
+
+const OUTPUT_LOCK_FILE: &str = ".formic-job.lock";
+
+/// 启动时绑定的输出目录能力。所有运行期输出都相对此句柄访问；`path` 只用于
+/// 用户可见诊断，输出目录的环境路径被改名或替换不会改变实际写入位置。
+#[derive(Clone)]
+pub struct OutputRoot {
+    dir: std::sync::Arc<Dir>,
+    path: PathBuf,
+}
+
+impl OutputRoot {
+    #[cfg(test)]
+    pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
+        let path = path.into();
+        let dir = Dir::open_ambient_dir(&path, ambient_authority())?;
+        Ok(Self {
+            dir: std::sync::Arc::new(dir),
+            path,
+        })
+    }
+
+    /// 使用调用方已经固定的目录句柄构造输出根；用于启动阶段在同一个已校验父目录
+    /// capability 内创建并打开输出目录，避免重新按环境路径绑定。
+    pub(crate) fn from_dir(path: impl Into<PathBuf>, dir: Dir) -> Self {
+        Self {
+            dir: std::sync::Arc::new(dir),
+            path: path.into(),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn clone_dir(&self) -> io::Result<Dir> {
+        self.dir.try_clone()
+    }
+
+    pub(crate) fn display(&self, relative: &Path) -> PathBuf {
+        self.path.join(relative)
+    }
+
+    fn create(&self, relative: &Path) -> io::Result<fs::File> {
+        Ok(self.dir.create(relative)?.into_std())
+    }
+
+    fn open_file(&self, relative: &Path) -> io::Result<fs::File> {
+        Ok(self.dir.open(relative)?.into_std())
+    }
+
+    pub(crate) fn write(&self, relative: &Path, content: impl AsRef<[u8]>) -> io::Result<()> {
+        let mut file = self.create(relative)?;
+        file.write_all(content.as_ref())
+    }
+
+    fn remove_file(&self, relative: &Path) -> io::Result<()> {
+        self.dir.remove_file(relative)
+    }
+
+    pub(crate) fn rename(&self, source: &Path, target: &Path) -> io::Result<()> {
+        self.dir.rename(source, &self.dir, target)
+    }
+
+    pub(crate) fn exists(&self, relative: &Path) -> bool {
+        self.dir.symlink_metadata(relative).is_ok()
+    }
+
+    pub(crate) fn read(&self, relative: &Path) -> io::Result<Vec<u8>> {
+        self.dir.read(relative)
+    }
+
+    pub(crate) fn read_dir(&self, relative: &Path) -> io::Result<cap_std::fs::ReadDir> {
+        self.dir.read_dir(relative)
+    }
+}
+
+/// 输出目录的跨进程独占使用权。锁文件固定存在，操作系统在进程退出时自动释放锁。
+pub struct OutputLease {
+    _file: fs::File,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OutputLeaseError {
+    #[error("无法打开输出目录锁 {path}：{source}")]
+    Open { path: PathBuf, source: io::Error },
+    #[error("输出目录 {0} 正在被另一个 Formic 作业使用")]
+    InUse(PathBuf),
+    #[error("无法锁定输出目录 {path}：{source}")]
+    Lock { path: PathBuf, source: io::Error },
+}
+
+impl OutputLease {
+    pub fn acquire(root: &OutputRoot) -> Result<Self, OutputLeaseError> {
+        let path = root.path.join(OUTPUT_LOCK_FILE);
+        let file = root
+            .dir
+            .open_with(
+                OUTPUT_LOCK_FILE,
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false),
+            )
+            .map(cap_std::fs::File::into_std)
+            .map_err(|source| OutputLeaseError::Open {
+                path: path.clone(),
+                source,
+            })?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(source) if lock_is_in_use(&source) => {
+                Err(OutputLeaseError::InUse(root.path.clone()))
+            }
+            Err(source) => Err(OutputLeaseError::Lock {
+                path: root.path.clone(),
+                source,
+            }),
+        }
+    }
+}
+
+fn lock_is_in_use(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::WouldBlock
+        || cfg!(windows) && matches!(error.raw_os_error(), Some(32) | Some(33))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordFormat {
@@ -31,7 +162,7 @@ pub struct JobReportFacts {
     pub protocol: String,
     pub model: String,
     pub context_window_tokens: u64,
-    pub max_output_tokens: u64,
+    pub anthropic_max_tokens: Option<u64>,
     pub context_safety_tokens: u64,
     pub concurrency: usize,
     pub output_format: RecordFormat,
@@ -41,15 +172,16 @@ pub struct JobReportFacts {
 /// 一次任务的 worker 观测目录。时间戳在 worker 启动前确定，原始审计和
 /// Markdown 视图共享该目录，避免复用输出区时把旧任务的证据指向新审计。
 pub struct WorkerRun {
+    root: OutputRoot,
+    relative_directory: PathBuf,
     directory: PathBuf,
     started_at: DateTime<Utc>,
     facts: JobReportFacts,
 }
 
 impl WorkerRun {
-    pub fn create(out_dir: &Path, facts: JobReportFacts) -> io::Result<Self> {
-        let root = out_dir.join("workers");
-        fs::create_dir_all(&root)?;
+    pub fn create(root: &OutputRoot, facts: JobReportFacts) -> io::Result<Self> {
+        root.dir.create_dir_all("workers")?;
         let started_at = Utc::now();
         let timestamp = started_at.format("%Y%m%dT%H%M%S%.3fZ").to_string();
         let mut sequence = 1u64;
@@ -59,15 +191,17 @@ impl WorkerRun {
             } else {
                 format!("{timestamp}-{sequence}")
             };
-            let candidate = root.join(name);
-            match fs::create_dir(&candidate) {
-                Ok(()) => break candidate,
+            let relative = Path::new("workers").join(name);
+            match root.dir.create_dir(&relative) {
+                Ok(()) => break relative,
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => sequence += 1,
                 Err(error) => return Err(error),
             }
         };
         Ok(Self {
-            directory,
+            root: root.clone(),
+            directory: root.display(&directory),
+            relative_directory: directory,
             started_at,
             facts,
         })
@@ -77,8 +211,13 @@ impl WorkerRun {
         self.directory.join(format!(".tmp-worker-{unit}.jsonl"))
     }
 
+    fn audit_relative(&self, unit: u64) -> PathBuf {
+        self.relative_directory
+            .join(format!(".tmp-worker-{unit}.jsonl"))
+    }
+
     fn request_base_path(&self, unit: u64, kind: RequestKind) -> PathBuf {
-        self.directory
+        self.relative_directory
             .join(format!(".tmp-worker-{unit}-{}-request", kind.key()))
     }
 
@@ -89,54 +228,23 @@ impl WorkerRun {
 
 /// 原子发布单元产出，返回记录路径。同一单元重复发布会以新记录替换。
 pub fn publish(
-    out_dir: &Path,
+    root: &OutputRoot,
     unit: u64,
     content: &str,
     format: RecordFormat,
 ) -> io::Result<PathBuf> {
-    let tmp = out_dir.join(format!(".tmp-unit-{unit}"));
-    fs::write(&tmp, content)?;
-    let target = out_dir.join(format!("{unit}.{}", format.extension()));
-    atomic_replace(&tmp, &target)?;
-    Ok(target)
-}
-
-#[cfg(not(windows))]
-fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
-    fs::rename(source, target)
-}
-
-#[cfg(windows)]
-fn atomic_replace(source: &Path, target: &Path) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
-    }
-    let existing: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
-    let replacement: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY：两个缓冲区均由有效 Windows 路径编码并以 NUL 结尾，调用期间保持存活。
-    let moved = unsafe {
-        MoveFileExW(
-            existing.as_ptr(),
-            replacement.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    let tmp = PathBuf::from(format!(".tmp-unit-{unit}"));
+    root.write(&tmp, content)?;
+    let target = PathBuf::from(format!("{unit}.{}", format.extension()));
+    root.rename(&tmp, &target)?;
+    Ok(root.display(&target))
 }
 
 /// 单元审计日志：流式逐条落盘，不在内存累积。请求正文以磁盘上的上一份同类请求
 /// 计算可逆增量，避免最终档案和 worker 内存随“每轮完整历史之和”增长。
 /// 文件自创建起存在，空文件表示单元在首次调用前结束。
 pub struct AuditLog {
+    root: OutputRoot,
     writer: BufWriter<fs::File>,
     path: PathBuf,
     llm_request_base: PathBuf,
@@ -148,11 +256,12 @@ pub struct AuditLog {
 
 impl AuditLog {
     pub fn create(run: &WorkerRun, unit: u64) -> io::Result<Self> {
-        let path = run.audit_path(unit);
-        let file = fs::File::create(&path)?;
+        let path = run.audit_relative(unit);
+        let file = run.root.create(&path)?;
         Ok(Self {
+            root: run.root.clone(),
             writer: BufWriter::new(file),
-            path,
+            path: run.audit_path(unit),
             llm_request_base: run.request_base_path(unit, RequestKind::Llm),
             compaction_request_base: run.request_base_path(unit, RequestKind::Compaction),
             started: Instant::now(),
@@ -225,7 +334,7 @@ impl AuditLog {
             RequestKind::Llm => self.llm_request_base.clone(),
             RequestKind::Compaction => self.compaction_request_base.clone(),
         };
-        let delta = request_delta(&base_path, body)?;
+        let delta = request_delta(&self.root, &base_path, body)?;
         let (sequence, elapsed_ms) = self.next_stamp();
         match delta.filter(|delta| delta.is_smaller_than(body)) {
             Some(delta) => {
@@ -257,7 +366,7 @@ impl AuditLog {
             }
         }
         self.writer.write_all(b"\n")?;
-        fs::write(base_path, body)
+        self.root.write(&base_path, body)
     }
 
     fn next_stamp(&mut self) -> (u64, u64) {
@@ -268,7 +377,7 @@ impl AuditLog {
 
     fn cleanup_request_bases(&self) -> io::Result<()> {
         for path in [&self.llm_request_base, &self.compaction_request_base] {
-            match fs::remove_file(path) {
+            match self.root.remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
@@ -378,8 +487,12 @@ impl RequestDelta<'_> {
     }
 }
 
-fn request_delta<'a>(base_path: &Path, body: &'a str) -> io::Result<Option<RequestDelta<'a>>> {
-    let mut base = match fs::File::open(base_path) {
+fn request_delta<'a>(
+    root: &OutputRoot,
+    base_path: &Path,
+    body: &'a str,
+) -> io::Result<Option<RequestDelta<'a>>> {
+    let mut base = match root.open_file(base_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
@@ -739,12 +852,17 @@ impl UnitStats {
 
 /// 追加一行单元统计到 out/stats.jsonl。附属证据：写失败只产生诊断，
 /// 不改写单元的业务结果（§9）。
-pub fn append_stats(out_dir: &Path, unit: u64, outcome: &str, stats: &UnitStats) -> io::Result<()> {
+pub fn append_stats(
+    root: &OutputRoot,
+    unit: u64,
+    outcome: &str,
+    stats: &UnitStats,
+) -> io::Result<()> {
     let line = stats_value(unit, outcome, stats);
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(out_dir.join("stats.jsonl"))?;
+    let mut file = root
+        .dir
+        .open_with("stats.jsonl", OpenOptions::new().create(true).append(true))?
+        .into_std();
     writeln!(file, "{line}")
 }
 
@@ -800,29 +918,35 @@ pub struct WorkerReport<'a> {
     pub record_format: Option<RecordFormat>,
 }
 
-/// 将一个 worker 的结构化审计流式渲染为 Markdown。内存中一次只保留一行原始
-/// 事件，避免报告生成重新引入审计历史的内存放大。Markdown 成功原子发布后
-/// 删除临时 JSONL，最终每个 worker 只保留一份完整证据。
+/// 将一个 worker 的结构化审计流式渲染为 Markdown。普通事件逐行读取；内存只保留
+/// LLM 与压缩请求各自的当前正文，以及正在严格校验的一次完整 LLM 事件流。
+/// Markdown 成功原子发布后删除临时 JSONL，最终每个 worker 只保留一份完整证据。
 pub fn render_worker_report(run: &WorkerRun, report: &WorkerReport<'_>) -> io::Result<PathBuf> {
     let target = run.report_path(report.unit);
+    let target_relative = run.relative_directory.join(format!("{}.md", report.unit));
     let temporary = run
-        .directory
+        .relative_directory
         .join(format!(".tmp-worker-{}.md", report.unit));
     let rendered = (|| -> io::Result<()> {
-        let file = fs::File::create(&temporary)?;
+        let file = run.root.create(&temporary)?;
         let mut writer = BufWriter::new(file);
         write_report_header(&mut writer, run, report)?;
-        render_audit_timeline(&mut writer, &run.audit_path(report.unit))?;
+        render_audit_timeline(
+            &mut writer,
+            &run.root,
+            &run.audit_relative(report.unit),
+            &run.audit_path(report.unit),
+        )?;
         writer.flush()
     })();
     if let Err(error) = rendered {
-        let _ = fs::remove_file(&temporary);
+        let _ = run.root.remove_file(&temporary);
         return Err(error);
     }
-    atomic_replace(&temporary, &target)?;
-    let audit = run.audit_path(report.unit);
-    if audit.exists() {
-        fs::remove_file(audit)?;
+    run.root.rename(&temporary, &target_relative)?;
+    let audit = run.audit_relative(report.unit);
+    if run.root.exists(&audit) {
+        run.root.remove_file(&audit)?;
     }
     Ok(target)
 }
@@ -893,11 +1017,9 @@ fn write_report_header(
         "- 上下文窗口：`{}` token",
         run.facts.context_window_tokens
     )?;
-    writeln!(
-        writer,
-        "- 最大输出：`{}` token",
-        run.facts.max_output_tokens
-    )?;
+    if let Some(max_tokens) = run.facts.anthropic_max_tokens {
+        writeln!(writer, "- Anthropic max_tokens：`{max_tokens}` token")?;
+    }
     writeln!(
         writer,
         "- 上下文安全余量：`{}` token",
@@ -920,8 +1042,13 @@ fn write_report_header(
     Ok(())
 }
 
-fn render_audit_timeline(writer: &mut impl Write, path: &Path) -> io::Result<()> {
-    let file = match fs::File::open(path) {
+fn render_audit_timeline(
+    writer: &mut impl Write,
+    root: &OutputRoot,
+    relative: &Path,
+    display_path: &Path,
+) -> io::Result<()> {
+    let file = match root.open_file(relative) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             writeln!(
@@ -933,22 +1060,464 @@ fn render_audit_timeline(writer: &mut impl Write, path: &Path) -> io::Result<()>
         Err(error) => return Err(error),
     };
     let mut lines = BufReader::new(file).lines().enumerate();
+    let mut request_bases = RequestAuditBases::default();
     while let Some((index, line)) = lines.next() {
         let line = line?;
-        let value: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                writeln!(writer, "### {}. 审计行无法解析\n", index + 1)?;
-                writeln!(writer, "{}\n", markdown_inline(&error.to_string()))?;
-                continue;
-            }
-        };
-        if value.get("direction").and_then(serde_json::Value::as_str) == Some("llm_event_stream") {
-            render_event_stream(writer, &value, index + 1, &mut lines)?;
+        let line_number = index + 1;
+        let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
+            invalid_audit(display_path, line_number, format!("不是合法 JSON：{error}"))
+        })?;
+        let object = audit_object(&value, display_path, line_number)?;
+        let direction = audit_string(object, "direction", display_path, line_number)?;
+        if direction == "llm_event_stream" {
+            render_event_stream(writer, &value, line_number, display_path, &mut lines)?;
         } else {
-            render_audit_entry(writer, &value, index + 1)?;
+            validate_audit_entry(&value, display_path, line_number, &mut request_bases)?;
+            render_audit_entry(writer, &value, line_number)?;
         }
     }
+    Ok(())
+}
+
+#[derive(Default)]
+struct RequestAuditBases {
+    llm: Option<String>,
+    compaction: Option<String>,
+}
+
+impl RequestAuditBases {
+    fn slot(&mut self, direction: &str) -> &mut Option<String> {
+        match direction {
+            "request" => &mut self.llm,
+            "compaction_request" => &mut self.compaction,
+            _ => unreachable!("只为两类请求审计取得基准"),
+        }
+    }
+}
+
+fn invalid_audit(path: &Path, line: usize, reason: impl std::fmt::Display) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("审计文件 {} 第 {line} 行损坏：{reason}", path.display()),
+    )
+}
+
+fn audit_object<'a>(
+    value: &'a serde_json::Value,
+    path: &Path,
+    line: usize,
+) -> io::Result<&'a serde_json::Map<String, serde_json::Value>> {
+    value
+        .as_object()
+        .ok_or_else(|| invalid_audit(path, line, "记录必须是 JSON object"))
+}
+
+fn audit_exact_fields(
+    object: &serde_json::Map<String, serde_json::Value>,
+    expected: &[&str],
+    path: &Path,
+    line: usize,
+) -> io::Result<()> {
+    if let Some(field) = expected.iter().find(|field| !object.contains_key(**field)) {
+        return Err(invalid_audit(path, line, format!("缺少字段 {field:?}")));
+    }
+    if let Some(field) = object
+        .keys()
+        .find(|field| !expected.contains(&field.as_str()))
+    {
+        return Err(invalid_audit(path, line, format!("含未知字段 {field:?}")));
+    }
+    Ok(())
+}
+
+fn audit_string<'a>(
+    object: &'a serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &Path,
+    line: usize,
+) -> io::Result<&'a str> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_audit(path, line, format!("字段 {field:?} 必须是字符串")))
+}
+
+fn audit_nullable_string(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &Path,
+    line: usize,
+) -> io::Result<()> {
+    match object.get(field) {
+        Some(serde_json::Value::Null | serde_json::Value::String(_)) => Ok(()),
+        Some(_) => Err(invalid_audit(
+            path,
+            line,
+            format!("字段 {field:?} 必须是字符串或 null"),
+        )),
+        None => Err(invalid_audit(path, line, format!("缺少字段 {field:?}"))),
+    }
+}
+
+fn audit_u64(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &Path,
+    line: usize,
+) -> io::Result<u64> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| invalid_audit(path, line, format!("字段 {field:?} 必须是非负整数")))
+}
+
+fn audit_usize(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &Path,
+    line: usize,
+) -> io::Result<usize> {
+    usize::try_from(audit_u64(object, field, path, line)?)
+        .map_err(|_| invalid_audit(path, line, format!("字段 {field:?} 超出当前平台可表示范围")))
+}
+
+fn audit_u32(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &Path,
+    line: usize,
+) -> io::Result<u32> {
+    u32::try_from(audit_u64(object, field, path, line)?)
+        .map_err(|_| invalid_audit(path, line, format!("字段 {field:?} 超出 u32 可表示范围")))
+}
+
+fn audit_bool(
+    object: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+    path: &Path,
+    line: usize,
+) -> io::Result<bool> {
+    object
+        .get(field)
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| invalid_audit(path, line, format!("字段 {field:?} 必须是 boolean")))
+}
+
+fn validate_audit_stamp(
+    object: &serde_json::Map<String, serde_json::Value>,
+    path: &Path,
+    line: usize,
+) -> io::Result<()> {
+    if audit_u64(object, "sequence", path, line)? == 0 {
+        return Err(invalid_audit(path, line, "字段 \"sequence\" 必须不小于 1"));
+    }
+    audit_u64(object, "elapsed_ms", path, line)?;
+    Ok(())
+}
+
+fn validate_audit_entry(
+    value: &serde_json::Value,
+    path: &Path,
+    line: usize,
+    request_bases: &mut RequestAuditBases,
+) -> io::Result<()> {
+    let object = audit_object(value, path, line)?;
+    let direction = audit_string(object, "direction", path, line)?;
+    match direction {
+        "state" => {
+            audit_exact_fields(
+                object,
+                &["direction", "state", "reason", "sequence", "elapsed_ms"],
+                path,
+                line,
+            )?;
+            validate_audit_stamp(object, path, line)?;
+            let state = audit_string(object, "state", path, line)?;
+            if WorkerState::from_key(state).is_none() {
+                return Err(invalid_audit(
+                    path,
+                    line,
+                    format!("未知 worker state {state:?}"),
+                ));
+            }
+            audit_string(object, "reason", path, line)?;
+        }
+        "context_budget" => {
+            audit_exact_fields(
+                object,
+                &[
+                    "direction",
+                    "estimated_tokens",
+                    "input_budget",
+                    "force",
+                    "action",
+                    "sequence",
+                    "elapsed_ms",
+                ],
+                path,
+                line,
+            )?;
+            validate_audit_stamp(object, path, line)?;
+            audit_u64(object, "estimated_tokens", path, line)?;
+            audit_u64(object, "input_budget", path, line)?;
+            audit_bool(object, "force", path, line)?;
+            audit_string(object, "action", path, line)?;
+        }
+        "request" | "compaction_request" => {
+            validate_request_audit(object, direction, path, line, request_bases)?;
+        }
+        "tool_call" => {
+            audit_exact_fields(
+                object,
+                &[
+                    "direction",
+                    "name",
+                    "source",
+                    "data",
+                    "sequence",
+                    "elapsed_ms",
+                ],
+                path,
+                line,
+            )?;
+            validate_audit_stamp(object, path, line)?;
+            audit_string(object, "name", path, line)?;
+            audit_nullable_string(object, "source", path, line)?;
+            audit_string(object, "data", path, line)?;
+        }
+        "tool_execution" => {
+            audit_exact_fields(
+                object,
+                &[
+                    "direction",
+                    "name",
+                    "cache",
+                    "wait_ms",
+                    "execution_ms",
+                    "result_bytes",
+                    "mcp_server",
+                    "sequence",
+                    "elapsed_ms",
+                ],
+                path,
+                line,
+            )?;
+            validate_audit_stamp(object, path, line)?;
+            audit_string(object, "name", path, line)?;
+            audit_string(object, "cache", path, line)?;
+            audit_u64(object, "wait_ms", path, line)?;
+            audit_u64(object, "execution_ms", path, line)?;
+            audit_usize(object, "result_bytes", path, line)?;
+            audit_nullable_string(object, "mcp_server", path, line)?;
+        }
+        "tool_result" => {
+            audit_exact_fields(
+                object,
+                &["direction", "data", "sequence", "elapsed_ms"],
+                path,
+                line,
+            )?;
+            validate_audit_stamp(object, path, line)?;
+            audit_string(object, "data", path, line)?;
+        }
+        "retry" => {
+            audit_exact_fields(
+                object,
+                &[
+                    "direction",
+                    "attempt",
+                    "next_attempt",
+                    "delay_ms",
+                    "reason",
+                    "sequence",
+                    "elapsed_ms",
+                ],
+                path,
+                line,
+            )?;
+            validate_audit_stamp(object, path, line)?;
+            audit_u32(object, "attempt", path, line)?;
+            audit_u32(object, "next_attempt", path, line)?;
+            audit_u64(object, "delay_ms", path, line)?;
+            audit_string(object, "reason", path, line)?;
+        }
+        "output_validation" => {
+            audit_exact_fields(
+                object,
+                &[
+                    "direction",
+                    "valid",
+                    "instance_path",
+                    "schema_path",
+                    "reason",
+                    "sequence",
+                    "elapsed_ms",
+                ],
+                path,
+                line,
+            )?;
+            validate_audit_stamp(object, path, line)?;
+            audit_bool(object, "valid", path, line)?;
+            audit_nullable_string(object, "instance_path", path, line)?;
+            audit_nullable_string(object, "schema_path", path, line)?;
+            audit_string(object, "reason", path, line)?;
+        }
+        "context_compaction" => {
+            audit_exact_fields(
+                object,
+                &[
+                    "direction",
+                    "valid",
+                    "before_tokens",
+                    "after_tokens",
+                    "reason",
+                    "sequence",
+                    "elapsed_ms",
+                ],
+                path,
+                line,
+            )?;
+            validate_audit_stamp(object, path, line)?;
+            audit_bool(object, "valid", path, line)?;
+            audit_u64(object, "before_tokens", path, line)?;
+            audit_u64(object, "after_tokens", path, line)?;
+            audit_string(object, "reason", path, line)?;
+        }
+        other => {
+            return Err(invalid_audit(
+                path,
+                line,
+                format!("未知 direction {other:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_request_audit(
+    object: &serde_json::Map<String, serde_json::Value>,
+    direction: &str,
+    path: &Path,
+    line: usize,
+    request_bases: &mut RequestAuditBases,
+) -> io::Result<()> {
+    let encoding = audit_string(object, "request_encoding", path, line)?;
+    match encoding {
+        "full" => audit_exact_fields(
+            object,
+            &[
+                "direction",
+                "sequence",
+                "elapsed_ms",
+                "attempt",
+                "request_encoding",
+                "full_bytes",
+                "data",
+            ],
+            path,
+            line,
+        )?,
+        "delta" => audit_exact_fields(
+            object,
+            &[
+                "direction",
+                "sequence",
+                "elapsed_ms",
+                "attempt",
+                "request_encoding",
+                "base_bytes",
+                "prefix_bytes",
+                "removed_bytes",
+                "inserted",
+                "full_bytes",
+            ],
+            path,
+            line,
+        )?,
+        other => {
+            return Err(invalid_audit(
+                path,
+                line,
+                format!("未知 request_encoding {other:?}"),
+            ));
+        }
+    }
+    validate_audit_stamp(object, path, line)?;
+    if audit_u32(object, "attempt", path, line)? == 0 {
+        return Err(invalid_audit(path, line, "字段 \"attempt\" 必须不小于 1"));
+    }
+    let full_bytes = audit_usize(object, "full_bytes", path, line)?;
+    let slot = request_bases.slot(direction);
+    if encoding == "full" {
+        let data = audit_string(object, "data", path, line)?;
+        if data.len() != full_bytes {
+            return Err(invalid_audit(
+                path,
+                line,
+                format!(
+                    "完整请求记录的 full_bytes 为 {full_bytes}，正文实际为 {} 字节",
+                    data.len()
+                ),
+            ));
+        }
+        *slot = Some(data.to_owned());
+        return Ok(());
+    }
+
+    let base_bytes = audit_usize(object, "base_bytes", path, line)?;
+    let base = slot.as_ref().ok_or_else(|| {
+        invalid_audit(
+            path,
+            line,
+            format!("{direction} 的首条记录不能使用 delta 编码"),
+        )
+    })?;
+    if base_bytes != base.len() {
+        return Err(invalid_audit(
+            path,
+            line,
+            format!(
+                "delta 基准为 {base_bytes} 字节，上一份请求实际为 {} 字节",
+                base.len()
+            ),
+        ));
+    }
+    let prefix_bytes = audit_usize(object, "prefix_bytes", path, line)?;
+    let removed_bytes = audit_usize(object, "removed_bytes", path, line)?;
+    let replaced_end = prefix_bytes.checked_add(removed_bytes).ok_or_else(|| {
+        invalid_audit(path, line, "delta 的 prefix_bytes + removed_bytes 发生溢出")
+    })?;
+    if replaced_end > base_bytes {
+        return Err(invalid_audit(
+            path,
+            line,
+            format!("delta 删除区间结束于 {replaced_end} 字节，超过 {base_bytes} 字节基准"),
+        ));
+    }
+    let prefix = base
+        .get(..prefix_bytes)
+        .ok_or_else(|| invalid_audit(path, line, "delta 的 prefix_bytes 不在 UTF-8 字符边界"))?;
+    let suffix = base
+        .get(replaced_end..)
+        .ok_or_else(|| invalid_audit(path, line, "delta 的删除区间末尾不在 UTF-8 字符边界"))?;
+    let inserted = audit_string(object, "inserted", path, line)?;
+    let reconstructed_bytes = prefix
+        .len()
+        .checked_add(inserted.len())
+        .and_then(|length| length.checked_add(suffix.len()))
+        .ok_or_else(|| invalid_audit(path, line, "delta 重建长度发生溢出"))?;
+    if reconstructed_bytes != full_bytes {
+        return Err(invalid_audit(
+            path,
+            line,
+            format!("delta 可重建 {reconstructed_bytes} 字节，但 full_bytes 记录为 {full_bytes}"),
+        ));
+    }
+    let mut reconstructed = String::with_capacity(reconstructed_bytes);
+    reconstructed.push_str(prefix);
+    reconstructed.push_str(inserted);
+    reconstructed.push_str(suffix);
+    *slot = Some(reconstructed);
     Ok(())
 }
 
@@ -1281,7 +1850,8 @@ fn render_request_delta(
 fn render_event_stream<I>(
     writer: &mut impl Write,
     value: &serde_json::Value,
-    fallback_sequence: usize,
+    line_number: usize,
+    display_path: &Path,
     lines: &mut I,
 ) -> io::Result<()>
 where
@@ -1290,29 +1860,155 @@ where
     use std::collections::BTreeMap;
 
     const DISPLAYED_KINDS: usize = 8;
-    let sequence = value
-        .get("sequence")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(fallback_sequence as u64);
-    let elapsed_ms = value
-        .get("elapsed_ms")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0);
-    let expected_count = value
-        .get("event_count")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|count| usize::try_from(count).ok())
-        .unwrap_or(0);
-    let expected_bytes = value
-        .get("total_bytes")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|count| usize::try_from(count).ok())
-        .unwrap_or(0);
-    let max_backtick_run = value
-        .get("max_backtick_run")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|count| usize::try_from(count).ok())
-        .unwrap_or(0);
+    let object = audit_object(value, display_path, line_number)?;
+    audit_exact_fields(
+        object,
+        &[
+            "direction",
+            "sequence",
+            "elapsed_ms",
+            "event_count",
+            "total_bytes",
+            "max_backtick_run",
+        ],
+        display_path,
+        line_number,
+    )?;
+    validate_audit_stamp(object, display_path, line_number)?;
+    if audit_string(object, "direction", display_path, line_number)? != "llm_event_stream" {
+        return Err(invalid_audit(
+            display_path,
+            line_number,
+            "事件流 header 的 direction 必须是 llm_event_stream",
+        ));
+    }
+    let sequence = audit_u64(object, "sequence", display_path, line_number)?;
+    let elapsed_ms = audit_u64(object, "elapsed_ms", display_path, line_number)?;
+    let expected_count = audit_usize(object, "event_count", display_path, line_number)?;
+    if expected_count == 0 {
+        return Err(invalid_audit(
+            display_path,
+            line_number,
+            "事件流 header 的 event_count 必须不小于 1",
+        ));
+    }
+    let expected_bytes = audit_usize(object, "total_bytes", display_path, line_number)?;
+    let max_backtick_run = audit_usize(object, "max_backtick_run", display_path, line_number)?;
+    let mut events = Vec::new();
+    let mut actual_bytes = 0usize;
+    let mut actual_max_backtick_run = 0usize;
+    let mut counts = BTreeMap::<String, usize>::new();
+    let mut other_events = 0usize;
+    for expected_index in 0..expected_count {
+        let Some((line_index, line)) = lines.next() else {
+            return Err(invalid_audit(
+                display_path,
+                line_number,
+                format!(
+                    "事件流应有 {expected_count} 个负载，实际只有 {} 个",
+                    events.len()
+                ),
+            ));
+        };
+        let line = line?;
+        let child_line = line_index + 1;
+        let child: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
+            invalid_audit(display_path, child_line, format!("不是合法 JSON：{error}"))
+        })?;
+        let child_object = audit_object(&child, display_path, child_line)?;
+        audit_exact_fields(
+            child_object,
+            &["direction", "stream_sequence", "index", "data"],
+            display_path,
+            child_line,
+        )?;
+        if audit_string(child_object, "direction", display_path, child_line)? != "llm_event_data" {
+            return Err(invalid_audit(
+                display_path,
+                child_line,
+                "事件流 child 的 direction 必须是 llm_event_data",
+            ));
+        }
+        let child_sequence = audit_u64(child_object, "stream_sequence", display_path, child_line)?;
+        if child_sequence != sequence {
+            return Err(invalid_audit(
+                display_path,
+                child_line,
+                format!("事件流 child 属于 stream {child_sequence}，header sequence 为 {sequence}"),
+            ));
+        }
+        let child_index = audit_usize(child_object, "index", display_path, child_line)?;
+        if child_index != expected_index {
+            return Err(invalid_audit(
+                display_path,
+                child_line,
+                format!("事件流 child index 为 {child_index}，期望 {expected_index}"),
+            ));
+        }
+        let data = audit_string(child_object, "data", display_path, child_line)?;
+        actual_bytes = actual_bytes
+            .checked_add(data.len())
+            .ok_or_else(|| invalid_audit(display_path, child_line, "事件流总字节数发生溢出"))?;
+        if actual_bytes > expected_bytes {
+            return Err(invalid_audit(
+                display_path,
+                child_line,
+                format!(
+                    "事件流实际负载已达到 {actual_bytes} 字节，超过 header 的 {expected_bytes} 字节"
+                ),
+            ));
+        }
+        actual_max_backtick_run = actual_max_backtick_run.max(longest_backtick_run(data));
+        if actual_max_backtick_run > max_backtick_run {
+            return Err(invalid_audit(
+                display_path,
+                child_line,
+                format!(
+                    "事件流实际反引号连续长度已达到 {actual_max_backtick_run}，超过 header 的 {max_backtick_run}"
+                ),
+            ));
+        }
+        let summary = event_summary(data);
+        if let Some(count) = counts.get_mut(&summary) {
+            *count += 1;
+        } else if counts.len() < DISPLAYED_KINDS {
+            counts.insert(summary, 1);
+        } else {
+            other_events += 1;
+        }
+        events.push(data.to_owned());
+    }
+    if events.len() != expected_count {
+        return Err(invalid_audit(
+            display_path,
+            line_number,
+            format!(
+                "事件流记录为 {expected_count} 个负载，实际读到 {} 个",
+                events.len()
+            ),
+        ));
+    }
+    if actual_bytes != expected_bytes {
+        return Err(invalid_audit(
+            display_path,
+            line_number,
+            format!("事件流 total_bytes 为 {expected_bytes}，实际负载共 {actual_bytes} 字节"),
+        ));
+    }
+    if actual_max_backtick_run != max_backtick_run {
+        return Err(invalid_audit(
+            display_path,
+            line_number,
+            format!(
+                "事件流 max_backtick_run 为 {max_backtick_run}，实际为 {actual_max_backtick_run}"
+            ),
+        ));
+    }
+    let fence_length = actual_max_backtick_run
+        .checked_add(1)
+        .ok_or_else(|| invalid_audit(display_path, line_number, "事件流 Markdown fence 长度溢出"))?
+        .max(3);
+    let fence = "`".repeat(fence_length);
 
     writeln!(
         writer,
@@ -1322,78 +2018,18 @@ where
         writer,
         "本次响应包含 `{expected_count}` 个原始 SSE data 负载，共 `{expected_bytes}` bytes；已合并显示，不按 token 片段展开标题。\n"
     )?;
-
     writeln!(writer, "<details>")?;
     writeln!(writer, "<summary>完整原始事件流（按到达顺序）</summary>\n")?;
-    let fence = "`".repeat(max_backtick_run.saturating_add(1).max(3));
     writeln!(writer, "{fence}json")?;
     writeln!(writer, "[")?;
-
-    let mut written = 0usize;
-    let mut actual_bytes = 0usize;
-    let mut counts = BTreeMap::<String, usize>::new();
-    let mut other_events = 0usize;
-    let mut issue = None;
-    for expected_index in 0..expected_count {
-        let Some((line_index, line)) = lines.next() else {
-            issue = Some(format!(
-                "事件流提前结束：应有 {expected_count} 个负载，实际只有 {written} 个"
-            ));
-            break;
-        };
-        let line = line?;
-        let child: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(value) => value,
-            Err(error) => {
-                issue.get_or_insert_with(|| {
-                    format!("审计第 {} 行无法解析：{error}", line_index + 1)
-                });
-                continue;
-            }
-        };
-        let valid_child = child.get("direction").and_then(serde_json::Value::as_str)
-            == Some("llm_event_data")
-            && child
-                .get("stream_sequence")
-                .and_then(serde_json::Value::as_u64)
-                == Some(sequence)
-            && child
-                .get("index")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|index| usize::try_from(index).ok())
-                == Some(expected_index);
-        if !valid_child {
-            issue.get_or_insert_with(|| {
-                format!(
-                    "审计第 {} 行不是本响应流的第 {expected_index} 个负载",
-                    line_index + 1
-                )
-            });
-            continue;
-        }
-        let Some(data) = child.get("data").and_then(serde_json::Value::as_str) else {
-            issue.get_or_insert_with(|| format!("审计第 {} 行缺少原始负载", line_index + 1));
-            continue;
-        };
-        if written > 0 {
+    for (index, data) in events.iter().enumerate() {
+        if index > 0 {
             writeln!(writer, ",")?;
         }
         let encoded = serde_json::to_string(data).expect("SSE 原始负载可序列化为 JSON string");
         write!(writer, "  {encoded}")?;
-        written += 1;
-        actual_bytes = actual_bytes.saturating_add(data.len());
-        let summary = event_summary(data);
-        if let Some(count) = counts.get_mut(&summary) {
-            *count += 1;
-        } else if counts.len() < DISPLAYED_KINDS {
-            counts.insert(summary, 1);
-        } else {
-            other_events += 1;
-        }
     }
-    if written > 0 {
-        writeln!(writer)?;
-    }
+    writeln!(writer)?;
     writeln!(writer, "]")?;
     writeln!(writer, "{fence}\n")?;
     writeln!(writer, "</details>\n")?;
@@ -1407,16 +2043,6 @@ where
     }
     if !parts.is_empty() {
         writeln!(writer, "事件概况：{}。\n", parts.join("；"))?;
-    }
-    if written != expected_count || actual_bytes != expected_bytes {
-        issue.get_or_insert_with(|| {
-            format!(
-                "事件流计数不一致：记录为 {expected_count} 个/{expected_bytes} bytes，实际读到 {written} 个/{actual_bytes} bytes"
-            )
-        });
-    }
-    if let Some(issue) = issue {
-        writeln!(writer, "> 审计异常：{}。\n", markdown_inline(&issue))?;
     }
     Ok(())
 }
@@ -1499,11 +2125,73 @@ impl Summary {
 mod tests {
     use super::*;
 
+    fn assert_corrupt_audit_is_preserved(name: &str, contents: &str) {
+        let directory = tempfile::tempdir().unwrap();
+        let out = directory.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let root = OutputRoot::open(out).unwrap();
+        let run = WorkerRun::create(
+            &root,
+            JobReportFacts {
+                protocol: "responses".into(),
+                model: "model-a".into(),
+                context_window_tokens: 100_000,
+                anthropic_max_tokens: None,
+                context_safety_tokens: 4096,
+                concurrency: 1,
+                output_format: RecordFormat::Markdown,
+                tools: Vec::new(),
+            },
+        )
+        .unwrap();
+        fs::write(run.audit_path(1), contents).unwrap();
+        let now = Utc::now();
+        let error = render_worker_report(
+            &run,
+            &WorkerReport {
+                unit: 1,
+                shard: "文件 input.txt",
+                outcome: "failed",
+                failure_reason: Some("测试失败"),
+                started_at: now,
+                finished_at: now,
+                duration: Duration::ZERO,
+                stats: &UnitStats::default(),
+                record_format: None,
+            },
+        )
+        .expect_err(name);
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{name}: {error}");
+        assert!(run.audit_path(1).exists(), "{name}：损坏的原始审计必须保留");
+        assert!(!run.report_path(1).exists(), "{name}：不完整报告不得发布");
+        assert!(
+            !run.directory.join(".tmp-worker-1.md").exists(),
+            "{name}：失败的 Markdown 临时文件必须删除"
+        );
+    }
+
+    // Windows 的文件锁按进程持有，同一测试进程内的第二个句柄可再次加锁；
+    // 跨进程行为由 e2e::concurrent_jobs_cannot_share_an_output_directory 验证。
+    #[cfg(not(windows))]
+    #[test]
+    fn output_directory_is_exclusively_leased() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = OutputRoot::open(directory.path().to_path_buf()).unwrap();
+        let first = OutputLease::acquire(&root).unwrap();
+        assert!(matches!(
+            OutputLease::acquire(&root),
+            Err(OutputLeaseError::InUse(_))
+        ));
+        drop(first);
+        OutputLease::acquire(&root).unwrap();
+    }
+
     #[test]
     fn publish_atomically_replaces_existing_record() {
         let directory = tempfile::tempdir().unwrap();
-        publish(directory.path(), 1, "old", RecordFormat::Markdown).unwrap();
-        publish(directory.path(), 1, "new", RecordFormat::Markdown).unwrap();
+        let root = OutputRoot::open(directory.path().to_path_buf()).unwrap();
+        publish(&root, 1, "old", RecordFormat::Markdown).unwrap();
+        publish(&root, 1, "new", RecordFormat::Markdown).unwrap();
         assert_eq!(
             fs::read_to_string(directory.path().join("1.md")).unwrap(),
             "new"
@@ -1511,17 +2199,92 @@ mod tests {
         assert!(!directory.path().join(".tmp-unit-1").exists());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn output_writes_stay_with_opened_root_after_ambient_path_is_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let ambient = directory.path().join("out");
+        let opened_directory = directory.path().join("opened-out");
+        fs::create_dir(&ambient).unwrap();
+        let root = OutputRoot::open(ambient.clone()).unwrap();
+        let _lease = OutputLease::acquire(&root).unwrap();
+
+        fs::rename(&ambient, &opened_directory).unwrap();
+        fs::create_dir(&ambient).unwrap();
+        fs::write(ambient.join("attacker-marker"), "replacement").unwrap();
+
+        publish(&root, 1, "result", RecordFormat::Markdown).unwrap();
+        append_stats(&root, 1, "published", &UnitStats::default()).unwrap();
+        let run = WorkerRun::create(
+            &root,
+            JobReportFacts {
+                protocol: "responses".into(),
+                model: "model-a".into(),
+                context_window_tokens: 100_000,
+                anthropic_max_tokens: None,
+                context_safety_tokens: 4096,
+                concurrency: 1,
+                output_format: RecordFormat::Markdown,
+                tools: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mut audit = AuditLog::create(&run, 1).unwrap();
+        audit
+            .push(&AuditEntry::State {
+                state: WorkerState::Preparing,
+                reason: "测试".into(),
+            })
+            .unwrap();
+        audit.finish().unwrap();
+        let now = Utc::now();
+        render_worker_report(
+            &run,
+            &WorkerReport {
+                unit: 1,
+                shard: "文件 input.txt",
+                outcome: "published",
+                failure_reason: None,
+                started_at: now,
+                finished_at: now,
+                duration: Duration::ZERO,
+                stats: &UnitStats::default(),
+                record_format: Some(RecordFormat::Markdown),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(opened_directory.join("1.md")).unwrap(),
+            "result"
+        );
+        assert!(opened_directory.join("stats.jsonl").exists());
+        assert!(
+            opened_directory
+                .join(&run.relative_directory)
+                .join("1.md")
+                .exists(),
+            "最终 worker 档案必须留在启动时打开的输出目录"
+        );
+        assert_eq!(
+            fs::read_dir(&ambient).unwrap().count(),
+            1,
+            "运行期替换目录不得收到完成记录、统计、锁或 worker 档案"
+        );
+    }
+
     #[test]
     fn request_delta_is_reversible_across_large_utf8_prefix_and_suffix() {
         let directory = tempfile::tempdir().unwrap();
-        let base_path = directory.path().join("request-base");
+        let root = OutputRoot::open(directory.path().to_path_buf()).unwrap();
+        let base_path = PathBuf::from("request-base");
         let prefix = "前".repeat(30_000);
         let suffix = "后".repeat(30_000);
         let previous = format!("{prefix}旧值{suffix}");
         let current = format!("{prefix}新的完整值{suffix}");
-        fs::write(&base_path, &previous).unwrap();
+        root.write(&base_path, &previous).unwrap();
 
-        let delta = request_delta(&base_path, &current).unwrap().unwrap();
+        let delta = request_delta(&root, &base_path, &current).unwrap().unwrap();
         assert!(current.is_char_boundary(delta.prefix_bytes));
         assert!(previous.is_char_boundary(delta.prefix_bytes + delta.removed_bytes));
         let mut reconstructed = String::new();
@@ -1536,13 +2299,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let out = directory.path().join("out");
         fs::create_dir(&out).unwrap();
+        let root = OutputRoot::open(out.clone()).unwrap();
         let run = WorkerRun::create(
-            &out,
+            &root,
             JobReportFacts {
                 protocol: "responses".into(),
                 model: "model-a".into(),
                 context_window_tokens: 100_000,
-                max_output_tokens: 10_000,
+                anthropic_max_tokens: None,
                 context_safety_tokens: 4096,
                 concurrency: 8,
                 output_format: RecordFormat::Markdown,
@@ -1624,8 +2388,10 @@ mod tests {
             "合并后必须保留每个原始负载的文字、边界和顺序"
         );
 
-        let mut stats = UnitStats::default();
-        stats.llm_calls = 1;
+        let stats = UnitStats {
+            llm_calls: 1,
+            ..UnitStats::default()
+        };
         let now = Utc::now();
         let report = render_worker_report(
             &run,
@@ -1669,5 +2435,144 @@ mod tests {
                 .is_some_and(|ext| ext == "md")),
             "成功结束后不得残留请求基准或其他临时文件"
         );
+    }
+
+    #[test]
+    fn malformed_audit_prevents_report_and_preserves_original() {
+        assert_corrupt_audit_is_preserved("非法 JSON", "{not-json}\n");
+    }
+
+    #[test]
+    fn structurally_corrupt_audits_are_rejected_and_preserved() {
+        let valid_full = serde_json::json!({
+            "direction": "request",
+            "sequence": 1,
+            "elapsed_ms": 0,
+            "attempt": 1,
+            "request_encoding": "full",
+            "full_bytes": 2,
+            "data": "{}",
+        });
+        let invalid_delta = serde_json::json!({
+            "direction": "request",
+            "sequence": 2,
+            "elapsed_ms": 1,
+            "attempt": 2,
+            "request_encoding": "delta",
+            "base_bytes": 2,
+            "prefix_bytes": 3,
+            "removed_bytes": 0,
+            "inserted": "",
+            "full_bytes": 3,
+        });
+        let stream_header = |event_count: usize, total_bytes: usize| {
+            serde_json::json!({
+                "direction": "llm_event_stream",
+                "sequence": 1,
+                "elapsed_ms": 0,
+                "event_count": event_count,
+                "total_bytes": total_bytes,
+                "max_backtick_run": 0,
+            })
+        };
+        let stream_child = |stream_sequence: u64, index: usize| {
+            serde_json::json!({
+                "direction": "llm_event_data",
+                "stream_sequence": stream_sequence,
+                "index": index,
+                "data": "x",
+            })
+        };
+        let cases = [
+            ("空 object", "{}\n".to_string()),
+            (
+                "未知 direction",
+                serde_json::json!({
+                    "direction": "future",
+                    "sequence": 1,
+                    "elapsed_ms": 0,
+                })
+                .to_string()
+                    + "\n",
+            ),
+            (
+                "full request 缺 data",
+                serde_json::json!({
+                    "direction": "request",
+                    "sequence": 1,
+                    "elapsed_ms": 0,
+                    "attempt": 1,
+                    "request_encoding": "full",
+                    "full_bytes": 2,
+                })
+                .to_string()
+                    + "\n",
+            ),
+            (
+                "delta 删除区间越界",
+                format!("{valid_full}\n{invalid_delta}\n"),
+            ),
+            (
+                "delta 偏移不在 UTF-8 字符边界",
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({
+                        "direction": "request",
+                        "sequence": 1,
+                        "elapsed_ms": 0,
+                        "attempt": 1,
+                        "request_encoding": "full",
+                        "full_bytes": 3,
+                        "data": "你",
+                    }),
+                    serde_json::json!({
+                        "direction": "request",
+                        "sequence": 2,
+                        "elapsed_ms": 1,
+                        "attempt": 2,
+                        "request_encoding": "delta",
+                        "base_bytes": 3,
+                        "prefix_bytes": 1,
+                        "removed_bytes": 0,
+                        "inserted": "",
+                        "full_bytes": 3,
+                    })
+                ),
+            ),
+            (
+                "stream child 数量不足",
+                format!("{}\n{}\n", stream_header(2, 2), stream_child(1, 0)),
+            ),
+            (
+                "stream child index 错误",
+                format!("{}\n{}\n", stream_header(1, 1), stream_child(1, 1)),
+            ),
+            (
+                "stream child sequence 错误",
+                format!("{}\n{}\n", stream_header(1, 1), stream_child(2, 0)),
+            ),
+            (
+                "stream total_bytes 错误",
+                format!("{}\n{}\n", stream_header(1, 2), stream_child(1, 0)),
+            ),
+            (
+                "stream max_backtick_run 极值",
+                format!(
+                    "{}\n{}\n",
+                    serde_json::json!({
+                        "direction": "llm_event_stream",
+                        "sequence": 1,
+                        "elapsed_ms": 0,
+                        "event_count": 1,
+                        "total_bytes": 1,
+                        "max_backtick_run": u64::MAX,
+                    }),
+                    stream_child(1, 0)
+                ),
+            ),
+        ];
+        for (name, contents) in cases {
+            assert_corrupt_audit_is_preserved(name, &contents);
+        }
     }
 }

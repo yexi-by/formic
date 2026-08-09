@@ -5,7 +5,9 @@ url = "https://api.example.com/v1"
 api_key = ""
 model = "model-name"
 context_window_tokens = 131072
-max_output_tokens = 16384
+# 仅当 FORMIC_LLM_PROTOCOL=anthropic 时取消下一行注释。Anthropic Messages
+# 要求 max_tokens；completions 和 responses 不允许配置或发送任何输出 token 参数。
+# anthropic_max_tokens = 16384
 
 [execution]
 # 单次 LLM 步骤最多尝试 5 次，包括可修正的结构错误；这不是 worker 总回合数限制。
@@ -50,14 +52,15 @@ session_scope = "job"
 max_in_flight = 64
 startup_timeout_sec = 60
 tool_timeout_sec = 600
+# 慢速 HTTP initialize 会受 startup_timeout_sec 限制；重连还受当前 tool_timeout_sec 限制。
+# 调用返回后底层 TCP 不保证立即关闭，见 docs/usage.md。
 max_result_bytes = 1048576
 # 只重建后续调用使用的会话，不重放已经中断的调用。
 reconnect = true
 
 [mcp_servers.http_example.tool_limits.search]
-# 单个工具可以在服务器默认值之上继续扩大。
-max_in_flight = 128
-max_result_bytes = 2097152
+# 单工具只配置并发上限；解码前结果字节上限统一由 server 的 max_result_bytes 负责。
+max_in_flight = 32
 
 # stdio MCP 示例。command 与 url 互斥；命令不会经过 shell 拼接。
 [mcp_servers.stdio_example]
