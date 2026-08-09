@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -22,6 +22,7 @@ const LOOP_MARKER: &str = "LOOP-MARKER";
 
 /// 请求体含此标记时 mock 对首次请求返回 500、后续恢复正常，用于驱动重试成功路径。
 const FLAKY_MARKER: &str = "FLAKY-UNIT";
+const FAIL_TWICE_MARKER: &str = "FAIL-TWICE-UNIT";
 
 /// 请求体含此标记时，completions mock 改为调用测试 MCP 工具。
 const MCP_MARKER: &str = "MCP-UNIT";
@@ -35,6 +36,23 @@ const REFUSAL_MARKER: &str = "REFUSAL-UNIT";
 const TRUNCATION_MARKER: &str = "TRUNCATION-UNIT";
 const COMPACTION_MARKER: &str = "COMPACTION-UNIT";
 const MCP_TIMEOUT_MARKER: &str = "MCP-TIMEOUT-UNIT";
+const AUTH_MARKER: &str = "AUTH-STATUS-UNIT";
+const FORBIDDEN_MARKER: &str = "FORBIDDEN-STATUS-UNIT";
+const QUOTA_MARKER: &str = "QUOTA-STATUS-UNIT";
+const ACCOUNT_MARKER: &str = "ACCOUNT-STATUS-UNIT";
+const RATE_LONG_MARKER: &str = "RATE-LONG-UNIT";
+const SERVER_LONG_MARKER: &str = "SERVER-LONG-UNIT";
+const RATE_NUMERIC_MARKER: &str = "RATE-NUMERIC-UNIT";
+const RATE_DATE_MARKER: &str = "RATE-DATE-UNIT";
+const BAD_PROTOCOL_MARKER: &str = "BAD-PROTOCOL-UNIT";
+const EOF_WITHOUT_FINISH_MARKER: &str = "EOF-WITHOUT-FINISH-UNIT";
+const SLOW_QUOTA_MARKER: &str = "SLOW-QUOTA-UNIT";
+const SLOW_SERVER_MARKER: &str = "SLOW-SERVER-UNIT";
+const NETWORK_CONTEXT_NETWORK_MARKER: &str = "NETWORK-CONTEXT-NETWORK-UNIT";
+const SLOW_STREAM_MARKER: &str = "SLOW-STREAM-UNIT";
+const RESPONSE_SECRET: &str = "SENSITIVE-RESPONSE-MARKER";
+const LLM_API_KEY_SECRET: &str = "SENSITIVE-LLM-API-KEY";
+const MCP_BEARER_SECRET: &str = "SENSITIVE-MCP-BEARER";
 
 // ---- 罐装 SSE：文本最终帧（三协议）----
 
@@ -416,10 +434,12 @@ fn start_mock_with_delay(delay_ms: u64) -> MockServer {
     let in_flight = Arc::new(AtomicUsize::new(0));
     let max_in_flight = Arc::new(AtomicUsize::new(0));
     let flaky_seen = Arc::new(AtomicBool::new(false));
+    let scenario_step = Arc::new(AtomicUsize::new(0));
     let shared = Arc::clone(&requests);
     let shared_in_flight = Arc::clone(&in_flight);
     let shared_max = Arc::clone(&max_in_flight);
     let shared_flaky = Arc::clone(&flaky_seen);
+    let shared_scenario_step = Arc::clone(&scenario_step);
     thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
@@ -428,8 +448,17 @@ fn start_mock_with_delay(delay_ms: u64) -> MockServer {
                     let in_flight = Arc::clone(&shared_in_flight);
                     let max = Arc::clone(&shared_max);
                     let flaky = Arc::clone(&shared_flaky);
+                    let scenario_step = Arc::clone(&shared_scenario_step);
                     thread::spawn(move || {
-                        handle_conn(stream, shared, in_flight, max, flaky, delay_ms)
+                        handle_conn(
+                            stream,
+                            shared,
+                            in_flight,
+                            max,
+                            flaky,
+                            scenario_step,
+                            delay_ms,
+                        )
                     });
                 }
                 Err(_) => break,
@@ -449,6 +478,7 @@ fn handle_conn(
     in_flight: Arc<AtomicUsize>,
     max_in_flight: Arc<AtomicUsize>,
     flaky_seen: Arc<AtomicBool>,
+    scenario_step: Arc<AtomicUsize>,
     delay_ms: u64,
 ) {
     let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -495,7 +525,156 @@ fn handle_conn(
         authorization,
     });
 
-    let (status, response_body) = if body_text.contains(FAIL_MARKER) {
+    if body_text.contains(SLOW_QUOTA_MARKER) && !flaky_seen.swap(true, Ordering::SeqCst) {
+        write_mock_llm_response_with_slow_body(
+            &mut stream,
+            "400 Bad Request",
+            "",
+            &format!(
+                r#"{{"error":{{"code":"insufficient_quota","message":"{RESPONSE_SECRET}"}}}}"#
+            ),
+            400,
+        );
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    if body_text.contains(SLOW_SERVER_MARKER) && !flaky_seen.swap(true, Ordering::SeqCst) {
+        write_mock_llm_response_with_slow_body(
+            &mut stream,
+            "500 Internal Server Error",
+            "",
+            &format!(r#"{{"error":{{"message":"{RESPONSE_SECRET}"}}}}"#),
+            400,
+        );
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    if body_text.contains(SLOW_STREAM_MARKER) {
+        write_mock_llm_stalled_stream(&mut stream, RESPONSE_SECRET, 300);
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    if body_text.contains(FAIL_TWICE_MARKER) && scenario_step.fetch_add(1, Ordering::SeqCst) < 2 {
+        write_mock_llm_response(&mut stream, "500 Internal Server Error", "", "transient");
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    if body_text.contains(NETWORK_CONTEXT_NETWORK_MARKER)
+        && body_text.contains(tool_result_marker(&path))
+        && !body_text.contains("formic_submit_compaction")
+        && scenario_step
+            .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        write_mock_llm_response(
+            &mut stream,
+            "500 Internal Server Error",
+            "",
+            "transient-before-context",
+        );
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+    if body_text.contains(NETWORK_CONTEXT_NETWORK_MARKER)
+        && body_text.contains(tool_result_marker(&path))
+        && !body_text.contains("formic_submit_compaction")
+        && scenario_step
+            .compare_exchange(1, 2, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        write_mock_llm_response(
+            &mut stream,
+            "400 Bad Request",
+            "",
+            r#"{"error":{"code":"context_length_exceeded"}}"#,
+        );
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+
+    let early_response = if body_text.contains(AUTH_MARKER) {
+        Some((
+            "401 Unauthorized".to_string(),
+            String::new(),
+            format!(r#"{{"error":{{"message":"{RESPONSE_SECRET}"}}}}"#),
+        ))
+    } else if body_text.contains(FORBIDDEN_MARKER) {
+        Some((
+            "403 Forbidden".to_string(),
+            String::new(),
+            format!(r#"{{"error":{{"message":"{RESPONSE_SECRET}"}}}}"#),
+        ))
+    } else if body_text.contains(QUOTA_MARKER) {
+        Some((
+            "429 Too Many Requests".to_string(),
+            "retry-after: 600\r\n".to_string(),
+            format!(r#"{{"error":{{"code":"insufficient_quota","message":"{RESPONSE_SECRET}"}}}}"#),
+        ))
+    } else if body_text.contains(ACCOUNT_MARKER) {
+        Some((
+            "400 Bad Request".to_string(),
+            String::new(),
+            format!(
+                r#"{{"error":{{"code":"account_deactivated","message":"{RESPONSE_SECRET}"}}}}"#
+            ),
+        ))
+    } else if body_text.contains(RATE_LONG_MARKER) {
+        Some((
+            "429 Too Many Requests".to_string(),
+            "retry-after: 600\r\n".to_string(),
+            format!(r#"{{"error":{{"message":"{RESPONSE_SECRET}"}}}}"#),
+        ))
+    } else if body_text.contains(SERVER_LONG_MARKER) {
+        Some((
+            "503 Service Unavailable".to_string(),
+            "retry-after: 600\r\n".to_string(),
+            format!(r#"{{"error":{{"message":"{RESPONSE_SECRET}"}}}}"#),
+        ))
+    } else if body_text.contains(RATE_NUMERIC_MARKER) && !flaky_seen.swap(true, Ordering::SeqCst) {
+        Some((
+            "429 Too Many Requests".to_string(),
+            "retry-after: 1\r\n".to_string(),
+            "{}".to_string(),
+        ))
+    } else if body_text.contains(RATE_DATE_MARKER) && !flaky_seen.swap(true, Ordering::SeqCst) {
+        let deadline = chrono::Utc::now() + chrono::Duration::seconds(2);
+        Some((
+            "429 Too Many Requests".to_string(),
+            format!(
+                "retry-after: {}\r\n",
+                deadline.format("%a, %d %b %Y %H:%M:%S GMT")
+            ),
+            "{}".to_string(),
+        ))
+    } else if body_text.contains(BAD_PROTOCOL_MARKER) {
+        Some((
+            "200 OK".to_string(),
+            String::new(),
+            format!("data: {{\"secret\":\"{RESPONSE_SECRET}\",\"choices\":\"bad\"}}\n\n"),
+        ))
+    } else if body_text.contains(EOF_WITHOUT_FINISH_MARKER) {
+        Some((
+            "200 OK".to_string(),
+            String::new(),
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n".to_string(),
+        ))
+    } else {
+        None
+    };
+    if let Some((status, extra_headers, response_body)) = early_response {
+        write_mock_llm_response(&mut stream, &status, &extra_headers, &response_body);
+        in_flight.fetch_sub(1, Ordering::SeqCst);
+        return;
+    }
+
+    let (status, response_body) = if body_text.contains(NETWORK_CONTEXT_NETWORK_MARKER)
+        && body_text.contains("此前历史的已验证压缩摘要")
+        && scenario_step
+            .compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        ("500 Internal Server Error", "transient".to_string())
+    } else if body_text.contains(FAIL_MARKER) {
         ("500 Internal Server Error", "boom".to_string())
     } else if body_text.contains(FLAKY_MARKER) && !flaky_seen.swap(true, Ordering::SeqCst) {
         ("500 Internal Server Error", "transient".to_string())
@@ -571,15 +750,50 @@ fn handle_conn(
             None => ("404 Not Found", "unknown path".to_string()),
         }
     };
-    let response = format!(
-        "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
-        response_body.len()
-    );
     if delay_ms > 0 {
         thread::sleep(std::time::Duration::from_millis(delay_ms));
     }
-    stream.write_all(response.as_bytes()).ok();
+    write_mock_llm_response(&mut stream, status, "", &response_body);
     in_flight.fetch_sub(1, Ordering::SeqCst);
+}
+
+fn write_mock_llm_response(stream: &mut TcpStream, status: &str, extra_headers: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: text/event-stream\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+}
+
+fn write_mock_llm_response_with_slow_body(
+    stream: &mut TcpStream,
+    status: &str,
+    extra_headers: &str,
+    body: &str,
+    delay_ms: u64,
+) {
+    let headers = format!(
+        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{extra_headers}content-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    thread::sleep(std::time::Duration::from_millis(delay_ms));
+    stream.write_all(body.as_bytes()).ok();
+}
+
+fn write_mock_llm_stalled_stream(stream: &mut TcpStream, secret: &str, delay_ms: u64) {
+    let prefix = format!(r#"data: {{"secret":"{secret}""#);
+    let suffix = ",\"choices\":[]}\n\n";
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        prefix.len() + suffix.len()
+    );
+    stream.write_all(headers.as_bytes()).unwrap();
+    stream.write_all(prefix.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    thread::sleep(std::time::Duration::from_millis(delay_ms));
+    stream.write_all(suffix.as_bytes()).ok();
 }
 
 /// 搭一个两单元作业：单元 1 文件清单形状，单元 2 行区间形状。
@@ -606,6 +820,29 @@ fn write_job(dir: &Path, marker: Option<&str>) -> (PathBuf, PathBuf, PathBuf, Pa
     (data, plan, task, out)
 }
 
+fn write_many_job(dir: &Path, count: u64, marker: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let data = dir.join("data");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("a.txt"), "共享输入。\n").unwrap();
+    let plan = dir.join("plan.jsonl");
+    let plan_text: String = (1..=count)
+        .map(|unit| format!("{{\"unit\":{unit},\"files\":[\"a.txt\"]}}\n"))
+        .collect();
+    fs::write(&plan, plan_text).unwrap();
+    let task = dir.join("task.md");
+    fs::write(&task, format!("测试供应商状态。{marker}\n")).unwrap();
+    let out = dir.join("out");
+    (data, plan, task, out)
+}
+
+fn write_request_policy(dir: &Path, retry_delays_ms: &str, max_retry_after_ms: u64) {
+    fs::write(
+        dir.join("config.toml"),
+        format!("retry_delays_ms = {retry_delays_ms}\nmax_retry_after_ms = {max_retry_after_ms}\n"),
+    )
+    .unwrap();
+}
+
 fn run_formic(
     protocol: &str,
     port: u16,
@@ -627,6 +864,27 @@ fn run_formic(
     } else {
         command.env_remove("FORMIC_ANTHROPIC_MAX_TOKENS");
     }
+    command.output().unwrap()
+}
+
+fn run_formic_resume(
+    protocol: &str,
+    port: u16,
+    concurrency: usize,
+    data: &Path,
+    plan: &Path,
+    task: &Path,
+    out: &Path,
+) -> Output {
+    let mut command = formic_command(concurrency, data, plan, task, out);
+    command
+        .arg("--resume")
+        .env("FORMIC_LLM_PROTOCOL", protocol)
+        .env("FORMIC_LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
+        .env("FORMIC_LLM_MODEL", "test-model")
+        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .env_remove("FORMIC_LLM_API_KEY")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS");
     command.output().unwrap()
 }
 
@@ -652,6 +910,41 @@ fn formic_command(
         .arg("--concurrency")
         .arg(concurrency.to_string());
     command
+}
+
+#[cfg(windows)]
+fn make_interruptible(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    // 为子进程建立独立控制台进程组，测试只向该组发送 CTRL_BREAK_EVENT。
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(unix)]
+fn make_interruptible(_command: &mut Command) {}
+
+#[cfg(windows)]
+fn send_interrupt(child: &Child) {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GenerateConsoleCtrlEvent(ctrl_event: u32, process_group_id: u32) -> i32;
+    }
+    const CTRL_BREAK_EVENT: u32 = 1;
+    // SAFETY：child 以 CREATE_NEW_PROCESS_GROUP 启动，id 正是目标进程组；函数不持有指针。
+    let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) };
+    assert_ne!(sent, 0, "应能向 Formic 子进程组发送 CTRL_BREAK_EVENT");
+}
+
+#[cfg(unix)]
+fn send_interrupt(child: &Child) {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    let pid = i32::try_from(child.id()).expect("子进程号应能用 pid_t 表示");
+    // SAFETY：pid 来自仍存活的直接子进程，SIGINT 不涉及指针或共享内存。
+    let sent = unsafe { kill(pid, 2) };
+    assert_eq!(sent, 0, "应能向 Formic 子进程发送 SIGINT");
 }
 
 fn run_structured_formic(
@@ -727,9 +1020,9 @@ fn toml_string(path: &Path) -> String {
     serde_json::to_string(&path.to_string_lossy()).unwrap()
 }
 
-/// 读取 out/stats.jsonl，返回按单元号索引的 JSON 行。
+/// 读取当前 run 的 stats.jsonl，返回按单元号索引的 JSON 行。
 fn stats_lines(out: &Path) -> Vec<serde_json::Value> {
-    fs::read_to_string(out.join("stats.jsonl"))
+    fs::read_to_string(run_dir(out).join("stats.jsonl"))
         .unwrap_or_default()
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
@@ -743,15 +1036,95 @@ fn stats_of(lines: &[serde_json::Value], unit: u64) -> &serde_json::Value {
         .unwrap_or_else(|| panic!("stats 缺单元 {unit} 的行"))
 }
 
-fn worker_run_dir(out: &Path) -> PathBuf {
-    let mut directories: Vec<PathBuf> = fs::read_dir(out.join("workers"))
-        .expect("缺少 workers 观测目录")
+fn run_dir(out: &Path) -> PathBuf {
+    let directories = run_dirs(out);
+    assert_eq!(directories.len(), 1, "一次测试作业应只有一个运行目录");
+    directories.into_iter().next().unwrap()
+}
+
+fn run_dirs(out: &Path) -> Vec<PathBuf> {
+    let mut directories: Vec<PathBuf> = fs::read_dir(out.join("runs"))
+        .expect("缺少 runs 观测目录")
         .map(|entry| entry.unwrap().path())
         .filter(|path| path.is_dir())
         .collect();
     directories.sort();
-    assert_eq!(directories.len(), 1, "一次测试作业应只有一个任务时间戳目录");
-    directories.pop().unwrap()
+    directories
+}
+
+fn latest_run_dir(out: &Path) -> PathBuf {
+    run_dirs(out).pop().expect("缺少运行目录")
+}
+
+fn latest_run_summary(out: &Path) -> serde_json::Value {
+    run_summary(&latest_run_dir(out))
+}
+
+fn run_summary(run: &Path) -> serde_json::Value {
+    serde_json::from_slice(&fs::read(run.join("summary.json")).expect("缺少运行汇总")).unwrap()
+}
+
+fn read_output_tree(path: &Path) -> String {
+    let mut text = String::new();
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        if entry.path().is_dir() {
+            text.push_str(&read_output_tree(&entry.path()));
+        } else {
+            text.push_str(&String::from_utf8_lossy(&fs::read(entry.path()).unwrap()));
+        }
+    }
+    text
+}
+
+fn assert_summary_identities(summary: &serde_json::Value) {
+    let value = |name: &str| summary[name].as_u64().unwrap();
+    assert_eq!(
+        value("planned"),
+        value("already_completed") + value("started") + value("not_started"),
+        "计划恒等式不成立：{summary}"
+    );
+    assert_eq!(
+        value("started"),
+        value("published") + value("failed") + value("stopped"),
+        "本轮状态恒等式不成立：{summary}"
+    );
+    assert_eq!(
+        value("llm_calls"),
+        value("llm_calls_with_provider_usage") + value("llm_calls_without_provider_usage"),
+        "调用 usage 恒等式不成立：{summary}"
+    );
+}
+
+fn results_dir(out: &Path) -> PathBuf {
+    out.join("results")
+}
+
+fn output_tree_snapshot(root: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+    fn collect(root: &Path, current: &Path, entries: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+        let mut children: Vec<_> = fs::read_dir(current)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        children.sort();
+        for child in children {
+            let relative = child.strip_prefix(root).unwrap().to_path_buf();
+            if child.is_dir() {
+                entries.push((relative, None));
+                collect(root, &child, entries);
+            } else {
+                entries.push((relative, Some(fs::read(&child).unwrap())));
+            }
+        }
+    }
+
+    let mut entries = Vec::new();
+    collect(root, root, &mut entries);
+    entries
+}
+
+fn worker_run_dir(out: &Path) -> PathBuf {
+    run_dir(out).join("workers")
 }
 
 fn worker_report(out: &Path, unit: u64) -> String {
@@ -783,17 +1156,22 @@ fn assert_success(protocol: &str, expected_path: &str) {
     );
     let stdout = stdout_of(&output);
     assert!(
-        stdout.contains("完成 2"),
+        stdout.contains("发布 2"),
         "{protocol} 汇总应含完成数：{stdout}"
     );
     assert!(
         stdout.contains("失败 0"),
         "{protocol} 汇总应含失败数：{stdout}"
     );
+    let progress = stderr_of(&output);
+    assert!(!progress.contains(['\r', '\u{1b}']), "{progress:?}");
+    assert!(progress.contains("0%（0/2）"), "{progress}");
+    assert!(progress.contains("100%（2/2）"), "{progress}");
+    assert!(progress.lines().count() <= 101, "{progress}");
 
     for unit in [1, 2] {
         assert_eq!(
-            fs::read_to_string(out.join(format!("{unit}.md"))).unwrap(),
+            fs::read_to_string(results_dir(&out).join(format!("{unit}.md"))).unwrap(),
             FINAL_TEXT,
             "{protocol} 单元 {unit} 产出应为最终回合文本"
         );
@@ -802,7 +1180,7 @@ fn assert_success(protocol: &str, expected_path: &str) {
             "状态：准备输入",
             "上下文预算判断",
             "LLM 请求",
-            "LLM 原始事件",
+            "模型响应",
             "模型请求工具",
             "工具执行事实",
             "工具结果",
@@ -817,18 +1195,29 @@ fn assert_success(protocol: &str, expected_path: &str) {
             "{protocol} 运行档案应含工具参数原文：{report}"
         );
         assert_eq!(
-            report.matches("完整请求体（基准）").count(),
+            report.matches("完整模型输入（基准）").count(),
             1,
-            "{protocol} 运行档案只应保存首轮完整请求：{report}"
+            "{protocol} 运行档案只应保存首轮完整模型输入：{report}"
         );
         assert!(
-            report.contains("本轮请求变化（逐字保留）"),
-            "{protocol} 后续请求应保存可逆变化量：{report}"
+            report.contains("本轮模型输入变化（逐字保留）"),
+            "{protocol} 后续模型输入应保存可逆变化量：{report}"
+        );
+        assert!(
+            report.contains(&format!("[{unit}.md](../../../results/{unit}.md)")),
+            "{protocol} worker 档案应正确链接到 results：{report}"
         );
         assert_eq!(
-            report.matches("LLM 原始事件流").count(),
+            report.matches("· 模型响应").count(),
             2,
-            "{protocol} 两次模型调用应各有一个响应流标题：{report}"
+            "{protocol} 两次模型调用应各有一个解析响应标题：{report}"
+        );
+        assert!(
+            !report.contains("choices")
+                && !report.contains("response.output_text.delta")
+                && !report.contains("encrypted_content")
+                && !report.contains("provider-only-state"),
+            "{protocol} HTTP/SSE envelope 与 opaque replay payload 不得进入 worker 报告：{report}"
         );
         assert!(report.contains("结局：`published`"), "{report}");
     }
@@ -856,8 +1245,8 @@ fn assert_success(protocol: &str, expected_path: &str) {
             s["output_tokens_est"].as_u64().unwrap() > 0,
             "{protocol} 单元 {unit} output：{s}"
         );
-        assert_eq!(s["provider_usage_reports"], 1, "{protocol}：{s}");
-        assert_eq!(s["provider_usage_missing_calls"], 1, "{protocol}：{s}");
+        assert_eq!(s["llm_calls_with_provider_usage"], 1, "{protocol}：{s}");
+        assert_eq!(s["llm_calls_without_provider_usage"], 1, "{protocol}：{s}");
         assert_eq!(s["provider_input_tokens"], 100, "{protocol}：{s}");
         assert_eq!(s["provider_output_tokens"], 5, "{protocol}：{s}");
         assert_eq!(s["provider_cache_read_tokens"], 60, "{protocol}：{s}");
@@ -964,15 +1353,15 @@ fn structured_output_succeeds_for_all_protocols() {
         );
         for unit in [1, 2] {
             assert_eq!(
-                fs::read_to_string(out.join(format!("{unit}.json"))).unwrap(),
+                fs::read_to_string(results_dir(&out).join(format!("{unit}.json"))).unwrap(),
                 "{\n  \"answer\": \"ok\"\n}\n"
             );
-            assert!(!out.join(format!("{unit}.md")).exists());
+            assert!(!results_dir(&out).join(format!("{unit}.md")).exists());
             let report = worker_report(&out, unit);
             assert!(report.contains("结构化结果校验"), "{report}");
             assert!(report.contains("校验通过：`true`"), "{report}");
         }
-        assert!(out.join("output-schema.json").exists());
+        assert!(results_dir(&out).join("output-schema.json").exists());
         let requests = mock.requests.lock().unwrap();
         assert_eq!(requests.len(), 2, "{protocol} 每单元只需一次提交");
         assert!(requests.iter().all(|request| {
@@ -1009,7 +1398,7 @@ fn structured_invalid_and_mixed_turns_are_corrected_for_all_protocols() {
                 stderr_of(&output)
             );
             for unit in [1, 2] {
-                assert!(out.join(format!("{unit}.json")).exists());
+                assert!(results_dir(&out).join(format!("{unit}.json")).exists());
                 let report = worker_report(&out, unit);
                 assert!(report.contains("校验通过：`false`"), "{report}");
                 assert!(report.contains("校验通过：`true`"), "{report}");
@@ -1037,13 +1426,10 @@ fn refusal_truncation_and_structured_exhaustion_publish_nothing() {
             let mock = start_mock();
             let output = run_formic(protocol, mock.port, 2, &data, &plan, &task, &out);
             assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
-            assert!(
-                stderr_of(&output).contains(expected),
-                "{}",
-                stderr_of(&output)
-            );
-            assert!(!out.join("1.md").exists());
-            assert!(!out.join("2.md").exists());
+            assert!(worker_report(&out, 1).contains(expected));
+            assert!(!stderr_of(&output).contains("100%"));
+            assert!(!results_dir(&out).join("1.md").exists());
+            assert!(!results_dir(&out).join("2.md").exists());
             assert_eq!(mock.requests.lock().unwrap().len(), 2);
         }
 
@@ -1058,9 +1444,10 @@ fn refusal_truncation_and_structured_exhaustion_publish_nothing() {
         let mock = start_mock();
         let output = run_structured_formic(protocol, mock.port, &data, &plan, &task, &out, &schema);
         assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
-        assert!(stderr_of(&output).contains("连续 5 次无效"));
-        assert!(!out.join("1.json").exists());
-        assert!(!out.join("2.json").exists());
+        assert!(worker_report(&out, 1).contains("连续 5 次无效"));
+        assert!(!stderr_of(&output).contains("100%"));
+        assert!(!results_dir(&out).join("1.json").exists());
+        assert!(!results_dir(&out).join("2.json").exists());
         assert_eq!(mock.requests.lock().unwrap().len(), 10);
     }
 }
@@ -1112,7 +1499,10 @@ fn context_budget_compacts_complete_tool_group_then_continues() {
         "压缩后应继续完成：{}",
         stderr_of(&output)
     );
-    assert_eq!(fs::read_to_string(out.join("1.md")).unwrap(), FINAL_TEXT);
+    assert_eq!(
+        fs::read_to_string(results_dir(&out).join("1.md")).unwrap(),
+        FINAL_TEXT
+    );
     let report = worker_report(&out, 1);
     assert!(report.contains("上下文压缩请求"), "{report}");
     assert!(report.contains("上下文压缩结果"), "{report}");
@@ -1147,21 +1537,82 @@ fn context_budget_compacts_complete_tool_group_then_continues() {
 }
 
 #[test]
+fn context_recovery_resets_the_consecutive_network_retry_schedule() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("a.txt"), "small shard\n").unwrap();
+    let mut large = String::new();
+    for line in 1..=260 {
+        large.push_str(&format!(
+            "line-{line:04} alpha beta gamma delta epsilon value-{line:04}\n"
+        ));
+    }
+    fs::write(data.join("big.txt"), large).unwrap();
+    let plan = dir.path().join("plan.jsonl");
+    fs::write(&plan, "{\"unit\":1,\"files\":[\"a.txt\"]}\n").unwrap();
+    let task = dir.path().join("task.md");
+    fs::write(
+        &task,
+        format!(
+            "先读取 big.txt，再完成任务。{COMPACTION_MARKER} {NETWORK_CONTEXT_NETWORK_MARKER}\n"
+        ),
+    )
+    .unwrap();
+    let out = dir.path().join("out");
+    fs::write(
+        dir.path().join("config.toml"),
+        "retry_delays_ms = [1]\nmax_retry_after_ms = 1000\n[tools.read]\nmax_result_bytes = 30000\n",
+    )
+    .unwrap();
+    let mock = start_mock();
+
+    let output = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}\nartifacts:\n{}",
+        stdout_of(&output),
+        stderr_of(&output),
+        read_output_tree(&out)
+    );
+    assert_eq!(mock.requests.lock().unwrap().len(), 6);
+    let stats = stats_lines(&out);
+    let value = stats_of(&stats, 1);
+    assert_eq!(value["llm_calls"], 6, "{value}");
+    assert_eq!(
+        value["retries"], 2,
+        "上下文响应应中断连续网络失败，压缩后的网络失败重新使用第一档：{value}"
+    );
+    assert_eq!(value["compactions"], 1, "{value}");
+    let summary = latest_run_summary(&out);
+    assert_summary_identities(&summary);
+    assert_eq!(summary["published"], 1);
+    assert_eq!(summary["llm_calls"], 6);
+}
+
+#[test]
 fn config_file_supplies_http_settings() {
     let dir = tempfile::tempdir().unwrap();
     let (data, plan, task, out) = write_job(dir.path(), None);
     let mock = start_mock();
+    let config_directory = dir.path().join("settings");
+    fs::create_dir(&config_directory).unwrap();
+    let config_path = config_directory.join("formic.toml");
     fs::write(
-        dir.path().join("config.toml"),
+        &config_path,
         format!(
-            "url = \"http://127.0.0.1:{}/v1\"\napi_key = \"config-key\"\nmodel = \"config-model\"\ncontext_window_tokens = 131072\n",
-            mock.port
+            "url = \"http://127.0.0.1:{}/v1\"\napi_key = \"{}\"\nmodel = \"config-model\"\ncontext_window_tokens = 131072\n",
+            mock.port, LLM_API_KEY_SECRET
         ),
     )
     .unwrap();
 
     let mut command = formic_command(2, &data, &plan, &task, &out);
     let output = command
+        .arg("--config")
+        .arg(&config_path)
         .current_dir(dir.path())
         .env("FORMIC_LLM_PROTOCOL", "completions")
         .env_remove("FORMIC_LLM_BASE_URL")
@@ -1192,12 +1643,54 @@ fn config_file_supplies_http_settings() {
             .all(|request| request.body.contains("\"model\":\"config-model\"")),
         "请求应使用 config.toml 的 model"
     );
+    let expected_authorization = format!("Bearer {LLM_API_KEY_SECRET}");
     assert!(
-        requests
-            .iter()
-            .all(|request| request.authorization.as_deref() == Some("Bearer config-key")),
+        requests.iter().all(
+            |request| request.authorization.as_deref() == Some(expected_authorization.as_str())
+        ),
         "请求应使用 config.toml 的明文 api_key"
     );
+    drop(requests);
+    let public = format!(
+        "{}{}{}",
+        stdout_of(&output),
+        stderr_of(&output),
+        read_output_tree(&out)
+    );
+    assert!(
+        !public.contains(LLM_API_KEY_SECRET),
+        "LLM API key 不得进入任何作业产物"
+    );
+}
+
+#[test]
+fn explicitly_selected_missing_config_fails_before_any_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_job(dir.path(), None);
+    let mock = start_mock();
+    let missing = dir.path().join("missing-config.toml");
+
+    let output = formic_command(1, &data, &plan, &task, &out)
+        .arg("--config")
+        .arg(&missing)
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env(
+            "FORMIC_LLM_BASE_URL",
+            format!("http://127.0.0.1:{}/v1", mock.port),
+        )
+        .env("FORMIC_LLM_MODEL", "test-model")
+        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .env_remove("FORMIC_LLM_API_KEY")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("指定的配置文件"), "{stderr}");
+    assert!(stderr.contains("missing-config.toml"), "{stderr}");
+    assert!(stderr.contains("不存在"), "{stderr}");
+    assert!(mock.requests.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -1265,7 +1758,7 @@ fn custom_stdio_mcp_auto_discovers_all_tools_and_is_audited() {
     );
     for unit in [1, 2] {
         assert_eq!(
-            fs::read_to_string(out.join(format!("{unit}.md"))).unwrap(),
+            fs::read_to_string(results_dir(&out).join(format!("{unit}.md"))).unwrap(),
             FINAL_TEXT
         );
         let report = worker_report(&out, unit);
@@ -1400,8 +1893,8 @@ fn timed_out_mcp_call_is_not_replayed() {
         call_started.elapsed()
     );
     assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
-    assert!(stderr_of(&output).contains("调用超时"));
-    assert!(!out.join("1.md").exists());
+    assert!(worker_report(&out, 1).contains("调用超时"));
+    assert!(!results_dir(&out).join("1.md").exists());
     assert_eq!(
         fs::read_to_string(call_log).unwrap().lines().count(),
         1,
@@ -1428,13 +1921,13 @@ fn custom_streamable_http_mcp_uses_session_auth_and_frozen_catalog() {
                 "[mcp_servers.demo]\n",
                 "enabled = true\n",
                 "url = \"http://127.0.0.1:{}/mcp\"\n",
-                "bearer_token = \"secret-token\"\n",
+                "bearer_token = \"{}\"\n",
                 "headers = {{ \"x-formic-test\" = \"yes\" }}\n",
                 "enabled_tools = [\"echo\"]\n",
                 "session_scope = \"job\"\n",
                 "max_in_flight = 2\n",
             ),
-            llm.port, mcp.port,
+            llm.port, mcp.port, MCP_BEARER_SECRET,
         ),
     )
     .unwrap();
@@ -1477,8 +1970,9 @@ fn custom_streamable_http_mcp_uses_session_auth_and_frozen_catalog() {
             .count(),
         2
     );
+    let expected_authorization = format!("Bearer {MCP_BEARER_SECRET}");
     assert!(requests.iter().all(|request| {
-        request.authorization.as_deref() == Some("Bearer secret-token")
+        request.authorization.as_deref() == Some(expected_authorization.as_str())
             && request.custom_header.as_deref() == Some("yes")
     }));
     assert!(
@@ -1487,6 +1981,17 @@ fn custom_streamable_http_mcp_uses_session_auth_and_frozen_catalog() {
             .filter(|request| request.rpc_method != "initialize")
             .any(|request| request.session_id.as_deref() == Some("test-session")),
         "初始化后的请求应复用 MCP session id"
+    );
+    drop(requests);
+    let public = format!(
+        "{}{}{}",
+        stdout_of(&output),
+        stderr_of(&output),
+        read_output_tree(&out)
+    );
+    assert!(
+        !public.contains(MCP_BEARER_SECRET),
+        "MCP bearer 不得进入任何作业产物"
     );
 }
 
@@ -1504,43 +2009,535 @@ fn failed_unit_leaves_no_record() {
         stderr_of(&output)
     );
     let stdout = stdout_of(&output);
-    assert!(stdout.contains("完成 1"), "{stdout}");
+    assert!(stdout.contains("发布 1"), "{stdout}");
     assert!(stdout.contains("失败 1"), "{stdout}");
-    assert!(stdout.contains("失败单元：2"), "{stdout}");
+    assert!(stdout.contains("首个未完成单元 2"), "{stdout}");
     assert!(
         !stdout.contains("全部成功"),
         "失败路径不得出现成功文案：{stdout}"
     );
 
-    assert!(out.join("1.md").exists(), "成功单元的记录应在");
-    assert!(!out.join("2.md").exists(), "失败单元不得留下记录");
     assert!(
-        !out.join(".tmp-unit-2").exists(),
+        results_dir(&out).join("1.md").exists(),
+        "成功单元的记录应在"
+    );
+    assert!(
+        !results_dir(&out).join("2.md").exists(),
+        "失败单元不得留下记录"
+    );
+    assert!(
+        !results_dir(&out).join(".tmp-unit-2").exists(),
         "失败单元不得留下临时文件"
     );
 
-    let stderr = stderr_of(&output);
+    let report = worker_report(&out, 2);
+    assert!(report.contains("500"), "失败档案应含直接原因：{report}");
     assert!(
-        stderr.contains("单元 2 失败"),
-        "失败诊断应含单元号：{stderr}"
-    );
-    assert!(stderr.contains("500"), "失败诊断应含直接原因：{stderr}");
-    assert!(
-        stderr.contains("重试 4 次"),
-        "瞬时故障应重试到预算耗尽：{stderr}"
+        report.contains("重试 3 次"),
+        "瞬时故障应按网络重试配置耗尽：{report}"
     );
 
-    // 单元 1 两轮 2 次请求 + 单元 2 五次尝试均 500
+    // 单元 1 两轮 2 次请求 + 单元 2 四次尝试均 500
     let requests = mock.requests.lock().unwrap();
-    assert_eq!(requests.len(), 7, "重试预算应耗尽：{:?}", requests.len());
+    assert_eq!(requests.len(), 6, "重试预算应耗尽：{:?}", requests.len());
     drop(requests);
 
     let stats = stats_lines(&out);
     assert_eq!(stats_of(&stats, 1)["outcome"], "published");
     let failed = stats_of(&stats, 2);
     assert_eq!(failed["outcome"], "failed", "{failed}");
-    assert_eq!(failed["llm_calls"], 5, "失败单元应尝试 5 次：{failed}");
-    assert_eq!(failed["retries"], 4, "失败单元应重试 4 次：{failed}");
+    assert_eq!(failed["llm_calls"], 4, "失败单元应尝试 4 次：{failed}");
+    assert_eq!(failed["retries"], 3, "失败单元应重试 3 次：{failed}");
+}
+
+#[test]
+fn permanent_service_errors_stop_within_the_initial_window_and_never_leak_body() {
+    for (marker, stop_reason, visible_fact) in [
+        (AUTH_MARKER, "鉴权失败", "HTTP 401"),
+        (FORBIDDEN_MARKER, "权限不足", "HTTP 403"),
+        (QUOTA_MARKER, "额度不可用", "insufficient\\_quota"),
+        (ACCOUNT_MARKER, "账户不可用", "account\\_deactivated"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (data, plan, task, out) = write_many_job(dir.path(), 20, marker);
+        write_request_policy(dir.path(), "[1]", 50);
+        let mock = start_mock();
+        let output = run_formic("completions", mock.port, 4, &data, &plan, &task, &out);
+
+        assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+        let requests = mock.requests.lock().unwrap().len() as u64;
+        assert!(
+            (1..=4).contains(&requests),
+            "永久错误的实际调用数不得超过首次活动窗口：{requests}"
+        );
+        let summary = latest_run_summary(&out);
+        assert_summary_identities(&summary);
+        assert_eq!(summary["llm_calls"], requests);
+        assert_eq!(summary["llm_calls_with_provider_usage"], 0);
+        assert_eq!(summary["llm_calls_without_provider_usage"], requests);
+        assert_eq!(summary["stop_reason"], stop_reason);
+        assert!(summary["not_started"].as_u64().unwrap() >= 16, "{summary}");
+        let all_public = format!(
+            "{}\n{}\n{}",
+            stdout_of(&output),
+            stderr_of(&output),
+            read_output_tree(&out)
+        );
+        assert!(!all_public.contains(RESPONSE_SECRET), "泄漏了错误响应正文");
+        assert!(
+            all_public.contains(visible_fact),
+            "缺少安全诊断事实：{all_public}"
+        );
+        assert!(!stderr_of(&output).contains("100%"), "失败不得补写 100%");
+    }
+}
+
+#[test]
+fn slow_quota_classification_blocks_new_calls_beyond_the_initial_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_many_job(dir.path(), 20, SLOW_QUOTA_MARKER);
+    write_request_policy(dir.path(), "[1]", 1_000);
+    let mock = start_mock();
+
+    let output = run_formic("completions", mock.port, 2, &data, &plan, &task, &out);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    let requests = mock.requests.lock().unwrap().len() as u64;
+    assert!(
+        (1..=2).contains(&requests),
+        "慢速 quota 正文分类期间不得超过首次活动窗口：{requests}"
+    );
+    let summary = latest_run_summary(&out);
+    assert_summary_identities(&summary);
+    assert_eq!(summary["llm_calls"], requests);
+    assert_eq!(summary["stop_reason"], "额度不可用");
+    assert!(summary["not_started"].as_u64().unwrap() >= 18, "{summary}");
+    assert!(!read_output_tree(&out).contains(RESPONSE_SECRET));
+}
+
+#[test]
+fn slow_server_error_releases_classification_gate_for_later_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_many_job(dir.path(), 2, SLOW_SERVER_MARKER);
+    write_request_policy(dir.path(), "[1]", 1_000);
+    let mock = start_mock();
+
+    let output = run_formic("completions", mock.port, 2, &data, &plan, &task, &out);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    assert_eq!(
+        mock.requests.lock().unwrap().len(),
+        5,
+        "一次 500 后两个单元都应继续完成各自回合"
+    );
+    let summary = latest_run_summary(&out);
+    assert_summary_identities(&summary);
+    assert_eq!(summary["published"], 2);
+    assert_eq!(summary["llm_calls"], 5);
+    assert!(summary["stop_reason"].is_null(), "{summary}");
+    assert!(!read_output_tree(&out).contains(RESPONSE_SECRET));
+}
+
+#[test]
+fn oversized_retry_after_on_429_or_503_stops_without_waiting() {
+    for marker in [RATE_LONG_MARKER, SERVER_LONG_MARKER] {
+        let dir = tempfile::tempdir().unwrap();
+        let (data, plan, task, out) = write_many_job(dir.path(), 20, marker);
+        write_request_policy(dir.path(), "[1]", 20);
+        let mock = start_mock();
+        let started = std::time::Instant::now();
+        let output = run_formic("completions", mock.port, 4, &data, &plan, &task, &out);
+        assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "不得等待 600 秒 Retry-After：{:?}",
+            started.elapsed()
+        );
+        assert!(mock.requests.lock().unwrap().len() <= 4);
+        let summary = latest_run_summary(&out);
+        assert_summary_identities(&summary);
+        assert_eq!(summary["stop_reason"], "供应商要求的等待时间超过配置上限");
+        let public = format!(
+            "{}{}{}",
+            stdout_of(&output),
+            stderr_of(&output),
+            read_output_tree(&out)
+        );
+        assert!(!public.contains(RESPONSE_SECRET));
+    }
+}
+
+#[test]
+fn numeric_and_http_date_retry_after_gate_the_retry_then_succeed() {
+    for (marker, minimum_wait) in [
+        (RATE_NUMERIC_MARKER, std::time::Duration::from_millis(800)),
+        (RATE_DATE_MARKER, std::time::Duration::from_millis(800)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (data, plan, task, out) = write_many_job(dir.path(), 1, marker);
+        write_request_policy(dir.path(), "[1]", 5_000);
+        let mock = start_mock();
+        let started = std::time::Instant::now();
+        let output = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+        assert!(started.elapsed() >= minimum_wait, "Retry-After 未生效");
+        assert_eq!(mock.requests.lock().unwrap().len(), 3);
+        let summary = latest_run_summary(&out);
+        assert_summary_identities(&summary);
+        assert_eq!(summary["published"], 1);
+        assert_eq!(summary["llm_calls"], 3);
+    }
+}
+
+#[test]
+fn malformed_protocol_payload_is_discarded_from_every_public_artifact() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_many_job(dir.path(), 2, BAD_PROTOCOL_MARKER);
+    write_request_policy(dir.path(), "[]", 100);
+    let mock = start_mock();
+    let output = run_formic("completions", mock.port, 2, &data, &plan, &task, &out);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    assert_eq!(mock.requests.lock().unwrap().len(), 2);
+    let public = format!(
+        "{}{}{}",
+        stdout_of(&output),
+        stderr_of(&output),
+        read_output_tree(&out)
+    );
+    assert!(!public.contains(RESPONSE_SECRET));
+    assert!(public.contains("协议响应无效"), "{public}");
+    assert!(!stderr_of(&output).contains("100%"));
+}
+
+#[test]
+fn eof_without_completion_is_fatal_protocol_but_does_not_stop_later_units() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(
+        data.join("bad.txt"),
+        format!("{EOF_WITHOUT_FINISH_MARKER}\n"),
+    )
+    .unwrap();
+    fs::write(data.join("good.txt"), "普通输入\n").unwrap();
+    let plan = dir.path().join("plan.jsonl");
+    fs::write(
+        &plan,
+        "{\"unit\":1,\"files\":[\"bad.txt\"]}\n{\"unit\":2,\"files\":[\"good.txt\"]}\n",
+    )
+    .unwrap();
+    let task = dir.path().join("task.md");
+    fs::write(&task, "给出结论。\n").unwrap();
+    let out = dir.path().join("out");
+    write_request_policy(dir.path(), "[]", 100);
+    let mock = start_mock();
+
+    let output = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    assert_eq!(mock.requests.lock().unwrap().len(), 3);
+    let summary = latest_run_summary(&out);
+    assert_summary_identities(&summary);
+    assert_eq!(summary["started"], 2);
+    assert_eq!(summary["failed"], 1);
+    assert_eq!(summary["published"], 1);
+    assert_eq!(summary["not_started"], 0);
+    assert_eq!(summary["failure_reasons"]["协议响应无效"], 1);
+    assert!(summary["stop_reason"].is_null(), "{summary}");
+    let stats = stats_lines(&out);
+    assert_eq!(stats_of(&stats, 1)["llm_calls"], 1);
+    assert_eq!(stats_of(&stats, 1)["retries"], 0);
+    assert!(results_dir(&out).join("2.md").exists());
+}
+
+#[test]
+fn stalled_llm_stream_times_out_without_persisting_partial_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_many_job(dir.path(), 1, SLOW_STREAM_MARKER);
+    fs::write(
+        dir.path().join("config.toml"),
+        "read_timeout_ms = 50\nrequest_timeout_ms = 1000\nretry_delays_ms = []\nmax_retry_after_ms = 100\n",
+    )
+    .unwrap();
+    let mock = start_mock();
+
+    let output = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    let summary = latest_run_summary(&out);
+    assert_summary_identities(&summary);
+    assert_eq!(summary["llm_calls"], 1);
+    assert_eq!(summary["failure_reasons"]["请求重试耗尽"], 1);
+    let public = format!(
+        "{}{}{}",
+        stdout_of(&output),
+        stderr_of(&output),
+        read_output_tree(&out)
+    );
+    assert!(public.contains("等待 LLM 流数据超过 50ms"), "{public}");
+    assert!(
+        !public.contains(RESPONSE_SECRET),
+        "部分 SSE payload 不得落盘"
+    );
+    assert!(!stderr_of(&output).contains("100%"));
+}
+
+#[test]
+fn empty_retry_policy_makes_one_request_and_stops_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_many_job(dir.path(), 1, FAIL_MARKER);
+    write_request_policy(dir.path(), "[]", 100);
+    let mock = start_mock();
+    let output = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    let summary = latest_run_summary(&out);
+    assert_summary_identities(&summary);
+    assert_eq!(summary["llm_calls"], 1);
+    assert_eq!(summary["stop_reason"], "网络请求重试已经耗尽");
+    let stats = stats_lines(&out);
+    assert_eq!(stats_of(&stats, 1)["retries"], 0);
+}
+
+#[test]
+fn resume_retries_only_unpublished_units_and_all_complete_is_zero_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_many_job(dir.path(), 2, FLAKY_MARKER);
+    write_request_policy(dir.path(), "[]", 100);
+    let mock = start_mock();
+
+    let first = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(first.status.code(), Some(1), "{}", stderr_of(&first));
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    let first_summary = latest_run_summary(&out);
+    assert_summary_identities(&first_summary);
+    assert_eq!(first_summary["failed"], 1);
+    assert_eq!(first_summary["not_started"], 1);
+
+    let second = run_formic_resume("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(second.status.code(), Some(0), "{}", stderr_of(&second));
+    assert_eq!(mock.requests.lock().unwrap().len(), 5);
+    assert!(results_dir(&out).join("1.md").exists());
+    assert!(results_dir(&out).join("2.md").exists());
+    let second_summary = latest_run_summary(&out);
+    assert_summary_identities(&second_summary);
+    assert_eq!(second_summary["published"], 2);
+
+    let before = mock.requests.lock().unwrap().len();
+    let third = run_formic_resume("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(third.status.code(), Some(0), "{}", stderr_of(&third));
+    assert!(stdout_of(&third).contains("无需处理"));
+    assert_eq!(mock.requests.lock().unwrap().len(), before);
+    assert_eq!(run_dirs(&out).len(), 3);
+    let third_summary = latest_run_summary(&out);
+    assert_summary_identities(&third_summary);
+    assert_eq!(third_summary["already_completed"], 2);
+    assert_eq!(third_summary["started"], 0);
+}
+
+#[test]
+fn cancelled_run_resumes_in_the_same_output_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_many_job(dir.path(), 1, "CANCEL-THEN-RESUME");
+    let mock = start_mock_with_delay(1000);
+    let mut command = formic_command(1, &data, &plan, &task, &out);
+    command
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env(
+            "FORMIC_LLM_BASE_URL",
+            format!("http://127.0.0.1:{}/v1", mock.port),
+        )
+        .env("FORMIC_LLM_MODEL", "test-model")
+        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .env_remove("FORMIC_LLM_API_KEY")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    make_interruptible(&mut command);
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while mock.requests.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "Formic 不应在收到信号前退出"
+        );
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        !mock.requests.lock().unwrap().is_empty(),
+        "首轮模型调用应已开始"
+    );
+    send_interrupt(&child);
+    let cancelled = child.wait_with_output().unwrap();
+
+    assert_eq!(
+        cancelled.status.code(),
+        Some(3),
+        "{}",
+        stderr_of(&cancelled)
+    );
+    assert!(!results_dir(&out).join("1.md").exists());
+    let first_runs = run_dirs(&out);
+    assert_eq!(
+        first_runs[0].file_name().unwrap().to_string_lossy(),
+        "run-000001"
+    );
+    let first_summary = run_summary(&first_runs[0]);
+    assert_summary_identities(&first_summary);
+    assert_eq!(first_summary["stopped"], 1);
+    assert_eq!(first_summary["not_started"], 0);
+
+    let resumed = run_formic_resume("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(resumed.status.code(), Some(0), "{}", stderr_of(&resumed));
+    assert_eq!(
+        fs::read_to_string(results_dir(&out).join("1.md")).unwrap(),
+        FINAL_TEXT
+    );
+    let runs = run_dirs(&out);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[1].file_name().unwrap().to_string_lossy(), "run-000002");
+    let second_summary = run_summary(&runs[1]);
+    assert_summary_identities(&second_summary);
+    assert_eq!(second_summary["published"], 1);
+}
+
+#[test]
+fn failed_unit_can_fail_again_then_succeed_on_a_third_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_many_job(dir.path(), 1, FAIL_TWICE_MARKER);
+    write_request_policy(dir.path(), "[]", 100);
+    let mock = start_mock();
+
+    let first = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(first.status.code(), Some(1), "{}", stderr_of(&first));
+    assert!(!results_dir(&out).join("1.md").exists());
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+
+    let second = run_formic_resume("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(second.status.code(), Some(1), "{}", stderr_of(&second));
+    assert!(!results_dir(&out).join("1.md").exists());
+    assert_eq!(mock.requests.lock().unwrap().len(), 2);
+
+    let third = run_formic_resume("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(third.status.code(), Some(0), "{}", stderr_of(&third));
+    assert_eq!(mock.requests.lock().unwrap().len(), 4);
+    assert_eq!(
+        fs::read_to_string(results_dir(&out).join("1.md")).unwrap(),
+        FINAL_TEXT
+    );
+
+    let runs = run_dirs(&out);
+    assert_eq!(runs.len(), 3);
+    for (index, run) in runs.iter().enumerate() {
+        assert_eq!(
+            run.file_name().unwrap().to_string_lossy(),
+            format!("run-{:06}", index + 1)
+        );
+        assert_summary_identities(&run_summary(run));
+    }
+    assert_eq!(run_summary(&runs[0])["failed"], 1);
+    assert_eq!(run_summary(&runs[1])["failed"], 1);
+    assert_eq!(run_summary(&runs[2])["published"], 1);
+}
+
+#[test]
+fn wrong_structured_resume_is_read_only_and_correct_text_resume_still_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_many_job(dir.path(), 1, FLAKY_MARKER);
+    write_request_policy(dir.path(), "[]", 100);
+    let schema = write_answer_schema(dir.path());
+    let mock = start_mock();
+
+    let first = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(first.status.code(), Some(1), "{}", stderr_of(&first));
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    assert!(!results_dir(&out).join("1.md").exists());
+    let before = output_tree_snapshot(&out);
+
+    let mut wrong = formic_command(1, &data, &plan, &task, &out);
+    let wrong = wrong
+        .arg("--resume")
+        .arg("--output-schema")
+        .arg(&schema)
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env(
+            "FORMIC_LLM_BASE_URL",
+            format!("http://127.0.0.1:{}/v1", mock.port),
+        )
+        .env("FORMIC_LLM_MODEL", "test-model")
+        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .env_remove("FORMIC_LLM_API_KEY")
+        .output()
+        .unwrap();
+
+    assert_eq!(wrong.status.code(), Some(2), "{}", stderr_of(&wrong));
+    assert_eq!(mock.requests.lock().unwrap().len(), 1);
+    assert_eq!(
+        output_tree_snapshot(&out),
+        before,
+        "错误的结构化 resume 不得写 schema、状态或运行档案"
+    );
+    assert!(!results_dir(&out).join("output-schema.json").exists());
+
+    let resumed = run_formic_resume("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(resumed.status.code(), Some(0), "{}", stderr_of(&resumed));
+    assert_eq!(
+        fs::read_to_string(results_dir(&out).join("1.md")).unwrap(),
+        FINAL_TEXT
+    );
+    assert_eq!(run_dirs(&out).len(), 2);
+}
+
+#[test]
+fn resume_rejects_published_result_without_terminal_state_before_any_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_many_job(dir.path(), 1, "NORMAL-UNIT");
+    let mock = start_mock();
+    let first = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr_of(&first));
+    let result_before = fs::read(results_dir(&out).join("1.md")).unwrap();
+    let state_path = out.join(".formic-job-state.jsonl");
+    let state = fs::read_to_string(&state_path).unwrap();
+    let first_line = state.lines().next().unwrap();
+    fs::write(&state_path, format!("{first_line}\n")).unwrap();
+    let request_count = mock.requests.lock().unwrap().len();
+
+    let resumed = run_formic_resume("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(resumed.status.code(), Some(2), "{}", stderr_of(&resumed));
+    assert_eq!(mock.requests.lock().unwrap().len(), request_count);
+    assert_eq!(
+        fs::read(results_dir(&out).join("1.md")).unwrap(),
+        result_before
+    );
+    assert!(stderr_of(&resumed).contains("状态不是 published"));
+    assert_eq!(run_dirs(&out).len(), 1, "请求前失败不建立新 run");
+}
+
+#[test]
+fn resume_rejects_a_damaged_published_result_before_any_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_many_job(dir.path(), 1, "NORMAL-UNIT");
+    let mock = start_mock();
+    let first = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr_of(&first));
+    let result_path = results_dir(&out).join("1.md");
+    fs::write(&result_path, []).unwrap();
+    let damaged = fs::read(&result_path).unwrap();
+    let request_count = mock.requests.lock().unwrap().len();
+
+    let resumed = run_formic_resume("completions", mock.port, 1, &data, &plan, &task, &out);
+
+    assert_eq!(resumed.status.code(), Some(2), "{}", stderr_of(&resumed));
+    assert_eq!(mock.requests.lock().unwrap().len(), request_count);
+    assert_eq!(
+        fs::read(&result_path).unwrap(),
+        damaged,
+        "损坏结果不得被覆盖"
+    );
+    assert!(stderr_of(&resumed).contains("已发布结果"));
+    assert!(stderr_of(&resumed).contains("完成记录为空"));
+    assert_eq!(run_dirs(&out).len(), 1, "请求前失败不建立新 run");
 }
 
 /// 瞬时故障重试成功：首次 500 → 重发 → 正常完成两轮。
@@ -1565,7 +2562,7 @@ fn retry_succeeds_after_transient_failure() {
         stderr_of(&output)
     );
     assert_eq!(
-        fs::read_to_string(out.join("1.md")).unwrap(),
+        fs::read_to_string(results_dir(&out).join("1.md")).unwrap(),
         FINAL_TEXT,
         "产出应为最终回合文本"
     );
@@ -1602,12 +2599,16 @@ fn stalled_unit_is_terminated() {
         stderr_of(&output)
     );
     let stdout = stdout_of(&output);
-    assert!(stdout.contains("失败单元：2"), "{stdout}");
-    assert!(!out.join("2.md").exists(), "停滞单元不得留下记录");
+    assert!(stdout.contains("首个未完成单元 2"), "{stdout}");
+    assert!(
+        !results_dir(&out).join("2.md").exists(),
+        "停滞单元不得留下记录"
+    );
 
-    let stderr = stderr_of(&output);
-    assert!(stderr.contains("单元 2 失败"), "{stderr}");
-    assert!(stderr.contains("停滞"), "诊断应说明停滞原因：{stderr}");
+    assert!(
+        stdout.contains("重复工具调用停滞 1"),
+        "汇总应按原因计数：{stdout}"
+    );
 
     let report = worker_report(&out, 2);
     assert!(
@@ -1817,7 +2818,7 @@ fn summary_follows_plan_order() {
     assert_eq!(output.status.code(), Some(1));
     let stdout = stdout_of(&output);
     assert!(
-        stdout.contains("失败单元：2, 1"),
+        stdout.contains("首个未完成单元 2，样例 2, 1"),
         "失败单元必须按计划文件顺序呈现，与完成时间无关：{stdout}"
     );
 }

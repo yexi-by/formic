@@ -162,10 +162,7 @@ impl super::Transform for Transform {
                         arguments: required_nonempty_string(item, "arguments", payload)?,
                     };
                     if self.tool_call_ids.contains(&tool_call.call_id) {
-                        return Err(LlmError::protocol(
-                            format!("同一回合重复提供工具调用 id {:?}", tool_call.call_id),
-                            payload,
-                        ));
+                        return Err(LlmError::protocol("同一回合重复提供工具调用 id", payload));
                     }
                     Some(tool_call)
                 } else {
@@ -213,12 +210,7 @@ impl super::Transform for Transform {
                 let finish = match v["response"]["incomplete_details"]["reason"].as_str() {
                     Some("max_output_tokens") => Finish::MaxTokens,
                     Some("content_filter") => Finish::Refusal,
-                    other => {
-                        return Err(LlmError::protocol(
-                            format!("响应未完成，原因 {other:?}"),
-                            payload,
-                        ));
-                    }
+                    _ => return Err(LlmError::protocol("响应未完成且原因未知", payload)),
                 };
                 self.terminal = true;
                 Ok(vec![LlmEvent::Finished(finish)])
@@ -508,6 +500,7 @@ mod tests {
             api_key: None,
             context_window_tokens: 131072,
             anthropic_max_tokens: None,
+            ..LlmConfig::test_defaults()
         };
         let history = vec![
             Message::User("任务".into()),
@@ -593,6 +586,7 @@ mod tests {
             api_key: None,
             context_window_tokens: 131072,
             anthropic_max_tokens: None,
+            ..LlmConfig::test_defaults()
         };
         let history = vec![
             Message::User("任务".into()),

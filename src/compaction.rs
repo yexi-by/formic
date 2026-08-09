@@ -9,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ExecutionConfig;
 use crate::llm::{
-    Finish, LlmClient, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq, ToolSpec,
+    Finish, LlmClient, LlmError, LlmEvent, Message, ProviderUsage, RequestObservation, ToolCallReq,
+    ToolSpec,
 };
 use crate::output::{AuditEntry, AuditLog, WorkerState};
 use crate::structured::SUBMIT_RESULT_TOOL;
@@ -28,7 +29,6 @@ pub enum CompactionOutcome {
     Replaced {
         before_tokens: u64,
         after_tokens: u64,
-        calls: Vec<CompactionCallUsage>,
     },
 }
 
@@ -36,12 +36,15 @@ pub enum CompactionOutcome {
 pub struct CompactionCallUsage {
     pub estimated_input_tokens: u64,
     pub provider_usage: ProviderUsage,
+    pub network_retry: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum CompactionError {
     #[error("上下文压缩已取消")]
     Cancelled,
+    #[error("作业已经停止接纳后续模型调用")]
+    Stopped,
     #[error(
         "初始任务、数据分片或冻结工具目录本身已超过上下文安全预算；请减小分片、schema 或启用的工具范围"
     )]
@@ -69,6 +72,8 @@ struct CompactionSubmission {
     remaining_work: Vec<String>,
 }
 
+// 每个参数都是本次压缩的直接事实或结果接收器；装进无职责的字段袋只会隐藏调用契约。
+#[allow(clippy::too_many_arguments)]
 pub async fn compact_if_needed(
     llm: &LlmClient,
     normal_instructions: &str,
@@ -78,6 +83,7 @@ pub async fn compact_if_needed(
     audit: &mut AuditLog,
     cancel: &CancellationToken,
     force: bool,
+    call_usage: &mut Vec<CompactionCallUsage>,
 ) -> Result<CompactionOutcome, CompactionError> {
     let budget = llm.input_budget(execution.context_safety_tokens);
     let before_tokens = llm.estimate_request_tokens(normal_instructions, history, normal_tools);
@@ -146,7 +152,7 @@ pub async fn compact_if_needed(
         return Err(CompactionError::CompactionRequestTooLarge);
     };
 
-    let (submission, calls) = request_compaction(
+    let submission = request_compaction(
         llm,
         compact_history,
         &tools,
@@ -154,6 +160,7 @@ pub async fn compact_if_needed(
         budget,
         audit,
         cancel,
+        call_usage,
     )
     .await?;
     let summary = format!(
@@ -182,7 +189,6 @@ pub async fn compact_if_needed(
     Ok(CompactionOutcome::Replaced {
         before_tokens,
         after_tokens,
-        calls,
     })
 }
 
@@ -279,6 +285,8 @@ fn render_compaction_input(
     output
 }
 
+// 请求策略、预算、审计和调用统计各自拥有独立语义，保持显式参数便于检查重试边界。
+#[allow(clippy::too_many_arguments)]
 async fn request_compaction(
     llm: &LlmClient,
     mut history: Vec<Message>,
@@ -287,103 +295,173 @@ async fn request_compaction(
     budget: u64,
     audit: &mut AuditLog,
     cancel: &CancellationToken,
-) -> Result<(CompactionSubmission, Vec<CompactionCallUsage>), CompactionError> {
+    call_usage: &mut Vec<CompactionCallUsage>,
+) -> Result<CompactionSubmission, CompactionError> {
     let mut last_reason = String::new();
-    let mut call_usage = Vec::new();
-    for attempt in 1..=attempts {
-        let estimated_input_tokens = llm.estimate_request_tokens(INSTRUCTIONS, &history, tools);
-        if estimated_input_tokens > budget {
-            return Err(CompactionError::CompactionRequestTooLarge);
-        }
-        let prepared = llm.prepare_call(INSTRUCTIONS, &history, tools);
-        audit.push_compaction_request(attempt, prepared.body())?;
-        let called = tokio::select! {
-            _ = cancel.cancelled() => return Err(CompactionError::Cancelled),
-            result = llm.send(prepared) => result,
-        };
-        let mut call = match called {
-            Ok(call) => call,
-            Err(error) if retryable(&error) && attempt < attempts => {
+    let mut call_number = 0u32;
+    for correction_attempt in 1..=attempts {
+        let mut failed_network_attempt = 0usize;
+        let mut next_call_is_network_retry = false;
+        loop {
+            let estimated_input_tokens = llm.estimate_request_tokens(INSTRUCTIONS, &history, tools);
+            if estimated_input_tokens > budget {
+                return Err(CompactionError::CompactionRequestTooLarge);
+            }
+            call_number += 1;
+            let prepared = llm.prepare_call(INSTRUCTIONS, &history, tools);
+            audit.push_compaction_request(call_number, prepared.audit_body())?;
+            let observation = RequestObservation::default();
+            let called = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => None,
+                result = llm.send(prepared, &observation) => Some(result),
+            };
+            let usage_index = observation.started().then(|| {
                 call_usage.push(CompactionCallUsage {
                     estimated_input_tokens,
                     provider_usage: ProviderUsage::default(),
+                    network_retry: next_call_is_network_retry,
                 });
-                record_retry(
-                    audit,
-                    attempt,
-                    u64::from(attempt).saturating_mul(1000),
-                    &error.to_string(),
-                )?;
-                tokio::select! {
-                    _ = cancel.cancelled() => return Err(CompactionError::Cancelled),
-                    _ = tokio::time::sleep(std::time::Duration::from_secs(attempt as u64)) => {}
-                }
-                continue;
-            }
-            Err(error) => return Err(CompactionError::Llm(error)),
-        };
-        let mut text = String::new();
-        let mut calls = Vec::new();
-        let mut finish = None;
-        let mut stream_error = None;
-        let mut provider_usage = ProviderUsage::default();
-        loop {
-            let next = tokio::select! {
-                _ = cancel.cancelled() => {
-                    write_call_audit(audit, &mut call)?;
-                    return Err(CompactionError::Cancelled);
-                },
-                result = call.next_event() => result,
+                call_usage.len() - 1
+            });
+            let Some(called) = called else {
+                return Err(CompactionError::Cancelled);
             };
-            match next {
-                Ok(Some(LlmEvent::TextDelta(delta))) => text.push_str(&delta),
-                Ok(Some(LlmEvent::ToolCall(tool_call))) => calls.push(tool_call),
-                Ok(Some(LlmEvent::Usage(usage))) => provider_usage.merge(usage),
-                Ok(Some(LlmEvent::Finished(reason))) => finish = Some(reason),
-                Ok(None) => break,
-                Err(error) => {
-                    stream_error = Some(error);
-                    break;
+            let mut call = match called {
+                Ok(call) => call,
+                Err(error) if error.is_admission_stopped() => {
+                    return Err(CompactionError::Stopped);
+                }
+                Err(error) if error.is_retryable() => {
+                    failed_network_attempt += 1;
+                    if llm.retry_after_too_long(error.retry_after()) {
+                        return Err(CompactionError::Llm(error));
+                    }
+                    if llm.stop_reason().is_some() {
+                        return Err(CompactionError::Stopped);
+                    }
+                    let Some(configured_delay) = llm.retry_delay(failed_network_attempt) else {
+                        llm.stop_retries_exhausted();
+                        return Err(CompactionError::Llm(error));
+                    };
+                    let delay = error
+                        .retry_after()
+                        .map_or(configured_delay, |value| configured_delay.max(value));
+                    record_retry(
+                        audit,
+                        call_number,
+                        u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        &error.to_string(),
+                    )?;
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(CompactionError::Cancelled),
+                        _ = llm.stopped() => return Err(CompactionError::Stopped),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    next_call_is_network_retry = true;
+                    continue;
+                }
+                Err(error) => return Err(CompactionError::Llm(error)),
+            };
+            let mut text = String::new();
+            let mut calls = Vec::new();
+            let mut finish = None;
+            let mut stream_error = None;
+            let mut provider_usage = ProviderUsage::default();
+            loop {
+                let next = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        if let Some(index) = usage_index {
+                            call_usage[index].provider_usage = provider_usage;
+                        }
+                        return Err(CompactionError::Cancelled);
+                    },
+                    result = call.next_event() => result,
+                };
+                match next {
+                    Ok(Some(LlmEvent::TextDelta(delta))) => text.push_str(&delta),
+                    Ok(Some(LlmEvent::ToolCall(tool_call))) => calls.push(tool_call),
+                    Ok(Some(LlmEvent::Usage(usage))) => provider_usage.merge(usage),
+                    Ok(Some(LlmEvent::Finished(reason))) => finish = Some(reason),
+                    Ok(None) => break,
+                    Err(error) => {
+                        stream_error = Some(error);
+                        break;
+                    }
                 }
             }
-        }
-        write_call_audit(audit, &mut call)?;
-        let response_output_items = if finish.is_some() {
-            call.response_output_items().to_vec()
-        } else {
-            Vec::new()
-        };
-        call_usage.push(CompactionCallUsage {
-            estimated_input_tokens,
-            provider_usage,
-        });
-        if let Some(error) = stream_error {
-            if retryable(&error) && attempt < attempts {
-                last_reason = error.to_string();
-                record_retry(audit, attempt, 0, &last_reason)?;
-                continue;
+            let response_output_items = if finish.is_some() {
+                call.response_output_items().to_vec()
+            } else {
+                Vec::new()
+            };
+            if let Some(index) = usage_index {
+                call_usage[index].provider_usage = provider_usage;
             }
-            return Err(CompactionError::Llm(error));
-        }
-        let validation = validate_turn(&text, &calls, finish);
-        match validation {
-            Ok(submission) => return Ok((submission, call_usage)),
-            Err(reason) => {
-                last_reason = reason.clone();
-                audit.push(&AuditEntry::ContextCompaction {
-                    valid: false,
-                    before_tokens: 0,
-                    after_tokens: 0,
-                    reason: reason.clone(),
+            if let Some(error) = stream_error {
+                if error.is_retryable() {
+                    failed_network_attempt += 1;
+                    if llm.retry_after_too_long(error.retry_after()) {
+                        return Err(CompactionError::Llm(error));
+                    }
+                    if llm.stop_reason().is_some() {
+                        return Err(CompactionError::Stopped);
+                    }
+                    let Some(configured_delay) = llm.retry_delay(failed_network_attempt) else {
+                        llm.stop_retries_exhausted();
+                        return Err(CompactionError::Llm(error));
+                    };
+                    let delay = error
+                        .retry_after()
+                        .map_or(configured_delay, |value| configured_delay.max(value));
+                    record_retry(
+                        audit,
+                        call_number,
+                        u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
+                        &error.to_string(),
+                    )?;
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Err(CompactionError::Cancelled),
+                        _ = llm.stopped() => return Err(CompactionError::Stopped),
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    next_call_is_network_retry = true;
+                    continue;
+                }
+                return Err(CompactionError::Llm(error));
+            }
+            let validation = validate_turn(&text, &calls, finish);
+            if matches!(finish, Some(Finish::Stop | Finish::ToolUse)) {
+                audit.push(&AuditEntry::ModelResponse {
+                    finish: if finish == Some(Finish::Stop) {
+                        "stop".into()
+                    } else {
+                        "tool_use".into()
+                    },
+                    text: text.clone(),
+                    tool_calls: calls.len(),
                 })?;
-                if attempt < attempts {
-                    append_compaction_correction(
-                        &mut history,
-                        text,
-                        calls,
-                        response_output_items,
-                        &reason,
-                    );
+            }
+            match validation {
+                Ok(submission) => return Ok(submission),
+                Err(reason) => {
+                    last_reason = reason.clone();
+                    audit.push(&AuditEntry::ContextCompaction {
+                        valid: false,
+                        before_tokens: 0,
+                        after_tokens: 0,
+                        reason: reason.clone(),
+                    })?;
+                    if correction_attempt < attempts {
+                        append_compaction_correction(
+                            &mut history,
+                            text,
+                            calls,
+                            response_output_items,
+                            &reason,
+                        );
+                    }
+                    break;
                 }
             }
         }
@@ -474,18 +552,6 @@ fn append_compaction_correction(
             call_id: call.call_id,
             content: format!("错误：{reason}；请重新提交"),
         });
-    }
-}
-
-fn write_call_audit(audit: &mut AuditLog, call: &mut crate::llm::Call) -> io::Result<()> {
-    audit.push_llm_event_stream(&call.take_audit_snapshot())
-}
-
-fn retryable(error: &LlmError) -> bool {
-    match error {
-        LlmError::Transport(_) | LlmError::Protocol { .. } | LlmError::Timeout { .. } => true,
-        LlmError::Http { status, .. } => *status == 429 || *status >= 500,
-        LlmError::ContextLimit { .. } | LlmError::StreamLimit { .. } => false,
     }
 }
 

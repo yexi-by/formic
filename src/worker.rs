@@ -6,14 +6,14 @@ use std::fmt::{self, Write as _};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{CompactionCallUsage, CompactionError, CompactionOutcome};
 use crate::config::ExecutionConfig;
 use crate::llm::{
-    Finish, LlmClient, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq, ToolSpec,
+    Finish, LlmClient, LlmError, LlmEvent, Message, ProviderUsage, RequestObservation, ToolCallReq,
+    ToolSpec,
 };
 use crate::output::{self, AuditEntry, UnitStats, WorkerState};
 use crate::plan::{PlanUnit, Shard};
@@ -23,16 +23,10 @@ use crate::structured::{OutputContract, SUBMIT_RESULT_TOOL};
 use crate::tokenize;
 use crate::tools::ReadRoot;
 
-/// 第 attempt 次尝试失败后的退避（1 起始）。无实测证据，不引入指数/抖动策略。
-fn backoff(attempt: u32) -> Duration {
-    Duration::from_secs(attempt as u64)
-}
-
 /// 一个作业的运行上下文：全部单元共享的只读事实与依赖。
 pub struct JobContext {
     pub data_root: ReadRoot,
     pub task: Arc<str>,
-    pub listing: Arc<[String]>,
     pub llm: LlmClient,
     pub scheduler: Scheduler,
     pub out_root: output::OutputRoot,
@@ -47,11 +41,11 @@ pub struct JobContext {
     pub instructions: String,
 }
 
-/// 单元结局：发布成功，或被取消（在途丢弃，不算失败）。
+/// 单元结局：发布成功，或因用户取消/全局停发而停止（在途丢弃，不算失败）。
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
     Published,
-    Cancelled,
+    Stopped,
 }
 
 /// 单元失败：带对象与直接原因，细节最终进入 worker 运行档案。
@@ -102,9 +96,49 @@ pub enum UnitFailure {
     Output(#[from] std::io::Error),
 }
 
+impl UnitFailure {
+    fn llm_retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Llm(error) => error.retry_after(),
+            _ => None,
+        }
+    }
+
+    pub fn category(&self) -> &'static str {
+        match self {
+            Self::Llm(LlmError::Http { category, .. }) => match category {
+                crate::llm::ServiceCategory::Authentication => "鉴权失败",
+                crate::llm::ServiceCategory::Authorization => "权限不足",
+                crate::llm::ServiceCategory::Quota => "额度不可用",
+                crate::llm::ServiceCategory::Account => "账户不可用",
+                crate::llm::ServiceCategory::RateLimit => "请求频率受限",
+                crate::llm::ServiceCategory::Server => "供应商服务故障",
+                crate::llm::ServiceCategory::Request => "请求被供应商拒绝",
+            },
+            Self::Llm(LlmError::Transport { .. } | LlmError::Timeout { .. }) => "网络故障",
+            Self::Llm(LlmError::Protocol { .. }) => "协议响应无效",
+            Self::Llm(LlmError::ContextLimit { .. }) => "上下文超限",
+            Self::Llm(LlmError::StreamLimit { .. }) => "响应超过本地上限",
+            Self::Llm(LlmError::AdmissionStopped { .. }) => "请求已停止",
+            Self::RetriesExhausted { .. } => "请求重试耗尽",
+            Self::ReadShard { .. } | Self::ShardEncoding { .. } | Self::ShardTooLarge { .. } => {
+                "输入无效"
+            }
+            Self::Stalled { .. } => "重复工具调用停滞",
+            Self::Truncated | Self::EmptyOutput | Self::Refused => "模型未产出可发布结果",
+            Self::StructuredExhausted { .. } => "结构化输出无效",
+            Self::Compaction(_) => "上下文压缩失败",
+            Self::Scheduler(_) => "工具调度失败",
+            Self::Panicked => "内部故障",
+            Self::Output(_) => "输出写入失败",
+        }
+    }
+}
+
 /// 一次 LLM 调用的失败按可重试性分类。
 enum CallFailure {
     Cancelled,
+    Stopped,
     ContextLimit(UnitFailure),
     Retryable(UnitFailure),
     Fatal(UnitFailure),
@@ -112,13 +146,11 @@ enum CallFailure {
 
 fn classify(failure: UnitFailure) -> CallFailure {
     match failure {
+        UnitFailure::Llm(error) if error.is_admission_stopped() => CallFailure::Stopped,
         UnitFailure::Llm(LlmError::ContextLimit { .. }) => CallFailure::ContextLimit(failure),
         UnitFailure::Llm(LlmError::StreamLimit { .. }) => CallFailure::Fatal(failure),
-        // 429 与 5xx 之外的客户错误属配置/请求问题，重试无意义
-        UnitFailure::Llm(LlmError::Http { status, .. }) if status != 429 && status < 500 => {
-            CallFailure::Fatal(failure)
-        }
-        UnitFailure::Llm(_) => CallFailure::Retryable(failure),
+        UnitFailure::Llm(ref error) if error.is_retryable() => CallFailure::Retryable(failure),
+        UnitFailure::Llm(_) => CallFailure::Fatal(failure),
         other => CallFailure::Fatal(other),
     }
 }
@@ -141,7 +173,6 @@ pub async fn run_unit(
     let planned_shard = unit.shard.clone();
     let read_cancel = cancel.clone();
     let task = Arc::clone(&ctx.task);
-    let listing = Arc::clone(&ctx.listing);
     let input_budget = ctx.llm.input_budget(ctx.execution.context_safety_tokens);
     let empty_history = [Message::User(String::new())];
     let request_base_tokens =
@@ -152,7 +183,6 @@ pub async fn run_unit(
             &root,
             &planned_shard,
             &task,
-            &listing,
             request_base_tokens,
             input_budget,
             &read_cancel,
@@ -161,19 +191,17 @@ pub async fn run_unit(
     let shard_result = tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(ShardReadError::Cancelled),
-        result = reader => result.unwrap_or_else(|_| {
-            Err(ShardReadError::Failure(UnitFailure::Panicked))
-        }),
+        result = reader => result.unwrap_or(Err(ShardReadError::Failure(UnitFailure::Panicked))),
     };
     let user = match shard_result {
         Ok(user) => user,
         Err(ShardReadError::Cancelled) => {
             audit.push(&AuditEntry::State {
-                state: WorkerState::Cancelled,
+                state: WorkerState::Stopped,
                 reason: "读取计划分片时收到取消信号".into(),
             })?;
             audit.finish()?;
-            return Ok(Outcome::Cancelled);
+            return Ok(Outcome::Stopped);
         }
         Err(ShardReadError::Failure(failure)) => {
             audit.push(&AuditEntry::State {
@@ -230,7 +258,7 @@ pub async fn run_unit(
         None
     };
     if matches!(outcome, Ok(LoopEnd::Published(_))) && cancel.is_cancelled() {
-        outcome = Ok(LoopEnd::Cancelled);
+        outcome = Ok(LoopEnd::Stopped);
     }
     crate::metrics::gauge_add(&crate::metrics::HISTORY_BYTES, -meter.tracked);
     match &outcome {
@@ -238,8 +266,8 @@ pub async fn run_unit(
             state: WorkerState::ReadyToPublish,
             reason: "最终结果已经满足当前输出契约".into(),
         })?,
-        Ok(LoopEnd::Cancelled) => audit.push(&AuditEntry::State {
-            state: WorkerState::Cancelled,
+        Ok(LoopEnd::Stopped) => audit.push(&AuditEntry::State {
+            state: WorkerState::Stopped,
             reason: "收到取消信号，丢弃尚未发布的结果".into(),
         })?,
         Err(failure) => audit.push(&AuditEntry::State {
@@ -259,7 +287,7 @@ pub async fn run_unit(
             )?;
             Ok(Outcome::Published)
         }
-        LoopEnd::Cancelled => Ok(Outcome::Cancelled),
+        LoopEnd::Stopped => Ok(Outcome::Stopped),
     }
 }
 
@@ -285,7 +313,7 @@ fn message_size(message: &Message) -> i64 {
 
 enum LoopEnd {
     Published(String),
-    Cancelled,
+    Stopped,
 }
 
 /// 一个单元的计量：内存字节（metrics 观测）、历史 token（估算）、单元统计。
@@ -310,7 +338,8 @@ async fn drive_loop(
     let mut emergency_compacted = false;
 
     loop {
-        match crate::compaction::compact_if_needed(
+        let mut compaction_calls = Vec::new();
+        let compaction = crate::compaction::compact_if_needed(
             &ctx.llm,
             &ctx.instructions,
             &ctx.model_tools,
@@ -319,48 +348,74 @@ async fn drive_loop(
             audit,
             cancel,
             false,
+            &mut compaction_calls,
         )
-        .await
-        {
+        .await;
+        record_compaction_calls(meter, &compaction_calls);
+        match compaction {
             Ok(CompactionOutcome::Unchanged) => {}
             Ok(CompactionOutcome::Replaced {
                 before_tokens,
                 after_tokens,
-                calls,
-            }) => refresh_after_compaction(history, meter, before_tokens, after_tokens, &calls),
-            Err(CompactionError::Cancelled) => {
-                return Ok(LoopEnd::Cancelled);
+            }) => refresh_after_compaction(history, meter, before_tokens, after_tokens),
+            Err(CompactionError::Cancelled | CompactionError::Stopped) => {
+                return Ok(LoopEnd::Stopped);
             }
             Err(error) => return Err(error.into()),
         }
-        // 单次 LLM 调用 + 重试预算：同一历史重发，每次尝试独立留痕
-        let mut attempt = 0u32;
+        // 网络重试只由 LLM 请求策略控制，不消耗模型结构修正预算。
+        let mut call_number = 0u32;
+        let mut failed_network_attempts = 0usize;
+        let mut next_call_is_network_retry = false;
         let turn = loop {
-            attempt += 1;
-            meter.stats.llm_calls += 1;
+            call_number += 1;
             let request_tokens =
                 ctx.llm
                     .estimate_request_tokens(&ctx.instructions, history, &ctx.model_tools);
-            meter.stats.input_tokens += request_tokens;
-            if attempt > 1 {
-                meter.stats.retries += 1;
-            }
             audit.push(&AuditEntry::State {
                 state: WorkerState::RequestingModel,
                 reason: format!(
-                    "第 {attempt} 次尝试，消息 {} 条，完整请求估算 {request_tokens} token",
+                    "第 {call_number} 次模型调用，消息 {} 条，完整请求估算 {request_tokens} token",
                     history.len()
                 ),
             })?;
-            match one_turn(ctx, history, audit, attempt, cancel).await {
+            let observation = RequestObservation::default();
+            let mut provider_usage = ProviderUsage::default();
+            let result = one_turn(
+                ctx,
+                history,
+                audit,
+                call_number,
+                cancel,
+                &observation,
+                &mut provider_usage,
+            )
+            .await;
+            if observation.started() {
+                meter.stats.llm_calls += 1;
+                meter.stats.input_tokens += request_tokens;
+                meter.stats.record_provider_usage(&provider_usage);
+                if next_call_is_network_retry {
+                    meter.stats.retries += 1;
+                }
+                next_call_is_network_retry = false;
+            }
+            match result {
                 Ok(turn) => break turn,
-                Err(CallFailure::Cancelled) => return Ok(LoopEnd::Cancelled),
+                Err(CallFailure::Cancelled | CallFailure::Stopped) => {
+                    return Ok(LoopEnd::Stopped);
+                }
                 Err(CallFailure::ContextLimit(failure)) => {
+                    // 已经收到并分类出有效的服务响应，之前的网络故障不再连续。
+                    // 本次调用开始时也已消费 network_retry 标记；压缩后的下一次
+                    // 网络故障必须重新使用第一档重试等待。
+                    failed_network_attempts = 0;
                     if emergency_compacted {
                         return Err(failure);
                     }
                     emergency_compacted = true;
-                    match crate::compaction::compact_if_needed(
+                    let mut compaction_calls = Vec::new();
+                    let compaction = crate::compaction::compact_if_needed(
                         &ctx.llm,
                         &ctx.instructions,
                         &ctx.model_tools,
@@ -369,25 +424,20 @@ async fn drive_loop(
                         audit,
                         cancel,
                         true,
+                        &mut compaction_calls,
                     )
-                    .await
-                    {
+                    .await;
+                    record_compaction_calls(meter, &compaction_calls);
+                    match compaction {
                         Ok(CompactionOutcome::Replaced {
                             before_tokens,
                             after_tokens,
-                            calls,
                         }) => {
-                            refresh_after_compaction(
-                                history,
-                                meter,
-                                before_tokens,
-                                after_tokens,
-                                &calls,
-                            );
+                            refresh_after_compaction(history, meter, before_tokens, after_tokens);
                             continue;
                         }
-                        Err(CompactionError::Cancelled) => {
-                            return Ok(LoopEnd::Cancelled);
+                        Err(CompactionError::Cancelled | CompactionError::Stopped) => {
+                            return Ok(LoopEnd::Stopped);
                         }
                         Ok(CompactionOutcome::Unchanged) => return Err(failure),
                         Err(error) => return Err(error.into()),
@@ -395,33 +445,44 @@ async fn drive_loop(
                 }
                 Err(CallFailure::Fatal(f)) => return Err(f),
                 Err(CallFailure::Retryable(f)) => {
-                    if attempt >= ctx.execution.llm_attempts {
+                    failed_network_attempts += 1;
+                    if ctx.llm.retry_after_too_long(f.llm_retry_after()) {
+                        return Err(f);
+                    }
+                    if ctx.llm.stop_reason().is_some() {
+                        return Ok(LoopEnd::Stopped);
+                    }
+                    let Some(configured_delay) = ctx.llm.retry_delay(failed_network_attempts)
+                    else {
+                        ctx.llm.stop_retries_exhausted();
                         return Err(UnitFailure::RetriesExhausted {
-                            retries: attempt - 1,
+                            retries: u32::try_from(failed_network_attempts.saturating_sub(1))
+                                .unwrap_or(u32::MAX),
                             cause: Box::new(f),
                         });
-                    }
-                    let delay = backoff(attempt);
+                    };
+                    let delay = f.llm_retry_after().map_or(configured_delay, |retry_after| {
+                        configured_delay.max(retry_after)
+                    });
                     audit.push(&AuditEntry::Retry {
-                        attempt,
-                        next_attempt: attempt + 1,
+                        attempt: call_number,
+                        next_attempt: call_number + 1,
                         delay_ms: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
                         reason: f.to_string(),
                     })?;
                     audit.push(&AuditEntry::State {
                         state: WorkerState::RetryingModel,
-                        reason: format!("第 {attempt} 次模型调用失败，等待后重试：{f}"),
+                        reason: format!("第 {call_number} 次模型请求失败，等待后重试：{f}"),
                     })?;
-                    eprintln!("第 {attempt} 次调用失败（{f}），退避后重试");
                     tokio::select! {
-                        _ = cancel.cancelled() => return Ok(LoopEnd::Cancelled),
+                        _ = cancel.cancelled() => return Ok(LoopEnd::Stopped),
+                        _ = ctx.llm.stopped() => return Ok(LoopEnd::Stopped),
                         _ = tokio::time::sleep(delay) => {}
                     }
+                    next_call_is_network_retry = true;
                 }
             }
         };
-        let (turn, usage) = turn;
-        meter.stats.record_provider_usage(&usage);
         meter.stats.turns += 1;
         audit.push(&AuditEntry::State {
             state: WorkerState::InterpretingModel,
@@ -612,7 +673,7 @@ async fn drive_loop(
                             reason: format!("工具 {} 已进入调度器，等待准入和执行", tc.name),
                         })?;
                         tokio::select! {
-                            _ = cancel.cancelled() => return Ok(LoopEnd::Cancelled),
+                            _ = cancel.cancelled() => return Ok(LoopEnd::Stopped),
                             result = ctx.scheduler.execute(unit, &tc.name, prepared.arguments, cancel.clone()) => result?,
                         }
                     };
@@ -688,7 +749,6 @@ fn refresh_after_compaction(
     meter: &mut Metering<'_>,
     before_tokens: u64,
     after_tokens: u64,
-    calls: &[CompactionCallUsage],
 ) {
     let new_tracked: i64 = history.iter().map(message_size).sum();
     crate::metrics::gauge_add(
@@ -700,10 +760,16 @@ fn refresh_after_compaction(
     meter.stats.compactions += 1;
     meter.stats.compaction_before_tokens += before_tokens;
     meter.stats.compaction_after_tokens += after_tokens;
+}
+
+fn record_compaction_calls(meter: &mut Metering<'_>, calls: &[CompactionCallUsage]) {
     for call in calls {
         meter.stats.llm_calls += 1;
         meter.stats.input_tokens += call.estimated_input_tokens;
         meter.stats.record_provider_usage(&call.provider_usage);
+        if call.network_retry {
+            meter.stats.retries += 1;
+        }
     }
 }
 
@@ -734,23 +800,25 @@ async fn one_turn(
     audit: &mut output::AuditLog,
     attempt: u32,
     cancel: &CancellationToken,
-) -> Result<(TurnEnd, ProviderUsage), CallFailure> {
+    observation: &RequestObservation,
+    provider_usage: &mut ProviderUsage,
+) -> Result<TurnEnd, CallFailure> {
     let prepared = ctx
         .llm
         .prepare_call(&ctx.instructions, history, &ctx.model_tools);
     audit
-        .push_llm_request(attempt, prepared.body())
+        .push_llm_request(attempt, prepared.audit_body())
         .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
     let mut call = tokio::select! {
+        biased;
         _ = cancel.cancelled() => return Err(CallFailure::Cancelled),
-        r = ctx.llm.send(prepared) => r,
+        r = ctx.llm.send(prepared, observation) => r,
     }
     .map_err(|e| classify(e.into()))?;
 
     let mut text = String::new();
     let mut tool_calls: Vec<ToolCallReq> = Vec::new();
     let mut finish = None;
-    let mut usage = ProviderUsage::default();
     loop {
         let next = tokio::select! {
             biased;
@@ -758,31 +826,17 @@ async fn one_turn(
             r = call.next_event() => Some(r),
         };
         let Some(next) = next else {
-            let snapshot = call.take_audit_snapshot();
-            audit
-                .push_llm_event_stream(&snapshot)
-                .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
             return Err(CallFailure::Cancelled);
         };
         match next {
             Ok(Some(LlmEvent::TextDelta(delta))) => text.push_str(&delta),
             Ok(Some(LlmEvent::ToolCall(tc))) => tool_calls.push(tc),
-            Ok(Some(LlmEvent::Usage(update))) => usage.merge(update),
+            Ok(Some(LlmEvent::Usage(update))) => provider_usage.merge(update),
             Ok(Some(LlmEvent::Finished(f))) => finish = Some(f),
             Ok(None) => break,
-            Err(e) => {
-                let snapshot = call.take_audit_snapshot();
-                audit
-                    .push_llm_event_stream(&snapshot)
-                    .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
-                return Err(classify(e.into()));
-            }
+            Err(e) => return Err(classify(e.into())),
         }
     }
-    let snapshot = call.take_audit_snapshot();
-    audit
-        .push_llm_event_stream(&snapshot)
-        .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
     let response_output_items = call.response_output_items().to_vec();
 
     if finish == Some(Finish::MaxTokens) {
@@ -797,30 +851,44 @@ async fn one_turn(
                 if text.is_empty() && !ctx.output_contract.is_structured() {
                     Err(CallFailure::Fatal(UnitFailure::EmptyOutput))
                 } else {
-                    Ok((
-                        TurnEnd::FinalText {
-                            text,
-                            response_output_items,
-                        },
-                        usage,
-                    ))
+                    audit
+                        .push(&AuditEntry::ModelResponse {
+                            finish: "stop".into(),
+                            text: text.clone(),
+                            tool_calls: 0,
+                        })
+                        .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
+                    Ok(TurnEnd::FinalText {
+                        text,
+                        response_output_items,
+                    })
                 }
             }
-            Some(Finish::ToolUse) => Err(CallFailure::Retryable(UnitFailure::Llm(
-                LlmError::protocol("finish 声称工具调用但没有工具调用内容", ""),
-            ))),
+            Some(Finish::ToolUse) => Err(classify(UnitFailure::Llm(LlmError::protocol(
+                "finish 声称工具调用但没有工具调用内容",
+                "",
+            )))),
             // MaxTokens 已在上面返回
-            _ => Err(CallFailure::Retryable(UnitFailure::Llm(
-                LlmError::protocol("流结束但没有收到完成事件", ""),
-            ))),
+            _ => Err(classify(UnitFailure::Llm(LlmError::protocol(
+                "流结束但没有收到完成事件",
+                "",
+            )))),
         };
     }
 
     if finish != Some(Finish::ToolUse) {
-        return Err(CallFailure::Retryable(UnitFailure::Llm(
-            LlmError::protocol("收到工具调用内容，但没有收到明确的工具调用完成事件", ""),
-        )));
+        return Err(classify(UnitFailure::Llm(LlmError::protocol(
+            "收到工具调用内容，但没有收到明确的工具调用完成事件",
+            "",
+        ))));
     }
+    audit
+        .push(&AuditEntry::ModelResponse {
+            finish: "tool_use".into(),
+            text: text.clone(),
+            tool_calls: tool_calls.len(),
+        })
+        .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
 
     // 参数在 LLM 边界只解析一次。非法 JSON 以合成工具结果回注，历史中使用合法空 object。
     let mut calls = Vec::with_capacity(tool_calls.len());
@@ -843,14 +911,11 @@ async fn one_turn(
             argument_error,
         });
     }
-    Ok((
-        TurnEnd::ToolCalls {
-            text,
-            calls,
-            response_output_items,
-        },
-        usage,
-    ))
+    Ok(TurnEnd::ToolCalls {
+        text,
+        calls,
+        response_output_items,
+    })
 }
 
 #[derive(Debug)]
@@ -863,13 +928,12 @@ fn read_shard(
     root: &ReadRoot,
     shard: &Shard,
     task: &str,
-    listing: &[String],
     request_base_tokens: u64,
     input_budget: u64,
     cancel: &CancellationToken,
 ) -> Result<String, ShardReadError> {
     let mut message = InitialMessageBuilder::new(request_base_tokens, input_budget)?;
-    if prompt::write_user_prefix(&mut message, task, listing).is_err() {
+    if prompt::write_user_prefix(&mut message, task).is_err() {
         return Err(message.too_large());
     }
     match shard {
@@ -996,14 +1060,6 @@ fn shard_read_error(path: &Path, error: io::Error) -> ShardReadError {
     }
 }
 
-/// 递归列出数据根内全部文件，返回排序后的根内相对表示（`/` 分隔）。
-pub fn list_files(root: &ReadRoot) -> std::io::Result<Vec<String>> {
-    Ok(crate::tools::walk_files(root)?
-        .iter()
-        .map(|p| prompt::slash_path(p))
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,6 +1070,7 @@ mod tests {
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     /// 迷你一次性应答 server：Slow 长时间不响应；Status(code) 以固定状态码应答。
     /// 返回端口与请求计数。
@@ -1147,7 +1204,6 @@ mod tests {
             scheduler,
             data_root: ReadRoot::open(data).unwrap(),
             task: "任务。".into(),
-            listing: vec!["a.txt".into()].into(),
             llm: LlmClient::new(LlmConfig {
                 protocol: Protocol::Completions,
                 base_url: format!("http://127.0.0.1:{port}"),
@@ -1155,11 +1211,13 @@ mod tests {
                 api_key: None,
                 context_window_tokens: 131072,
                 anthropic_max_tokens: None,
+                ..LlmConfig::test_defaults()
             }),
             out_root,
             output_contract: OutputContract::Text,
             execution: ExecutionConfig {
                 llm_attempts: 3,
+                max_concurrent_units: 4,
                 identical_tool_call_limit: 3,
                 context_safety_tokens: 4096,
             },
@@ -1193,7 +1251,6 @@ mod tests {
             &root,
             &shard,
             "任务。",
-            &["range.txt".into()],
             0,
             u64::MAX,
             &CancellationToken::new(),
@@ -1211,12 +1268,10 @@ mod tests {
         let read_root = ReadRoot::open(root.to_path_buf()).unwrap();
         let shard = Shard::Files(vec!["a.txt".into(), "b.txt".into()]);
         let task = "任务。\n";
-        let listing = vec!["a.txt".into(), "b.txt".into()];
         let actual = read_shard(
             &read_root,
             &shard,
             task,
-            &listing,
             0,
             u64::MAX,
             &CancellationToken::new(),
@@ -1224,7 +1279,6 @@ mod tests {
         .unwrap();
         let expected = prompt::build_user_message(
             task,
-            &listing,
             &crate::prompt::ShardContent::Files(vec![
                 ("a.txt".into(), "alpha\n\n".into()),
                 ("b.txt".into(), "beta\r\n".into()),
@@ -1245,7 +1299,6 @@ mod tests {
             &read_root,
             &shard,
             "任务。",
-            &["a.txt".into(), "b.txt".into()],
             0,
             1_000,
             &CancellationToken::new(),
@@ -1276,7 +1329,7 @@ mod tests {
         let outcome = run_unit(&ctx, &unit(), token, &mut UnitStats::default())
             .await
             .unwrap();
-        assert_eq!(outcome, Outcome::Cancelled);
+        assert_eq!(outcome, Outcome::Stopped);
         assert!(
             !dir.path().join("out").join("1.md").exists(),
             "取消单元不得留下记录"
@@ -1310,10 +1363,10 @@ mod tests {
         drop(publish_guard);
 
         let outcome = worker.await.unwrap().unwrap();
-        assert_eq!(outcome, Outcome::Cancelled);
+        assert_eq!(outcome, Outcome::Stopped);
         assert!(!dir.path().join("out/1.md").exists());
         let audit = fs::read_to_string(ctx.worker_run.audit_path(1)).unwrap();
-        assert!(audit.contains("\"state\":\"cancelled\""), "{audit}");
+        assert!(audit.contains("\"state\":\"stopped\""), "{audit}");
     }
 
     #[tokio::test]
@@ -1328,14 +1381,26 @@ mod tests {
             api_key: None,
             context_window_tokens: 131072,
             anthropic_max_tokens: None,
+            ..LlmConfig::test_defaults()
         });
         let mut audit = output::AuditLog::create(&ctx.worker_run, 1).unwrap();
         let history = vec![Message::User("任务".into())];
-        let result = one_turn(&ctx, &history, &mut audit, 1, &CancellationToken::new()).await;
+        let observation = RequestObservation::default();
+        let mut usage = ProviderUsage::default();
+        let result = one_turn(
+            &ctx,
+            &history,
+            &mut audit,
+            1,
+            &CancellationToken::new(),
+            &observation,
+            &mut usage,
+        )
+        .await;
         assert!(
             matches!(
                 result,
-                Err(CallFailure::Retryable(UnitFailure::Llm(
+                Err(CallFailure::Fatal(UnitFailure::Llm(
                     LlmError::Protocol { .. }
                 )))
             ),
@@ -1355,13 +1420,24 @@ mod tests {
         let (_dir, ctx) = fixture(port);
         let mut audit = output::AuditLog::create(&ctx.worker_run, 1).unwrap();
         let history = vec![Message::User("任务".into())];
+        let observation = RequestObservation::default();
+        let mut usage = ProviderUsage::default();
 
-        let result = one_turn(&ctx, &history, &mut audit, 1, &CancellationToken::new()).await;
+        let result = one_turn(
+            &ctx,
+            &history,
+            &mut audit,
+            1,
+            &CancellationToken::new(),
+            &observation,
+            &mut usage,
+        )
+        .await;
 
         assert!(
             matches!(
                 result,
-                Err(CallFailure::Retryable(UnitFailure::Llm(
+                Err(CallFailure::Fatal(UnitFailure::Llm(
                     LlmError::Protocol { .. }
                 )))
             ),
@@ -1369,11 +1445,14 @@ mod tests {
         );
         let report = audit.finish().unwrap();
         let text = fs::read_to_string(report).unwrap();
-        assert!(text.contains("call_1"), "违规帧仍须进入原始审计：{text}");
+        assert!(
+            !text.contains("call_1"),
+            "协议错误 payload 不得进入运行档案：{text}"
+        );
     }
 
     #[tokio::test]
-    async fn cancellation_persists_sse_received_before_the_signal() {
+    async fn cancellation_discards_sse_received_before_the_signal() {
         const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"partial-before-cancel\"},\"finish_reason\":null}]}\n\n";
         let (port, _count) = mini_server(Mode::SseThenSlow(BODY));
         let (_dir, ctx) = fixture(port);
@@ -1385,15 +1464,26 @@ mod tests {
         });
         let mut audit = output::AuditLog::create(&ctx.worker_run, 1).unwrap();
         let history = vec![Message::User("任务".into())];
-        let result = one_turn(&ctx, &history, &mut audit, 1, &token).await;
+        let observation = RequestObservation::default();
+        let mut usage = ProviderUsage::default();
+        let result = one_turn(
+            &ctx,
+            &history,
+            &mut audit,
+            1,
+            &token,
+            &observation,
+            &mut usage,
+        )
+        .await;
         assert!(matches!(result, Err(CallFailure::Cancelled)));
         let report = audit.finish().unwrap();
         let text = fs::read_to_string(report).unwrap();
-        assert!(text.contains("partial-before-cancel"), "{text}");
+        assert!(!text.contains("partial-before-cancel"), "{text}");
     }
 
     #[tokio::test]
-    async fn cancellation_persists_an_incomplete_sse_frame() {
+    async fn cancellation_discards_an_incomplete_sse_frame() {
         const BODY: &str =
             "data: {\"choices\":[{\"delta\":{\"content\":\"partial-without-delimiter\"}";
         let (port, _count) = mini_server(Mode::SseThenSlow(BODY));
@@ -1406,25 +1496,64 @@ mod tests {
         });
         let mut audit = output::AuditLog::create(&ctx.worker_run, 1).unwrap();
         let history = vec![Message::User("任务".into())];
+        let observation = RequestObservation::default();
+        let mut usage = ProviderUsage::default();
 
-        let result = one_turn(&ctx, &history, &mut audit, 1, &token).await;
+        let result = one_turn(
+            &ctx,
+            &history,
+            &mut audit,
+            1,
+            &token,
+            &observation,
+            &mut usage,
+        )
+        .await;
 
         assert!(matches!(result, Err(CallFailure::Cancelled)));
         let report = audit.finish().unwrap();
-        let entries: Vec<serde_json::Value> = fs::read_to_string(report)
-            .unwrap()
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        let marker = entries
-            .iter()
-            .filter(|entry| entry["direction"] == "llm_event_data")
-            .filter_map(|entry| entry["data"].as_str())
-            .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
-            .find(|value| value["formic_audit_kind"] == "incomplete_sse_frame")
-            .expect("取消时必须保存未闭合 SSE 半帧");
-        assert_eq!(marker["encoding"], "utf-8");
-        assert_eq!(marker["byte_length"], BODY.len());
+        let text = fs::read_to_string(report).unwrap();
+        assert!(!text.contains("partial-without-delimiter"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_send_does_not_count_an_llm_call() {
+        let (port, count) = mini_server(Mode::Status(500));
+        let (_dir, ctx) = fixture(port);
+        let token = CancellationToken::new();
+        token.cancel();
+        let mut stats = UnitStats::default();
+
+        let outcome = run_unit(&ctx, &unit(), token, &mut stats).await.unwrap();
+
+        assert_eq!(outcome, Outcome::Stopped);
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(stats.llm_calls, 0);
+        assert_eq!(stats.llm_calls_with_provider_usage, 0);
+        assert_eq!(stats.llm_calls_without_provider_usage, 0);
+    }
+
+    #[tokio::test]
+    async fn audit_creation_failure_does_not_count_an_llm_call() {
+        let (port, count) = mini_server(Mode::Status(500));
+        let (_dir, ctx) = fixture(port);
+        let workers = ctx
+            .worker_run
+            .report_path(1)
+            .parent()
+            .expect("worker 报告有父目录")
+            .to_path_buf();
+        fs::remove_dir(&workers).unwrap();
+        fs::write(&workers, b"not a directory").unwrap();
+        let mut stats = UnitStats::default();
+
+        let result = run_unit(&ctx, &unit(), CancellationToken::new(), &mut stats).await;
+
+        assert!(matches!(result, Err(UnitFailure::Output(_))));
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        assert_eq!(stats.llm_calls, 0);
+        assert_eq!(stats.llm_calls_with_provider_usage, 0);
+        assert_eq!(stats.llm_calls_without_provider_usage, 0);
     }
 
     #[tokio::test]
@@ -1465,11 +1594,11 @@ mod tests {
         };
         let text = failure.to_string();
         assert!(text.contains("500"), "{text}");
-        assert!(text.contains("重试 2 次"), "{text}");
+        assert!(text.contains("重试 1 次"), "{text}");
         assert_eq!(
             count.load(Ordering::SeqCst),
-            ctx.execution.llm_attempts as usize,
-            "500 应尝试到预算上限"
+            2,
+            "500 应使用独立的网络重试预算"
         );
     }
 }

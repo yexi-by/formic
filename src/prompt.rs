@@ -1,7 +1,7 @@
 //! worker 输入装配：instructions 静态文本 + 用户消息。
 //!
-//! 不变量：同一作业内全部单元的 instructions、任务说明与数据集文件清单前缀
-//! 字节一致，分片内容与定位永远在消息末尾——这是 prompt cache 跨单元命中的前提。
+//! 不变量：同一作业内全部单元的 instructions 与任务说明前缀字节一致，当前分片
+//! 的文件名、内容与定位永远在消息末尾——这是 prompt cache 跨单元命中的前提。
 //! Formic 对任务说明只做机械搬运，不理解其中的自然语言。
 
 use std::fmt;
@@ -51,19 +51,13 @@ pub enum ShardContent {
     },
 }
 
-/// 写入任务说明、文件清单和分片标题。调用方可在每次 write 时实施预算。
-pub(crate) fn write_user_prefix(
-    output: &mut impl fmt::Write,
-    task: &str,
-    listing: &[String],
-) -> fmt::Result {
+/// 写入任务说明和分片标题。完整 input 根可以通过只读工具搜索，不在每个 prompt
+/// 中重复整份文件清单。调用方可在每次 write 时实施预算。
+pub(crate) fn write_user_prefix(output: &mut impl fmt::Write, task: &str) -> fmt::Result {
     output.write_str(task.trim_end_matches('\n'))?;
-    output.write_str("\n\n# 数据集文件清单\n")?;
-    for file in listing {
-        output.write_str(file)?;
-        output.write_char('\n')?;
-    }
-    output.write_str("\n# 你的分片\n")
+    output.write_str(
+        "\n\n完整 input 根可通过只读 search/read 工具按需检索；不要主动扩大当前分片。\n\n# 你的分片\n",
+    )
 }
 
 pub(crate) fn write_file_header(
@@ -86,11 +80,11 @@ pub(crate) fn write_line_header(
     writeln!(output, "## 文件 {file} 第 {start}-{end} 行")
 }
 
-/// 装配用户消息：任务说明原文 + 数据集文件清单 + 分片内容与定位。
+/// 装配用户消息：任务说明原文 + 当前单元的分片内容与自然位置。
 #[cfg(test)]
-pub fn build_user_message(task: &str, listing: &[String], shard: &ShardContent) -> String {
+pub fn build_user_message(task: &str, shard: &ShardContent) -> String {
     let mut msg = String::new();
-    write_user_prefix(&mut msg, task, listing).expect("String 写入不会失败");
+    write_user_prefix(&mut msg, task).expect("String 写入不会失败");
     match shard {
         ShardContent::Files(files) => {
             for (i, (path, content)) in files.iter().enumerate() {
@@ -127,10 +121,6 @@ mod tests {
 
     const TASK: &str = "判断分片内容，给出结论。";
 
-    fn listing() -> Vec<String> {
-        vec!["a.txt".into(), "dir/b.txt".into()]
-    }
-
     #[test]
     fn shared_prefix_is_byte_identical_across_units() {
         let shard1 = ShardContent::Files(vec![("a.txt".into(), "内容甲".into())]);
@@ -140,8 +130,8 @@ mod tests {
             end: 9,
             content: "内容乙".into(),
         };
-        let m1 = build_user_message(TASK, &listing(), &shard1);
-        let m2 = build_user_message(TASK, &listing(), &shard2);
+        let m1 = build_user_message(TASK, &shard1);
+        let m2 = build_user_message(TASK, &shard2);
         let prefix_len = m1.find("# 你的分片").unwrap();
         assert!(m2.len() > prefix_len);
         assert_eq!(
@@ -156,17 +146,17 @@ mod tests {
     #[test]
     fn shard_is_at_message_end() {
         let shard = ShardContent::Files(vec![("a.txt".into(), "尾巴内容".into())]);
-        let m = build_user_message(TASK, &listing(), &shard);
+        let m = build_user_message(TASK, &shard);
         assert!(m.trim_end().ends_with("尾巴内容"), "分片内容在消息末尾");
     }
 
     #[test]
-    fn listing_is_in_prefix() {
+    fn complete_input_is_searchable_without_repeating_its_file_list() {
         let shard = ShardContent::Files(vec![("a.txt".into(), "x".into())]);
-        let m = build_user_message(TASK, &listing(), &shard);
+        let m = build_user_message(TASK, &shard);
         let prefix = &m[..m.find("# 你的分片").unwrap()];
-        assert!(prefix.contains("a.txt"));
-        assert!(prefix.contains("dir/b.txt"));
+        assert!(prefix.contains("完整 input 根"));
+        assert!(!prefix.contains("dir/b.txt"));
     }
 
     #[test]
@@ -177,7 +167,7 @@ mod tests {
             end: 200,
             content: "切片".into(),
         };
-        let m = build_user_message(TASK, &listing(), &shard);
+        let m = build_user_message(TASK, &shard);
         assert!(m.contains("第 100-200 行"), "行区间定位进入消息");
     }
 

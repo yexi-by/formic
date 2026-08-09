@@ -361,6 +361,8 @@ impl InFlightTracker {
     }
 }
 
+// 调度入口显式接收已经解析的调用事实与四个独立能力，避免建立无语义的参数字段袋。
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     _unit: u64,
     name: &str,

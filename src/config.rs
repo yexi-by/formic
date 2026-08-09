@@ -1,4 +1,4 @@
-//! 作业启动配置：只读取当前工作目录的 `config.toml`，并在边界上完成默认值、
+//! 作业启动配置：读取调用方明确指定的 `config.toml`，并在边界上完成默认值、
 //! 环境变量覆盖、外部服务密钥解析和全部资源参数校验。
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,8 +14,14 @@ use crate::llm::{LlmConfig, Protocol};
 
 const CONFIG_FILE: &str = "config.toml";
 const DEFAULT_LLM_ATTEMPTS: u32 = 5;
+const DEFAULT_MAX_CONCURRENT_UNITS: usize = 64;
 const DEFAULT_IDENTICAL_TOOL_CALL_LIMIT: u32 = 16;
 const DEFAULT_CONTEXT_SAFETY_TOKENS: u64 = 2048;
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 30_000;
+const DEFAULT_READ_TIMEOUT_MS: u64 = 600_000;
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 1_800_000;
+const DEFAULT_RETRY_DELAYS_MS: &[u64] = &[1_000, 2_000, 5_000];
+const DEFAULT_MAX_RETRY_AFTER_MS: u64 = 60_000;
 const DEFAULT_MAX_RESULT_BYTES: usize = 1024 * 1024;
 const DEFAULT_MAX_IN_FLIGHT: usize = 64;
 const DEFAULT_MAX_MATCHES: usize = 1000;
@@ -37,6 +43,7 @@ pub struct AppConfig {
 #[derive(Debug, Clone)]
 pub struct ExecutionConfig {
     pub llm_attempts: u32,
+    pub max_concurrent_units: usize,
     pub identical_tool_call_limit: u32,
     pub context_safety_tokens: u64,
 }
@@ -118,6 +125,12 @@ struct FileConfig {
     context_window_tokens: Option<u64>,
     /// Anthropic Messages 协议要求的必填参数；其他协议不得配置。
     anthropic_max_tokens: Option<u64>,
+    connect_timeout_ms: Option<u64>,
+    read_timeout_ms: Option<u64>,
+    request_timeout_ms: Option<u64>,
+    retry_delays_ms: Option<Vec<u64>>,
+    max_retry_after_ms: Option<u64>,
+    requests_per_minute: Option<u32>,
     execution: FileExecutionConfig,
     tools: FileToolsConfig,
     cache: FileCacheConfig,
@@ -128,6 +141,7 @@ struct FileConfig {
 #[serde(default, deny_unknown_fields)]
 struct FileExecutionConfig {
     llm_attempts: Option<u32>,
+    max_concurrent_units: Option<usize>,
     identical_tool_call_limit: Option<u32>,
     context_safety_tokens: Option<u64>,
 }
@@ -235,6 +249,8 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("指定的配置文件 {0} 不存在")]
+    MissingFile(PathBuf),
     #[error("配置文件 {path} 不是有效配置：请检查 TOML 语法、字段名和字段类型")]
     Parse { path: PathBuf },
     #[error(
@@ -259,19 +275,25 @@ pub enum ConfigError {
     Invalid(String),
 }
 
-/// 只读取当前工作目录下的固定文件名，不接受外部路径。
-pub fn load() -> Result<AppConfig, ConfigError> {
-    load_from_with(Path::new(CONFIG_FILE), |name| env::var(name).ok())
+/// 显式配置路径必须存在；省略路径时读取当前目录的 `config.toml`，默认文件不存在则
+/// 允许完全由环境变量提供 LLM 身份。环境变量只覆盖 LLM 身份与模型容量字段。
+pub fn load(path: Option<&Path>) -> Result<AppConfig, ConfigError> {
+    let (path, required) = path.map_or((Path::new(CONFIG_FILE), false), |path| (path, true));
+    load_from_with(path, required, |name| env::var(name).ok())
 }
 
 fn load_from_with(
     path: &Path,
+    required: bool,
     get_env: impl Fn(&str) -> Option<String>,
 ) -> Result<AppConfig, ConfigError> {
     let file = match fs::read_to_string(path) {
         Ok(contents) => toml::from_str(&contents).map_err(|_| ConfigError::Parse {
             path: path.to_path_buf(),
         })?,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound && required => {
+            return Err(ConfigError::MissingFile(path.to_path_buf()));
+        }
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => FileConfig::default(),
         Err(source) => {
             return Err(ConfigError::Read {
@@ -323,6 +345,11 @@ fn resolve(
             file.execution.llm_attempts,
             DEFAULT_LLM_ATTEMPTS,
             "execution.llm_attempts",
+        )?,
+        max_concurrent_units: positive_or(
+            file.execution.max_concurrent_units,
+            DEFAULT_MAX_CONCURRENT_UNITS,
+            "execution.max_concurrent_units",
         )?,
         identical_tool_call_limit: positive_or(
             file.execution.identical_tool_call_limit,
@@ -425,6 +452,31 @@ fn resolve(
             api_key: env_value("FORMIC_LLM_API_KEY").or_else(|| non_empty(file.api_key)),
             context_window_tokens,
             anthropic_max_tokens,
+            connect_timeout: Duration::from_millis(positive_or(
+                file.connect_timeout_ms,
+                DEFAULT_CONNECT_TIMEOUT_MS,
+                "connect_timeout_ms",
+            )?),
+            read_timeout: Duration::from_millis(positive_or(
+                file.read_timeout_ms,
+                DEFAULT_READ_TIMEOUT_MS,
+                "read_timeout_ms",
+            )?),
+            request_timeout: Duration::from_millis(positive_or(
+                file.request_timeout_ms,
+                DEFAULT_REQUEST_TIMEOUT_MS,
+                "request_timeout_ms",
+            )?),
+            retry_delays: retry_delays(file.retry_delays_ms)?,
+            max_retry_after: Duration::from_millis(positive_or(
+                file.max_retry_after_ms,
+                DEFAULT_MAX_RETRY_AFTER_MS,
+                "max_retry_after_ms",
+            )?),
+            requests_per_minute: optional_positive(
+                file.requests_per_minute,
+                "requests_per_minute",
+            )?,
         },
         execution,
         tools,
@@ -637,6 +689,26 @@ where
     Ok(value)
 }
 
+fn optional_positive<T>(value: Option<T>, name: &str) -> Result<Option<T>, ConfigError>
+where
+    T: Copy + PartialEq + From<u8>,
+{
+    if value == Some(T::from(0)) {
+        return Err(ConfigError::Invalid(format!("{name} 必须是正整数")));
+    }
+    Ok(value)
+}
+
+fn retry_delays(values: Option<Vec<u64>>) -> Result<Vec<Duration>, ConfigError> {
+    let values = values.unwrap_or_else(|| DEFAULT_RETRY_DELAYS_MS.to_vec());
+    if values.contains(&0) {
+        return Err(ConfigError::Invalid(
+            "retry_delays_ms 的每个等待时间都必须是正整数".into(),
+        ));
+    }
+    Ok(values.into_iter().map(Duration::from_millis).collect())
+}
+
 fn require_positive<T>(value: T, name: &str) -> Result<(), ConfigError>
 where
     T: PartialEq + From<u8>,
@@ -667,9 +739,19 @@ mod tests {
             fs::write(&path, contents).unwrap();
         }
         let values: HashMap<&str, &str> = values.iter().copied().collect();
-        load_from_with(&path, |name| {
+        load_from_with(&path, false, |name| {
             values.get(name).map(|value| (*value).to_string())
         })
+    }
+
+    #[test]
+    fn explicitly_selected_config_must_exist() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.toml");
+        let error = load_from_with(&missing, true, |_| None)
+            .err()
+            .expect("显式缺失配置必须失败");
+        assert!(matches!(error, ConfigError::MissingFile(path) if path == missing));
     }
 
     const BASE_FILE: &str = r#"
@@ -690,7 +772,17 @@ context_window_tokens = 131072
         assert_eq!(config.llm.model, "file-model");
         assert_eq!(config.llm.context_window_tokens, 131072);
         assert_eq!(config.llm.anthropic_max_tokens, None);
+        assert_eq!(config.llm.connect_timeout, Duration::from_millis(30_000));
+        assert_eq!(config.llm.read_timeout, Duration::from_millis(600_000));
+        assert_eq!(config.llm.request_timeout, Duration::from_millis(1_800_000));
+        assert_eq!(
+            config.llm.retry_delays,
+            [1_000, 2_000, 5_000].map(Duration::from_millis)
+        );
+        assert_eq!(config.llm.max_retry_after, Duration::from_millis(60_000));
+        assert_eq!(config.llm.requests_per_minute, None);
         assert_eq!(config.execution.llm_attempts, 5);
+        assert_eq!(config.execution.max_concurrent_units, 64);
         assert_eq!(config.execution.identical_tool_call_limit, 16);
         assert_eq!(config.execution.context_safety_tokens, 2048);
         assert_eq!(config.tools.max_in_flight, 64);
@@ -703,6 +795,42 @@ context_window_tokens = 131072
         assert_eq!(config.tools.read.max_result_bytes, 1024 * 1024);
         assert_eq!(config.tools.read.max_in_flight, 64);
         assert_eq!(config.cache.max_bytes, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn request_policy_is_configurable_and_empty_retry_list_disables_retries() {
+        let file = format!(
+            "{BASE_FILE}\nconnect_timeout_ms=11\nread_timeout_ms=22\nrequest_timeout_ms=33\nretry_delays_ms=[]\nmax_retry_after_ms=44\nrequests_per_minute=55\n[execution]\nmax_concurrent_units=7\n"
+        );
+        let config = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]).unwrap();
+        assert_eq!(config.llm.connect_timeout, Duration::from_millis(11));
+        assert_eq!(config.llm.read_timeout, Duration::from_millis(22));
+        assert_eq!(config.llm.request_timeout, Duration::from_millis(33));
+        assert!(config.llm.retry_delays.is_empty());
+        assert_eq!(config.llm.max_retry_after, Duration::from_millis(44));
+        assert_eq!(config.llm.requests_per_minute, Some(55));
+        assert_eq!(config.execution.max_concurrent_units, 7);
+    }
+
+    #[test]
+    fn request_policy_rejects_zero_values_inside_nonempty_settings() {
+        for field in [
+            "connect_timeout_ms=0",
+            "read_timeout_ms=0",
+            "request_timeout_ms=0",
+            "max_retry_after_ms=0",
+            "requests_per_minute=0",
+            "retry_delays_ms=[1,0]",
+        ] {
+            let file = format!("{BASE_FILE}\n{field}\n");
+            assert!(
+                matches!(
+                    load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]),
+                    Err(ConfigError::Invalid(_))
+                ),
+                "应拒绝 {field}"
+            );
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ formic run \
   --plan <plan.jsonl> \
   --task <task.md> \
   --out <输出目录> \
-  --concurrency <同时活动的单元数>
+  --config <config.toml>
 ```
 
 结构化输出作业额外传入一份 JSON Schema：
@@ -25,11 +25,13 @@ formic run \
   --plan plan.jsonl \
   --task task.md \
   --out out \
-  --concurrency 32 \
+  --config settings/formic.toml \
   --output-schema result.schema.json
 ```
 
-`--output-schema` 是本次作业的输入，不是部署配置。Formic 不提供指定配置文件路径的参数。
+`--output-schema` 是本次作业输入，不是部署配置。`--concurrency` 可选，只覆盖本次运行的
+`execution.max_concurrent_units`。作业中断或部分失败后，以完全相同的输入增加 `--resume`；
+Formic 会保留已发布结果，只处理 failed、stopped 和 not_started 单元。
 
 ## 调用前提
 
@@ -44,9 +46,10 @@ formic run \
 
 ## 配置
 
-Formic 只在进程启动时读取当前工作目录的 `config.toml`，不搜索父目录、不接受其他路径，
-也不热加载。复制 [`config.example.toml`](../config.example.toml) 后修改即可。`config.toml`
-可保存明文 API key，仓库已通过 `.gitignore` 排除它；不要把真实密钥提交到版本库。
+Formic 在进程启动时读取 `--config` 指定的文件；省略参数时读取当前目录的 `config.toml`，
+不搜索父目录，也不热加载。显式指定的文件不存在时直接报错；只有省略 `--config` 时，默认
+文件缺失才允许完全由环境变量提供 LLM 配置。配置可保存明文 API key，仓库已通过 `.gitignore` 排除默认文件；
+不要把真实密钥提交到版本库，也不必为了运行作业把含 key 的配置复制到临时目录。
 
 LLM 的最小配置：
 
@@ -79,13 +82,26 @@ verbosity、seed、stop、penalty、tool_choice 等生成控制字段。Anthropi
 | `FORMIC_METRICS=1` | 每 250 ms 向 stderr 输出进程级观测值 |
 
 配置采用严格字段校验：未知字段、`0`、互斥传输字段或缺失的必填项都会在读取作业前
-报错。完整字段和注释见配置示例。
+报错。`retry_delays_ms` 是唯一允许为空的数值数组，`[]` 表示禁用网络重试。完整字段和
+注释见配置示例。
 
 未填写资源字段时，正式默认值面向大规模作业：内置工具和每个 MCP server 最多同时执行
 64 次，单次工具结果为 1 MiB，搜索最多返回 1000 个匹配及 100 行上下文，作业内存缓存为
-1 GiB，连续相同调用阈值为 16，MCP 为后续调用自动重连。`--concurrency` 仍决定同时活动的
-worker 数；这些值只控制活动工作，不限制单元总量、回合总数或普通工具调用总数。外部服务
-有明确配额或机器经实测无法承受时，可以在自己的 `config.toml` 中降低对应值。
+1 GiB，活动 worker 为 64，连续相同调用阈值为 16，MCP 为后续调用自动重连。LLM 默认连接、
+单次读取和整次请求超时分别为 30 秒、10 分钟和 30 分钟；网络重试等待为 1、2、5 秒，
+`Retry-After` 最多接受 60 秒。`llm_attempts` 只用于模型结构修正和后续回合，不再充当网络
+重试次数。这些值只控制活动工作，不限制单元总量、回合总数或普通工具调用总数。
+
+`requests_per_minute` 是可选的真实请求频率限制；worker 并发窗口只限制同时活动的单元，
+不能冒充供应商限流。401、403 和 allowlist 中明确的额度/账户 code 会立即停止接纳后续模型
+调用。普通 429 的 `Retry-After` 对当前作业全部 worker 共享；超过 `max_retry_after_ms` 或
+网络重试耗尽时也停止接纳。已发请求允许收敛，尚未继续下一次模型调用的 worker 标为
+stopped，其余计划保持 not_started。未知 429 code 不解析 message 猜测额度，只按普通
+rate limit 处理。
+
+HTTP 错误正文只在内存中读取最多 1 KiB，用于提取 allowlist 中的结构化 code，随后丢弃。
+终端、worker 档案和 stats 只保存 HTTP 状态、公开类别、允许公开的 provider code 与
+`Retry-After`；不保存错误正文、无效协议 payload、URL 或 reqwest 原始错误文字。
 
 ## 分片计划
 
@@ -104,10 +120,11 @@ worker 数；这些值只控制活动工作，不限制单元总量、回合总�
 {"unit":2,"file":"records.jsonl","start":100,"end":199}
 ```
 
-Formic 将任务说明、数据集文件清单和当前分片装入首条用户消息。任务说明与清单位于
-共享前缀，分片内容只追加在末尾，以便不同单元复用相同的供应商 prompt cache 前缀。
+Formic 将任务说明和当前单元的文件或行区间装入首条用户消息。共享前缀说明完整 `input`
+根可通过 `search`/`read` 检索，但不重复列出整个数据集；当前分片只追加在末尾，以便不同
+单元复用相同的供应商 prompt cache 前缀。
 
-当前分片是 worker 的主动处理范围。完整文件清单和 `input` 工具允许它为分片中已经发现的
+当前分片是 worker 的主动处理范围。`input` 工具允许它为分片中已经发现的
 对象查找支持或反证，不表示它应主动扫描整个数据集、扩大任务范围或建立全局目录。计划应使
 单元即使单独运行也能产出含义完整的结果。
 
@@ -121,7 +138,7 @@ worker → 冻结的 ToolRegistry → Scheduler 有界收件箱
                               └─ 用户配置的任意 MCP
 ```
 
-每个 worker 同时只等待一个工具调用。调度器收件箱容量等于 `--concurrency`，排队和
+每个 worker 同时只等待一个工具调用。调度器收件箱容量等于本次生效的 worker 并发，排队和
 执行阶段都携带取消令牌。用户配置各层并发，内核不依据 MCP 产品名设置特殊上限。
 `identical_tool_call_limit` 只检测单 worker 连续完全相同且没有进展的调用，不是工具
 调用总数上限。
@@ -163,9 +180,9 @@ Formic 不复用它，也不承诺超时后固定时间内出现 TCP EOF。
 
 ## 结构化输出
 
-未传 `--output-schema` 时，最终文本原子发布为 `out/<unit>.md`。传入后，Formic 编译并
+未传 `--output-schema` 时，最终文本原子发布为 `out/results/<unit>.md`。传入后，Formic 编译并
 规范化一份作业级 JSON Schema，通过内部 `formic_submit_result` 接收结果，再执行本地
-校验；成功 object 发布为 `out/<unit>.json`。
+校验；成功 object 发布为 `out/results/<unit>.json`。
 
 当前公共 schema 子集包括根 object、基础类型、`properties`、`required`、
 `additionalProperties=false`、数组 `items` 和基础值 `enum`。外部 `$ref`、组合、条件和
@@ -175,7 +192,7 @@ schema 负责结果形状，`task.md` 负责解释字段的业务含义、证据
 重复单元号、分片位置、任务时间或重试次数等运行时已经确定的事实，也不要把全局归并后才能
 确定的字段放入单元 schema。
 
-`out/output-schema.json` 保存输出目录的权威 schema。同一输出目录不能混用 Markdown
+`out/results/output-schema.json` 保存结果目录的权威 schema。同一输出目录不能混用 Markdown
 与 JSON 完成记录，也不能在已有 JSON 记录上更换 schema。输出目录与数据目录不能相同或
 互相包含；一个输出目录同一时刻只允许一个 Formic 作业使用。
 
@@ -198,17 +215,26 @@ schema 负责结果形状，`task.md` 负责解释字段的业务含义、证据
 
 | 路径 | 内容 |
 | --- | --- |
-| `out/<unit>.md` | 文本模式的权威完成记录 |
-| `out/<unit>.json` | 结构化模式的权威完成记录 |
-| `out/output-schema.json` | 结构化输出目录的规范化 schema |
-| `out/workers/<任务时间戳>/<unit>.md` | worker 完整运行档案 |
-| `out/stats.jsonl` | 每单元回合、重试、缓存、工具、压缩和 token 统计 |
+| `out/results/<unit>.md` | 文本模式的已发布结果 |
+| `out/results/<unit>.json` | 结构化模式的已发布结果 |
+| `out/results/output-schema.json` | 结构化结果目录的规范化 schema |
+| `out/runs/run-000001/workers/<unit>.md` | 本轮 worker 完整运行档案 |
+| `out/runs/run-000001/stats.jsonl` | 本轮每单元回合、调用、缓存、工具和 token 统计 |
+| `out/runs/run-000001/summary.json` | 本轮 planned、状态数量、原因样例和真实请求 usage 覆盖 |
 
 运行档案格式及失败语义见 [Worker 可观测性](observability.md)。本地 `o200k` 估算值使用
 `*_est` 字段；供应商报告的 usage 单独保存，缺失值不会由估算值冒充。
 
-退出码：`0` 表示全部成功，`1` 表示至少一个单元失败，`2` 表示启动配置或输入无效，
-`3` 表示收到终止信号。已发布记录始终保留，跨运行续跑由调用方生成剩余计划。
+每轮 summary 满足 `planned = already_completed + started + not_started`、
+`started = published + failed + stopped` 和
+`llm_calls = llm_calls_with_provider_usage + llm_calls_without_provider_usage`。终端只显示失败总数、
+首个未完成单元和最多五个样例；逐单元原因留在对应 worker 档案。
+
+退出码：`0` 表示本次作业完整，`1` 表示存在 failed、stopped 或 not_started，`2` 表示启动
+配置、输入或 resume 一致性无效，`3` 表示收到终止信号。首次运行建立机器管理的作业身份和
+追加式状态记录；`--resume` 会在模型或 MCP 请求前验证 plan、task、schema 和完整 input 未变，
+并拒绝缺失状态、损坏结果或 `results/` 中的未知文件。已发布结果永不覆盖。每轮档案保留在
+新的自然序号 `run-N` 下。
 
 ## 本地验证
 

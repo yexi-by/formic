@@ -1,15 +1,18 @@
 //! Formic 内置只读工具。这里唯一拥有参数语义、路径边界、结果截断和缓存键规范化。
 
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use cap_std::ambient_authority;
 use cap_std::fs::Dir;
 use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, SearcherBuilder, Sink, SinkMatch};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ReadToolConfig, SearchToolConfig, ToolsConfig};
@@ -29,6 +32,33 @@ pub struct Roots {
 #[derive(Clone)]
 pub struct ReadRoot {
     dir: Arc<Dir>,
+    snapshot: Option<Arc<RootSnapshot>>,
+}
+
+struct RootSnapshot {
+    files: BTreeMap<PathBuf, FileStamp>,
+    digest: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileStamp {
+    identity: FileIdentity,
+    content_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    len: u64,
+    modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    change_seconds: i64,
+    #[cfg(unix)]
+    change_nanoseconds: i64,
 }
 
 impl ReadRoot {
@@ -37,14 +67,87 @@ impl ReadRoot {
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
         let dir = Dir::open_ambient_dir(&path, ambient_authority())?;
-        Ok(Self { dir: Arc::new(dir) })
+        Ok(Self {
+            dir: Arc::new(dir),
+            snapshot: None,
+        })
     }
 
     pub(crate) fn from_dir(dir: Dir) -> Self {
-        Self { dir: Arc::new(dir) }
+        Self {
+            dir: Arc::new(dir),
+            snapshot: None,
+        }
     }
 
-    fn open_file(&self, relative: &Path) -> io::Result<fs::File> {
+    pub(crate) fn open_file(&self, relative: &Path) -> io::Result<fs::File> {
+        let mut file = self.open_live_file(relative)?;
+        if let Some(snapshot) = &self.snapshot {
+            let expected = snapshot.files.get(relative).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("输入快照不含文件 {}", crate::prompt::slash_path(relative)),
+                )
+            })?;
+            let before = FileIdentity::from_metadata(&file.metadata()?);
+            if before != expected.identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "输入文件 {} 在作业启动后发生变化",
+                        crate::prompt::slash_path(relative)
+                    ),
+                ));
+            }
+            let mut content = Sha256::new();
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                content.update(&buffer[..read]);
+            }
+            let actual_digest: [u8; 32] = content.finalize().into();
+            let after = FileIdentity::from_metadata(&file.metadata()?);
+            if after != expected.identity || actual_digest != expected.content_digest {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "输入文件 {} 与作业快照内容不同",
+                        crate::prompt::slash_path(relative)
+                    ),
+                ));
+            }
+            file.seek(SeekFrom::Start(0))?;
+        }
+        Ok(file)
+    }
+
+    /// 计划形状校验只确认文件身份；实际读取仍由 `open_file` 按内容摘要验收。
+    pub(crate) fn check_file(&self, relative: &Path) -> io::Result<()> {
+        let file = self.open_live_file(relative)?;
+        if let Some(snapshot) = &self.snapshot {
+            let expected = snapshot.files.get(relative).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("输入快照不含文件 {}", crate::prompt::slash_path(relative)),
+                )
+            })?;
+            if FileIdentity::from_metadata(&file.metadata()?) != expected.identity {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "输入文件 {} 在作业启动后发生变化",
+                        crate::prompt::slash_path(relative)
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn open_live_file(&self, relative: &Path) -> io::Result<fs::File> {
         validate_relative_path(relative)?;
         self.reject_link_components(relative)?;
         let file = self.dir.open(relative)?.into_std();
@@ -55,6 +158,91 @@ impl ReadRoot {
             )));
         }
         Ok(file)
+    }
+
+    /// 冻结本轮执行能够观察到的输入文件集合和元数据，并以相同文件内容生成作业摘要。
+    /// 后续遍历只返回这份集合，打开文件时再次核对身份、大小和时间戳。
+    pub(crate) fn freeze(&self) -> io::Result<(Self, String)> {
+        if let Some(snapshot) = &self.snapshot {
+            return Ok((self.clone(), snapshot.digest.clone()));
+        }
+        let paths = walk_files_live(self, None)?;
+        let mut files = BTreeMap::new();
+        let mut aggregate = Sha256::new();
+        for relative in &paths {
+            let mut file = self.open_live_file(relative)?;
+            let before = FileIdentity::from_metadata(&file.metadata()?);
+            let mut content = Sha256::new();
+            let mut content_len = 0u64;
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                let read = file.read(&mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                content_len = content_len
+                    .checked_add(read as u64)
+                    .ok_or_else(|| io::Error::other("输入文件长度溢出"))?;
+                content.update(&buffer[..read]);
+            }
+            let after = FileIdentity::from_metadata(&file.metadata()?);
+            if before != after || before.len != content_len {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "建立输入快照时文件 {} 发生变化",
+                        crate::prompt::slash_path(relative)
+                    ),
+                ));
+            }
+            let path_bytes = path_identity_bytes(relative);
+            aggregate.update((path_bytes.len() as u64).to_le_bytes());
+            aggregate.update(path_bytes);
+            aggregate.update(content_len.to_le_bytes());
+            let content_digest: [u8; 32] = content.finalize().into();
+            aggregate.update(content_digest);
+            files.insert(
+                relative.clone(),
+                FileStamp {
+                    identity: before,
+                    content_digest,
+                },
+            );
+        }
+
+        // 捕获期间新增、删除、替换或改写的文件不能形成混合版本摘要。
+        let after_paths = walk_files_live(self, None)?;
+        if paths != after_paths {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "建立输入快照时文件集合发生变化",
+            ));
+        }
+        for relative in &after_paths {
+            let file = self.open_live_file(relative)?;
+            let actual = FileIdentity::from_metadata(&file.metadata()?);
+            if files.get(relative).map(|stamp| &stamp.identity) != Some(&actual) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "建立输入快照时文件 {} 发生变化",
+                        crate::prompt::slash_path(relative)
+                    ),
+                ));
+            }
+        }
+
+        let snapshot = Arc::new(RootSnapshot {
+            files,
+            digest: format!("{:x}", aggregate.finalize()),
+        });
+        Ok((
+            Self {
+                dir: Arc::clone(&self.dir),
+                snapshot: Some(Arc::clone(&snapshot)),
+            },
+            snapshot.digest.clone(),
+        ))
     }
 
     /// 静态目录树中的链接仍按产品契约拒绝；路径被并发替换时，根句柄相对打开
@@ -94,6 +282,46 @@ impl ReadRoot {
         self.reject_link_components(relative)?;
         self.dir.open_dir(relative)
     }
+}
+
+impl FileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            change_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            change_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn path_identity_bytes(path: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt as _;
+    path.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(windows)]
+fn path_identity_bytes(path: &Path) -> Vec<u8> {
+    use std::os::windows::ffi::OsStrExt as _;
+    path.as_os_str()
+        .encode_wide()
+        .flat_map(u16::to_le_bytes)
+        .collect()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn path_identity_bytes(path: &Path) -> Vec<u8> {
+    path.as_os_str().to_string_lossy().as_bytes().to_vec()
 }
 
 #[derive(Debug, Clone)]
@@ -987,11 +1215,29 @@ fn scope_files(
 }
 
 /// 递归列出根内普通文件；符号链接不跟随。
+#[cfg(test)]
 pub fn walk_files(root: &ReadRoot) -> io::Result<Vec<PathBuf>> {
     walk_files_cancellable(root, None)
 }
 
 fn walk_files_cancellable(
+    root: &ReadRoot,
+    cancel: Option<&CancellationToken>,
+) -> io::Result<Vec<PathBuf>> {
+    if let Some(snapshot) = &root.snapshot {
+        let mut files = Vec::with_capacity(snapshot.files.len());
+        for relative in snapshot.files.keys() {
+            if cancel.is_some_and(CancellationToken::is_cancelled) {
+                break;
+            }
+            files.push(relative.clone());
+        }
+        return Ok(files);
+    }
+    walk_files_live(root, cancel)
+}
+
+fn walk_files_live(
     root: &ReadRoot,
     cancel: Option<&CancellationToken>,
 ) -> io::Result<Vec<PathBuf>> {
@@ -1166,6 +1412,38 @@ mod tests {
                 read,
             },
         }
+    }
+
+    #[test]
+    fn frozen_input_rejects_same_size_content_replacement_with_restored_times() {
+        let fixture = fixture(RecordFormat::Markdown);
+        let source = fixture.input_path.join("a.txt");
+        let metadata = fs::metadata(&source).unwrap();
+        let modified = metadata.modified().unwrap();
+        let accessed = metadata.accessed().unwrap();
+        let original_len = metadata.len();
+        let (frozen, _) = fixture.roots.input.freeze().unwrap();
+
+        let replacement = "梨子是水果。\n葡萄也是。\n柚子第三个。\n";
+        assert_eq!(replacement.len() as u64, original_len);
+        fs::write(&source, replacement).unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&source).unwrap();
+        file.set_times(
+            fs::FileTimes::new()
+                .set_modified(modified)
+                .set_accessed(accessed),
+        )
+        .unwrap();
+        fs::write(fixture.input_path.join("added.txt"), "later").unwrap();
+
+        let error = frozen.open_file(Path::new("a.txt")).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("快照内容"), "{error}");
+        assert!(
+            !walk_files(&frozen)
+                .unwrap()
+                .contains(&PathBuf::from("added.txt"))
+        );
     }
 
     fn execute(fixture: &Fixture, name: &str, json: &str) -> ToolOutput {

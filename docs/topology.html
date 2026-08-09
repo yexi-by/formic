@@ -18,16 +18,16 @@
 
 <h2>作业入口</h2>
 <div class="row">
-  <div class="box"><b>CLI 与固定配置</b><code>src/main.rs · src/config.rs</code><br>读取当前目录 config.toml、合并环境变量、校验计划与输出模式。</div>
+  <div class="box"><b>CLI 与固定配置</b><code>src/main.rs · src/config.rs</code><br>默认读取当前目录 config.toml；--config 可指定文件。合并环境变量后校验计划、续跑身份与输出模式。</div>
   <div class="arrow">→</div>
-  <div class="box"><b>活动 worker 窗口</b><code>src/main.rs</code><br>取得 --concurrency 许可后才创建 task；总单元量不设上限。</div>
+  <div class="box"><b>活动 worker 窗口</b><code>src/main.rs</code><br>默认使用 execution.max_concurrent_units；--concurrency 只显式覆盖本次运行。取得窗口许可后才创建 task；总单元量不设上限。</div>
   <div class="arrow">→</div>
   <div class="box"><b>单元循环</b><code>src/worker.rs</code><br>LLM ↔ 工具，多轮直到文本完成、结构化提交、取消或失败。</div>
 </div>
 
 <h2>模型与上下文</h2>
 <div class="row">
-  <div class="box"><b>稳定输入前缀</b><code>src/prompt.rs</code><br>输出模式 instructions、任务和清单冻结；动态分片在末尾。</div>
+  <div class="box"><b>稳定输入前缀</b><code>src/prompt.rs</code><br>输出模式 instructions 与任务冻结；user message 只列当前单元文件和分片正文，并说明完整 input 根可用 search/read 搜索核实。</div>
   <div class="arrow">→</div>
   <div class="box"><b>三协议适配</b><code>src/llm/</code><br>Completions、Responses、Anthropic 映射为同一消息、工具、usage 和终态。</div>
   <div class="arrow">↔</div>

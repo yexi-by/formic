@@ -1,5 +1,5 @@
-# 复制为当前工作目录的 config.toml 后填写。明文密钥不会进入 worker 运行档案；
-# 不要提交复制后含真实密钥的 config.toml。
+# 复制到自己的固定配置位置后填写，并用 --config 指定；也可放在当前工作目录命名为
+# config.toml。明文密钥不会进入 worker 运行档案；不要提交含真实密钥的配置文件。
 # 本示例显式写出 Formic 的高吞吐默认值。只有外部服务配额或实测资源边界要求时才降低它们。
 url = "https://api.example.com/v1"
 api_key = ""
@@ -8,10 +8,22 @@ context_window_tokens = 131072
 # 仅当 FORMIC_LLM_PROTOCOL=anthropic 时取消下一行注释。Anthropic Messages
 # 要求 max_tokens；completions 和 responses 不允许配置或发送任何输出 token 参数。
 # anthropic_max_tokens = 16384
+# 连接、单次读取等待和整次请求的超时，单位均为毫秒。
+connect_timeout_ms = 30000
+read_timeout_ms = 600000
+request_timeout_ms = 1800000
+# 网络/HTTP 瞬时失败的重试等待；空数组表示不重试。它不消耗 llm_attempts。
+retry_delays_ms = [1000, 2000, 5000]
+# 供应商 Retry-After 超过此值时停止接纳新请求，不进行超长等待。
+max_retry_after_ms = 60000
+# 可选的作业级请求频率限制；服务没有明确限制时保持注释。
+# requests_per_minute = 600
 
 [execution]
-# 单次 LLM 步骤最多尝试 5 次，包括可修正的结构错误；这不是 worker 总回合数限制。
+# 模型结构修正最多 5 次；网络重试只由 retry_delays_ms 控制。
 llm_attempts = 5
+# 同时活动的单元窗口。--concurrency 只在本次运行中显式覆盖它。
+max_concurrent_units = 64
 # 只阻止连续完全相同且没有进展的调用；普通工具调用总数不受此值限制。
 identical_tool_call_limit = 16
 # 在声明的模型上下文中预留 2048 tokens，超出预算前自动压缩旧工具往返。

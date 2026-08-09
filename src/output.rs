@@ -1,7 +1,9 @@
 //! 输出区：单元记录的原子发布、worker 运行档案与作业汇总。
 //! 不变量：任何时刻读到的都是完整记录——先写同目录临时文件，rename 一次性可见；
-//! 失败单元没有记录文件，完成记录就是完成事实的权威表示（供调用方算续跑差集）。
-//! 审计的语义所有者也是本模块：每次 LLM 调用与工具调用的输入输出完整留痕。
+//! 失败单元没有结果文件。续跑只把结果文件与追加式状态记录一致的单元视为已发布；
+//! 任一侧缺失都会在发起请求前报告状态不一致。
+//! 审计的语义所有者也是本模块：完整记录协议无关的模型输入、验收后的模型事实和
+//! 工具调用事实；HTTP/SSE envelope、错误 payload 与传输库原文不进入档案。
 
 use std::fs;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -52,6 +54,15 @@ impl OutputRoot {
         self.dir.try_clone()
     }
 
+    pub(crate) fn create_subdir(&self, relative: &Path) -> io::Result<Self> {
+        self.dir.create_dir_all(relative)?;
+        let dir = self.dir.open_dir(relative)?;
+        Ok(Self {
+            dir: std::sync::Arc::new(dir),
+            path: self.path.join(relative),
+        })
+    }
+
     pub(crate) fn display(&self, relative: &Path) -> PathBuf {
         self.path.join(relative)
     }
@@ -67,6 +78,13 @@ impl OutputRoot {
     pub(crate) fn write(&self, relative: &Path, content: impl AsRef<[u8]>) -> io::Result<()> {
         let mut file = self.create(relative)?;
         file.write_all(content.as_ref())
+    }
+
+    pub(crate) fn open_append(&self, relative: &Path) -> io::Result<fs::File> {
+        Ok(self
+            .dir
+            .open_with(relative, OpenOptions::new().create(true).append(true))?
+            .into_std())
     }
 
     fn remove_file(&self, relative: &Path) -> io::Result<()> {
@@ -169,8 +187,8 @@ pub struct JobReportFacts {
     pub tools: Vec<String>,
 }
 
-/// 一次任务的 worker 观测目录。时间戳在 worker 启动前确定，原始审计和
-/// Markdown 视图共享该目录，避免复用输出区时把旧任务的证据指向新审计。
+/// 一轮任务的 worker 观测目录。自然递增的 run 序号在 worker 启动前确定，临时
+/// 审计与 Markdown 视图共享该目录，避免 resume 时把旧轮证据指向新轮现场。
 pub struct WorkerRun {
     root: OutputRoot,
     relative_directory: PathBuf,
@@ -181,19 +199,16 @@ pub struct WorkerRun {
 
 impl WorkerRun {
     pub fn create(root: &OutputRoot, facts: JobReportFacts) -> io::Result<Self> {
-        root.dir.create_dir_all("workers")?;
+        root.dir.create_dir_all("runs")?;
         let started_at = Utc::now();
-        let timestamp = started_at.format("%Y%m%dT%H%M%S%.3fZ").to_string();
         let mut sequence = 1u64;
         let directory = loop {
-            let name = if sequence == 1 {
-                timestamp.clone()
-            } else {
-                format!("{timestamp}-{sequence}")
-            };
-            let relative = Path::new("workers").join(name);
+            let relative = Path::new("runs").join(format!("run-{sequence:06}"));
             match root.dir.create_dir(&relative) {
-                Ok(()) => break relative,
+                Ok(()) => {
+                    root.dir.create_dir(relative.join("workers"))?;
+                    break relative;
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => sequence += 1,
                 Err(error) => return Err(error),
             }
@@ -208,25 +223,29 @@ impl WorkerRun {
     }
 
     pub(crate) fn audit_path(&self, unit: u64) -> PathBuf {
-        self.directory.join(format!(".tmp-worker-{unit}.jsonl"))
+        self.directory
+            .join("workers")
+            .join(format!(".tmp-worker-{unit}.jsonl"))
     }
 
     fn audit_relative(&self, unit: u64) -> PathBuf {
         self.relative_directory
+            .join("workers")
             .join(format!(".tmp-worker-{unit}.jsonl"))
     }
 
     fn request_base_path(&self, unit: u64, kind: RequestKind) -> PathBuf {
         self.relative_directory
+            .join("workers")
             .join(format!(".tmp-worker-{unit}-{}-request", kind.key()))
     }
 
     pub fn report_path(&self, unit: u64) -> PathBuf {
-        self.directory.join(format!("{unit}.md"))
+        self.directory.join("workers").join(format!("{unit}.md"))
     }
 }
 
-/// 原子发布单元产出，返回记录路径。同一单元重复发布会以新记录替换。
+/// 原子发布单元产出，返回记录路径。已经发布的结果不可覆盖。
 pub fn publish(
     root: &OutputRoot,
     unit: u64,
@@ -234,13 +253,19 @@ pub fn publish(
     format: RecordFormat,
 ) -> io::Result<PathBuf> {
     let tmp = PathBuf::from(format!(".tmp-unit-{unit}"));
-    root.write(&tmp, content)?;
     let target = PathBuf::from(format!("{unit}.{}", format.extension()));
+    if root.exists(&target) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!("单元 {unit} 的结果已经发布，不能覆盖"),
+        ));
+    }
+    root.write(&tmp, content)?;
     root.rename(&tmp, &target)?;
     Ok(root.display(&target))
 }
 
-/// 单元审计日志：流式逐条落盘，不在内存累积。请求正文以磁盘上的上一份同类请求
+/// 单元审计日志：流式逐条落盘，不在内存累积。协议无关模型输入以磁盘上的上一份同类输入
 /// 计算可逆增量，避免最终档案和 worker 内存随“每轮完整历史之和”增长。
 /// 文件自创建起存在，空文件表示单元在首次调用前结束。
 pub struct AuditLog {
@@ -282,8 +307,8 @@ impl AuditLog {
         self.writer.write_all(b"\n")
     }
 
-    /// 保存一次普通模型请求。首个请求保存完整正文，后续请求保存相对上一份普通请求的
-    /// 可逆字节增量。基准正文只在 worker 运行期间保留在临时文件中，避免用内存保存
+    /// 保存一次普通模型调用的协议无关输入。首个输入保存完整正文，后续输入保存相对上一份
+    /// 同类输入的可逆字节增量。基准正文只在 worker 运行期间保留在临时文件中，避免用内存保存
     /// 随历史增长的大字符串。
     pub fn push_llm_request(&mut self, attempt: u32, body: &str) -> io::Result<()> {
         self.push_request(RequestKind::Llm, attempt, body)
@@ -293,40 +318,6 @@ impl AuditLog {
     /// 增量序列。
     pub fn push_compaction_request(&mut self, attempt: u32, body: &str) -> io::Result<()> {
         self.push_request(RequestKind::Compaction, attempt, body)
-    }
-
-    /// 一次 LLM 调用的全部原始 SSE data 负载按到达顺序保存为一个批次。事件边界和
-    /// 原文仍完整保留，但 Markdown 不再为每个 token 片段生成标题。
-    pub fn push_llm_event_stream(&mut self, events: &[String]) -> io::Result<()> {
-        if events.is_empty() {
-            return Ok(());
-        }
-        let (sequence, elapsed_ms) = self.next_stamp();
-        let record = LlmEventStreamRecord {
-            direction: "llm_event_stream",
-            sequence,
-            elapsed_ms,
-            event_count: events.len(),
-            total_bytes: events.iter().map(String::len).sum(),
-            max_backtick_run: events
-                .iter()
-                .map(|event| longest_backtick_run(event))
-                .max()
-                .unwrap_or(0),
-        };
-        serde_json::to_writer(&mut self.writer, &record)?;
-        self.writer.write_all(b"\n")?;
-        for (index, event) in events.iter().enumerate() {
-            let record = LlmEventDataRecord {
-                direction: "llm_event_data",
-                stream_sequence: sequence,
-                index,
-                data: event,
-            };
-            serde_json::to_writer(&mut self.writer, &record)?;
-            self.writer.write_all(b"\n")?;
-        }
-        Ok(())
     }
 
     fn push_request(&mut self, kind: RequestKind, attempt: u32, body: &str) -> io::Result<()> {
@@ -390,7 +381,7 @@ impl AuditLog {
     pub fn finish(mut self) -> io::Result<PathBuf> {
         self.writer.flush()?;
         if let Err(error) = self.cleanup_request_bases() {
-            eprintln!("worker 请求基准临时文件清理失败：{error}");
+            eprintln!("worker 模型输入基准临时文件清理失败：{error}");
         }
         self.request_bases_cleaned = true;
         Ok(self.path.clone())
@@ -403,7 +394,7 @@ impl Drop for AuditLog {
             return;
         }
         if let Err(error) = self.cleanup_request_bases() {
-            eprintln!("worker 请求基准临时文件清理失败：{error}");
+            eprintln!("worker 模型输入基准临时文件清理失败：{error}");
         }
     }
 }
@@ -455,24 +446,6 @@ struct RequestDeltaRecord<'a> {
     full_bytes: usize,
 }
 
-#[derive(serde::Serialize)]
-struct LlmEventStreamRecord {
-    direction: &'static str,
-    sequence: u64,
-    elapsed_ms: u64,
-    event_count: usize,
-    total_bytes: usize,
-    max_backtick_run: usize,
-}
-
-#[derive(serde::Serialize)]
-struct LlmEventDataRecord<'a> {
-    direction: &'static str,
-    stream_sequence: u64,
-    index: usize,
-    data: &'a str,
-}
-
 struct RequestDelta<'a> {
     base_bytes: usize,
     prefix_bytes: usize,
@@ -498,7 +471,7 @@ fn request_delta<'a>(
         Err(error) => return Err(error),
     };
     let base_bytes = usize::try_from(base.metadata()?.len())
-        .map_err(|_| io::Error::other("请求基准文件大小超出当前平台可表示范围"))?;
+        .map_err(|_| io::Error::other("模型输入基准文件大小超出当前平台可表示范围"))?;
     let prefix_bytes = common_prefix_bytes(&mut base, base_bytes, body)?;
     let suffix_bytes = common_suffix_bytes(&mut base, base_bytes, body, prefix_bytes)?;
     let removed_bytes = base_bytes - prefix_bytes - suffix_bytes;
@@ -554,7 +527,7 @@ fn common_suffix_bytes(
         let count = BUFFER_BYTES.min(limit - matched);
         let base_start = base_len - matched - count;
         let base_start = u64::try_from(base_start)
-            .map_err(|_| io::Error::other("请求基准偏移超出文件 API 可表示范围"))?;
+            .map_err(|_| io::Error::other("模型输入基准偏移超出文件 API 可表示范围"))?;
         base.seek(SeekFrom::Start(base_start))?;
         base.read_exact(&mut buffer[..count])?;
         let body_start = body_bytes.len() - matched - count;
@@ -589,7 +562,7 @@ pub enum WorkerState {
     CorrectingToolCall,
     CorrectingOutput,
     ReadyToPublish,
-    Cancelled,
+    Stopped,
     Failed,
 }
 
@@ -606,7 +579,7 @@ impl WorkerState {
             Self::CorrectingToolCall => "correcting_tool_call",
             Self::CorrectingOutput => "correcting_output",
             Self::ReadyToPublish => "ready_to_publish",
-            Self::Cancelled => "cancelled",
+            Self::Stopped => "stopped",
             Self::Failed => "failed",
         }
     }
@@ -623,7 +596,7 @@ impl WorkerState {
             Self::CorrectingToolCall => "修正工具参数",
             Self::CorrectingOutput => "修正输出",
             Self::ReadyToPublish => "等待发布",
-            Self::Cancelled => "已取消",
+            Self::Stopped => "已停止",
             Self::Failed => "失败",
         }
     }
@@ -640,15 +613,15 @@ impl WorkerState {
             "correcting_tool_call" => Self::CorrectingToolCall,
             "correcting_output" => Self::CorrectingOutput,
             "ready_to_publish" => Self::ReadyToPublish,
-            "cancelled" => Self::Cancelled,
+            "stopped" => Self::Stopped,
             "failed" => Self::Failed,
             _ => return None,
         })
     }
 }
 
-/// 除模型请求和原始事件流之外的一条审计留痕；大正文由 AuditLog 的专用方法写入，
-/// 避免在 serde_json::Value 中再次复制。
+/// 除模型输入之外的一条审计留痕。供应商的 SSE envelope、残帧和错误 payload 不进入
+/// worker 档案；成功响应只记录完成语义与解析后的助手正文。
 pub enum AuditEntry {
     /// worker 状态变化及其直接原因。
     State { state: WorkerState, reason: String },
@@ -658,6 +631,12 @@ pub enum AuditEntry {
         input_budget: u64,
         force: bool,
         action: String,
+    },
+    /// 已经完整通过协议解析和回合语义验收的模型响应。
+    ModelResponse {
+        finish: String,
+        text: String,
+        tool_calls: usize,
     },
     /// 组装完毕的工具调用（名称 + 模型给出的原始参数文本）。
     ToolCall {
@@ -683,7 +662,7 @@ pub enum AuditEntry {
         delay_ms: u64,
         reason: String,
     },
-    /// 结构化结果的本地校验，不重复保存已在原始事件中的结果正文。
+    /// 结构化结果的本地校验，不重复保存已在模型响应中的结果正文。
     OutputValidation {
         valid: bool,
         instance_path: Option<String>,
@@ -717,6 +696,16 @@ impl AuditEntry {
                 "input_budget": input_budget,
                 "force": force,
                 "action": action,
+            }),
+            AuditEntry::ModelResponse {
+                finish,
+                text,
+                tool_calls,
+            } => serde_json::json!({
+                "direction": "model_response",
+                "finish": finish,
+                "text": text,
+                "tool_calls": tool_calls,
             }),
             AuditEntry::ToolCall {
                 name,
@@ -813,8 +802,8 @@ pub struct UnitStats {
     pub provider_output_tokens: u64,
     pub provider_cache_read_tokens: u64,
     pub provider_cache_creation_tokens: u64,
-    pub provider_usage_reports: u64,
-    pub provider_usage_missing_calls: u64,
+    pub llm_calls_with_provider_usage: u64,
+    pub llm_calls_without_provider_usage: u64,
 }
 
 impl UnitStats {
@@ -839,10 +828,10 @@ impl UnitStats {
 
     pub fn record_provider_usage(&mut self, usage: &crate::llm::ProviderUsage) {
         if usage.is_empty() {
-            self.provider_usage_missing_calls += 1;
+            self.llm_calls_without_provider_usage += 1;
             return;
         }
-        self.provider_usage_reports += 1;
+        self.llm_calls_with_provider_usage += 1;
         self.provider_input_tokens += usage.input_tokens.unwrap_or(0);
         self.provider_output_tokens += usage.output_tokens.unwrap_or(0);
         self.provider_cache_read_tokens += usage.cache_read_tokens.unwrap_or(0);
@@ -850,20 +839,58 @@ impl UnitStats {
     }
 }
 
-/// 追加一行单元统计到 out/stats.jsonl。附属证据：写失败只产生诊断，
+/// 追加一行单元统计到当前 `runs/run-N/stats.jsonl`。附属证据：写失败只产生诊断，
 /// 不改写单元的业务结果（§9）。
 pub fn append_stats(
-    root: &OutputRoot,
+    run: &WorkerRun,
     unit: u64,
     outcome: &str,
     stats: &UnitStats,
 ) -> io::Result<()> {
     let line = stats_value(unit, outcome, stats);
-    let mut file = root
+    let mut file = run
+        .root
         .dir
-        .open_with("stats.jsonl", OpenOptions::new().create(true).append(true))?
+        .open_with(
+            run.relative_directory.join("stats.jsonl"),
+            OpenOptions::new().create(true).append(true),
+        )?
         .into_std();
     writeln!(file, "{line}")
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct RunSummary {
+    pub planned: u64,
+    pub already_completed: u64,
+    pub started: u64,
+    pub published: u64,
+    pub failed: u64,
+    pub stopped: u64,
+    pub not_started: u64,
+    pub first_failed: Option<u64>,
+    pub failed_samples: Vec<u64>,
+    pub first_stopped: Option<u64>,
+    pub stopped_samples: Vec<u64>,
+    pub first_incomplete: Option<u64>,
+    pub incomplete_samples: Vec<u64>,
+    pub failure_reasons: std::collections::BTreeMap<String, u64>,
+    pub stop_reason: Option<String>,
+    pub llm_calls: u64,
+    pub llm_calls_with_provider_usage: u64,
+    pub llm_calls_without_provider_usage: u64,
+}
+
+pub fn write_run_summary(run: &WorkerRun, summary: &RunSummary) -> io::Result<PathBuf> {
+    let content = format!(
+        "{}\n",
+        serde_json::to_string_pretty(summary).expect("运行汇总可以序列化")
+    );
+    let temporary = run.relative_directory.join(".tmp-summary.json");
+    let target = run.relative_directory.join("summary.json");
+    run.root.write(&temporary, content)?;
+    run.root.rename(&temporary, &target)?;
+    Ok(run.root.display(&target))
 }
 
 fn stats_value(unit: u64, outcome: &str, stats: &UnitStats) -> serde_json::Value {
@@ -899,8 +926,8 @@ fn stats_value(unit: u64, outcome: &str, stats: &UnitStats) -> serde_json::Value
         "provider_output_tokens": stats.provider_output_tokens,
         "provider_cache_read_tokens": stats.provider_cache_read_tokens,
         "provider_cache_creation_tokens": stats.provider_cache_creation_tokens,
-        "provider_usage_reports": stats.provider_usage_reports,
-        "provider_usage_missing_calls": stats.provider_usage_missing_calls,
+        "llm_calls_with_provider_usage": stats.llm_calls_with_provider_usage,
+        "llm_calls_without_provider_usage": stats.llm_calls_without_provider_usage,
     })
 }
 
@@ -923,9 +950,13 @@ pub struct WorkerReport<'a> {
 /// Markdown 成功原子发布后删除临时 JSONL，最终每个 worker 只保留一份完整证据。
 pub fn render_worker_report(run: &WorkerRun, report: &WorkerReport<'_>) -> io::Result<PathBuf> {
     let target = run.report_path(report.unit);
-    let target_relative = run.relative_directory.join(format!("{}.md", report.unit));
+    let target_relative = run
+        .relative_directory
+        .join("workers")
+        .join(format!("{}.md", report.unit));
     let temporary = run
         .relative_directory
+        .join("workers")
         .join(format!(".tmp-worker-{}.md", report.unit));
     let rendered = (|| -> io::Result<()> {
         let file = run.root.create(&temporary)?;
@@ -996,12 +1027,12 @@ fn write_report_header(
     writeln!(writer, "- 审计证据：已完整合并到本文件的状态时间线")?;
     writeln!(
         writer,
-        "- 审计编码：同类请求首份保存完整正文，后续保存可逆字节增量；每次 SSE 流合并为一个折叠块"
+        "- 审计编码：同类请求首份保存完整正文，后续保存可逆字节增量；响应只保存解析后的允许事实"
     )?;
     if let Some(format) = report.record_format {
         writeln!(
             writer,
-            "- 完成记录：[{}.{}](../../{}.{})",
+            "- 完成记录：[{}.{}](../../../results/{}.{})",
             report.unit,
             format.extension(),
             report.unit,
@@ -1059,22 +1090,18 @@ fn render_audit_timeline(
         }
         Err(error) => return Err(error),
     };
-    let mut lines = BufReader::new(file).lines().enumerate();
+    let lines = BufReader::new(file).lines().enumerate();
     let mut request_bases = RequestAuditBases::default();
-    while let Some((index, line)) = lines.next() {
+    for (index, line) in lines {
         let line = line?;
         let line_number = index + 1;
         let value: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
             invalid_audit(display_path, line_number, format!("不是合法 JSON：{error}"))
         })?;
         let object = audit_object(&value, display_path, line_number)?;
-        let direction = audit_string(object, "direction", display_path, line_number)?;
-        if direction == "llm_event_stream" {
-            render_event_stream(writer, &value, line_number, display_path, &mut lines)?;
-        } else {
-            validate_audit_entry(&value, display_path, line_number, &mut request_bases)?;
-            render_audit_entry(writer, &value, line_number)?;
-        }
+        audit_string(object, "direction", display_path, line_number)?;
+        validate_audit_entry(&value, display_path, line_number, &mut request_bases)?;
+        render_audit_entry(writer, &value, line_number)?;
     }
     Ok(())
 }
@@ -1262,6 +1289,34 @@ fn validate_audit_entry(
             audit_u64(object, "input_budget", path, line)?;
             audit_bool(object, "force", path, line)?;
             audit_string(object, "action", path, line)?;
+        }
+        "model_response" => {
+            audit_exact_fields(
+                object,
+                &[
+                    "direction",
+                    "finish",
+                    "text",
+                    "tool_calls",
+                    "sequence",
+                    "elapsed_ms",
+                ],
+                path,
+                line,
+            )?;
+            validate_audit_stamp(object, path, line)?;
+            match audit_string(object, "finish", path, line)? {
+                "stop" | "tool_use" => {}
+                other => {
+                    return Err(invalid_audit(
+                        path,
+                        line,
+                        format!("未知模型完成类别 {other:?}"),
+                    ));
+                }
+            }
+            audit_string(object, "text", path, line)?;
+            audit_usize(object, "tool_calls", path, line)?;
         }
         "request" | "compaction_request" => {
             validate_request_audit(object, direction, path, line, request_bases)?;
@@ -1455,7 +1510,7 @@ fn validate_request_audit(
                 path,
                 line,
                 format!(
-                    "完整请求记录的 full_bytes 为 {full_bytes}，正文实际为 {} 字节",
+                    "完整模型输入记录的 full_bytes 为 {full_bytes}，正文实际为 {} 字节",
                     data.len()
                 ),
             ));
@@ -1570,6 +1625,29 @@ fn render_audit_entry(
                     .unwrap_or("unknown"),
             )?;
         }
+        "model_response" => {
+            let finish = value
+                .get("finish")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let tool_calls = value
+                .get("tool_calls")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let text = value
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            writeln!(
+                writer,
+                "完成类别：`{}`；工具调用：`{tool_calls}`；助手正文：`{}` bytes。\n",
+                markdown_inline(finish),
+                text.len(),
+            )?;
+            if !text.is_empty() {
+                write_details_code(writer, "解析后的助手正文", "text", text)?;
+            }
+        }
         "request" | "compaction_request" => {
             let attempt = value
                 .get("attempt")
@@ -1586,16 +1664,16 @@ fn render_audit_entry(
                     .unwrap_or("");
                 writeln!(
                     writer,
-                    "第 `{attempt}` 次尝试，请求体 `{}` bytes；这是该类请求的完整基准。\n",
+                    "第 `{attempt}` 次尝试，模型输入 `{}` bytes；这是该类输入的完整基准。\n",
                     data.len()
                 )?;
-                write_details_code(writer, "完整请求体（基准）", "json", data)?;
+                write_details_code(writer, "完整模型输入（基准）", "json", data)?;
             } else if encoding == "delta" {
                 render_request_delta(writer, value, attempt)?;
             } else {
                 writeln!(writer, "第 `{attempt}` 次尝试的请求编码无效。\n")?;
                 let data = serde_json::to_string_pretty(value).expect("JSON value 可序列化");
-                write_details_code(writer, "完整请求审计项", "json", &data)?;
+                write_details_code(writer, "完整模型输入审计项", "json", &data)?;
             }
         }
         "tool_call" => {
@@ -1752,7 +1830,7 @@ fn audit_title(direction: &str, value: &serde_json::Value) -> String {
             .unwrap_or_else(|| "状态变化".into()),
         "context_budget" => "上下文预算判断".into(),
         "request" => "LLM 请求".into(),
-        "llm_event_stream" => "LLM 原始事件流".into(),
+        "model_response" => "模型响应".into(),
         "tool_call" => "模型请求工具".into(),
         "tool_execution" => "工具执行事实".into(),
         "tool_result" => "工具结果".into(),
@@ -1771,41 +1849,6 @@ fn outcome_label(outcome: &str) -> &'static str {
         "failed" => "失败",
         _ => "未知",
     }
-}
-
-fn event_summary(data: &str) -> String {
-    if data == "[DONE]" {
-        return "SSE 结束标记".into();
-    }
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(data) else {
-        return "非 JSON SSE 负载".into();
-    };
-    if let Some(kind) = value.get("type").and_then(serde_json::Value::as_str) {
-        return format!("事件类型 `{}`", markdown_inline(kind));
-    }
-    if let Some(reason) = value
-        .pointer("/choices/0/finish_reason")
-        .and_then(serde_json::Value::as_str)
-    {
-        return format!("Chat Completions 完成原因 `{}`", markdown_inline(reason));
-    }
-    if let Some(reason) = value.get("stop_reason").and_then(serde_json::Value::as_str) {
-        return format!("Anthropic 完成原因 `{}`", markdown_inline(reason));
-    }
-    if value.pointer("/choices/0/delta/tool_calls").is_some() {
-        return "Chat Completions 工具调用增量".into();
-    }
-    if value
-        .pointer("/choices/0/delta/content")
-        .and_then(serde_json::Value::as_str)
-        .is_some()
-    {
-        return "Chat Completions 文本增量".into();
-    }
-    if value.get("usage").is_some() {
-        return "Chat Completions 用量".into();
-    }
-    "JSON SSE 负载".into()
 }
 
 fn render_request_delta(
@@ -1836,215 +1879,15 @@ fn render_request_delta(
     let suffix_bytes = base_bytes.saturating_sub(prefix_bytes.saturating_add(removed_bytes));
     writeln!(
         writer,
-        "第 `{attempt}` 次尝试，请求体 `{full_bytes}` bytes；相对上一份同类请求保留前 `{prefix_bytes}` bytes 和后 `{suffix_bytes}` bytes，删除 `{removed_bytes}` bytes，插入 `{}` bytes。\n",
+        "第 `{attempt}` 次尝试，模型输入 `{full_bytes}` bytes；相对上一份同类输入保留前 `{prefix_bytes}` bytes 和后 `{suffix_bytes}` bytes，删除 `{removed_bytes}` bytes，插入 `{}` bytes。\n",
         inserted.len()
     )?;
     writeln!(
         writer,
-        "> 重建规则：上一份请求的前 `{prefix_bytes}` bytes + 下方插入正文 + 从第 `{}` byte 起的剩余正文。\n",
+        "> 重建规则：上一份模型输入的前 `{prefix_bytes}` bytes + 下方插入正文 + 从第 `{}` byte 起的剩余正文。\n",
         prefix_bytes.saturating_add(removed_bytes)
     )?;
-    write_details_code(writer, "本轮请求变化（逐字保留）", "text", inserted)
-}
-
-fn render_event_stream<I>(
-    writer: &mut impl Write,
-    value: &serde_json::Value,
-    line_number: usize,
-    display_path: &Path,
-    lines: &mut I,
-) -> io::Result<()>
-where
-    I: Iterator<Item = (usize, io::Result<String>)>,
-{
-    use std::collections::BTreeMap;
-
-    const DISPLAYED_KINDS: usize = 8;
-    let object = audit_object(value, display_path, line_number)?;
-    audit_exact_fields(
-        object,
-        &[
-            "direction",
-            "sequence",
-            "elapsed_ms",
-            "event_count",
-            "total_bytes",
-            "max_backtick_run",
-        ],
-        display_path,
-        line_number,
-    )?;
-    validate_audit_stamp(object, display_path, line_number)?;
-    if audit_string(object, "direction", display_path, line_number)? != "llm_event_stream" {
-        return Err(invalid_audit(
-            display_path,
-            line_number,
-            "事件流 header 的 direction 必须是 llm_event_stream",
-        ));
-    }
-    let sequence = audit_u64(object, "sequence", display_path, line_number)?;
-    let elapsed_ms = audit_u64(object, "elapsed_ms", display_path, line_number)?;
-    let expected_count = audit_usize(object, "event_count", display_path, line_number)?;
-    if expected_count == 0 {
-        return Err(invalid_audit(
-            display_path,
-            line_number,
-            "事件流 header 的 event_count 必须不小于 1",
-        ));
-    }
-    let expected_bytes = audit_usize(object, "total_bytes", display_path, line_number)?;
-    let max_backtick_run = audit_usize(object, "max_backtick_run", display_path, line_number)?;
-    let mut events = Vec::new();
-    let mut actual_bytes = 0usize;
-    let mut actual_max_backtick_run = 0usize;
-    let mut counts = BTreeMap::<String, usize>::new();
-    let mut other_events = 0usize;
-    for expected_index in 0..expected_count {
-        let Some((line_index, line)) = lines.next() else {
-            return Err(invalid_audit(
-                display_path,
-                line_number,
-                format!(
-                    "事件流应有 {expected_count} 个负载，实际只有 {} 个",
-                    events.len()
-                ),
-            ));
-        };
-        let line = line?;
-        let child_line = line_index + 1;
-        let child: serde_json::Value = serde_json::from_str(&line).map_err(|error| {
-            invalid_audit(display_path, child_line, format!("不是合法 JSON：{error}"))
-        })?;
-        let child_object = audit_object(&child, display_path, child_line)?;
-        audit_exact_fields(
-            child_object,
-            &["direction", "stream_sequence", "index", "data"],
-            display_path,
-            child_line,
-        )?;
-        if audit_string(child_object, "direction", display_path, child_line)? != "llm_event_data" {
-            return Err(invalid_audit(
-                display_path,
-                child_line,
-                "事件流 child 的 direction 必须是 llm_event_data",
-            ));
-        }
-        let child_sequence = audit_u64(child_object, "stream_sequence", display_path, child_line)?;
-        if child_sequence != sequence {
-            return Err(invalid_audit(
-                display_path,
-                child_line,
-                format!("事件流 child 属于 stream {child_sequence}，header sequence 为 {sequence}"),
-            ));
-        }
-        let child_index = audit_usize(child_object, "index", display_path, child_line)?;
-        if child_index != expected_index {
-            return Err(invalid_audit(
-                display_path,
-                child_line,
-                format!("事件流 child index 为 {child_index}，期望 {expected_index}"),
-            ));
-        }
-        let data = audit_string(child_object, "data", display_path, child_line)?;
-        actual_bytes = actual_bytes
-            .checked_add(data.len())
-            .ok_or_else(|| invalid_audit(display_path, child_line, "事件流总字节数发生溢出"))?;
-        if actual_bytes > expected_bytes {
-            return Err(invalid_audit(
-                display_path,
-                child_line,
-                format!(
-                    "事件流实际负载已达到 {actual_bytes} 字节，超过 header 的 {expected_bytes} 字节"
-                ),
-            ));
-        }
-        actual_max_backtick_run = actual_max_backtick_run.max(longest_backtick_run(data));
-        if actual_max_backtick_run > max_backtick_run {
-            return Err(invalid_audit(
-                display_path,
-                child_line,
-                format!(
-                    "事件流实际反引号连续长度已达到 {actual_max_backtick_run}，超过 header 的 {max_backtick_run}"
-                ),
-            ));
-        }
-        let summary = event_summary(data);
-        if let Some(count) = counts.get_mut(&summary) {
-            *count += 1;
-        } else if counts.len() < DISPLAYED_KINDS {
-            counts.insert(summary, 1);
-        } else {
-            other_events += 1;
-        }
-        events.push(data.to_owned());
-    }
-    if events.len() != expected_count {
-        return Err(invalid_audit(
-            display_path,
-            line_number,
-            format!(
-                "事件流记录为 {expected_count} 个负载，实际读到 {} 个",
-                events.len()
-            ),
-        ));
-    }
-    if actual_bytes != expected_bytes {
-        return Err(invalid_audit(
-            display_path,
-            line_number,
-            format!("事件流 total_bytes 为 {expected_bytes}，实际负载共 {actual_bytes} 字节"),
-        ));
-    }
-    if actual_max_backtick_run != max_backtick_run {
-        return Err(invalid_audit(
-            display_path,
-            line_number,
-            format!(
-                "事件流 max_backtick_run 为 {max_backtick_run}，实际为 {actual_max_backtick_run}"
-            ),
-        ));
-    }
-    let fence_length = actual_max_backtick_run
-        .checked_add(1)
-        .ok_or_else(|| invalid_audit(display_path, line_number, "事件流 Markdown fence 长度溢出"))?
-        .max(3);
-    let fence = "`".repeat(fence_length);
-
-    writeln!(
-        writer,
-        "### {sequence}. +{elapsed_ms} ms · LLM 原始事件流\n"
-    )?;
-    writeln!(
-        writer,
-        "本次响应包含 `{expected_count}` 个原始 SSE data 负载，共 `{expected_bytes}` bytes；已合并显示，不按 token 片段展开标题。\n"
-    )?;
-    writeln!(writer, "<details>")?;
-    writeln!(writer, "<summary>完整原始事件流（按到达顺序）</summary>\n")?;
-    writeln!(writer, "{fence}json")?;
-    writeln!(writer, "[")?;
-    for (index, data) in events.iter().enumerate() {
-        if index > 0 {
-            writeln!(writer, ",")?;
-        }
-        let encoded = serde_json::to_string(data).expect("SSE 原始负载可序列化为 JSON string");
-        write!(writer, "  {encoded}")?;
-    }
-    writeln!(writer)?;
-    writeln!(writer, "]")?;
-    writeln!(writer, "{fence}\n")?;
-    writeln!(writer, "</details>\n")?;
-
-    let mut parts: Vec<String> = counts
-        .into_iter()
-        .map(|(kind, count)| format!("{kind} × `{count}`"))
-        .collect();
-    if other_events > 0 {
-        parts.push(format!("其他事件 × `{other_events}`"));
-    }
-    if !parts.is_empty() {
-        writeln!(writer, "事件概况：{}。\n", parts.join("；"))?;
-    }
-    Ok(())
+    write_details_code(writer, "本轮模型输入变化（逐字保留）", "text", inserted)
 }
 
 fn write_reason(writer: &mut impl Write, reason: Option<&str>) -> io::Result<()> {
@@ -2094,31 +1937,6 @@ fn markdown_inline(text: &str) -> String {
         }
     }
     escaped
-}
-
-/// 作业汇总：完成数、失败单元号、取消数；失败原因已在各单元完成时即时报告。
-pub struct Summary {
-    pub completed: u64,
-    pub failed: Vec<u64>,
-    pub cancelled: u64,
-}
-
-impl Summary {
-    pub fn render(&self) -> String {
-        let mut line = format!("完成 {}，失败 {}", self.completed, self.failed.len());
-        if !self.failed.is_empty() {
-            let ids: Vec<String> = self.failed.iter().map(u64::to_string).collect();
-            line.push_str(&format!("；失败单元：{}", ids.join(", ")));
-        }
-        if self.cancelled > 0 {
-            line.push_str(&format!("；取消 {}（作业已被终止）", self.cancelled));
-        }
-        line
-    }
-
-    pub fn exit_code(&self) -> u8 {
-        if self.failed.is_empty() { 0 } else { 1 }
-    }
 }
 
 #[cfg(test)]
@@ -2187,14 +2005,15 @@ mod tests {
     }
 
     #[test]
-    fn publish_atomically_replaces_existing_record() {
+    fn publish_never_overwrites_existing_record() {
         let directory = tempfile::tempdir().unwrap();
         let root = OutputRoot::open(directory.path().to_path_buf()).unwrap();
         publish(&root, 1, "old", RecordFormat::Markdown).unwrap();
-        publish(&root, 1, "new", RecordFormat::Markdown).unwrap();
+        let error = publish(&root, 1, "new", RecordFormat::Markdown).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(
             fs::read_to_string(directory.path().join("1.md")).unwrap(),
-            "new"
+            "old"
         );
         assert!(!directory.path().join(".tmp-unit-1").exists());
     }
@@ -2214,7 +2033,6 @@ mod tests {
         fs::write(ambient.join("attacker-marker"), "replacement").unwrap();
 
         publish(&root, 1, "result", RecordFormat::Markdown).unwrap();
-        append_stats(&root, 1, "published", &UnitStats::default()).unwrap();
         let run = WorkerRun::create(
             &root,
             JobReportFacts {
@@ -2229,6 +2047,7 @@ mod tests {
             },
         )
         .unwrap();
+        append_stats(&run, 1, "published", &UnitStats::default()).unwrap();
         let mut audit = AuditLog::create(&run, 1).unwrap();
         audit
             .push(&AuditEntry::State {
@@ -2258,10 +2077,16 @@ mod tests {
             fs::read_to_string(opened_directory.join("1.md")).unwrap(),
             "result"
         );
-        assert!(opened_directory.join("stats.jsonl").exists());
         assert!(
             opened_directory
                 .join(&run.relative_directory)
+                .join("stats.jsonl")
+                .exists()
+        );
+        assert!(
+            opened_directory
+                .join(&run.relative_directory)
+                .join("workers")
                 .join("1.md")
                 .exists(),
             "最终 worker 档案必须留在启动时打开的输出目录"
@@ -2314,9 +2139,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(run.directory.parent(), Some(out.join("workers").as_path()));
+        assert_eq!(run.directory.parent(), Some(out.join("runs").as_path()));
         let name = run.directory.file_name().unwrap().to_string_lossy();
-        assert!(name.ends_with('Z'), "任务目录应使用 UTC 时间戳：{name}");
+        assert_eq!(name, "run-000001");
 
         let mut audit = AuditLog::create(&run, 7).unwrap();
         audit
@@ -2333,11 +2158,11 @@ mod tests {
         );
         audit.push_llm_request(1, &first_request).unwrap();
         audit
-            .push_llm_event_stream(&[
-                r#"{"type":"response.output_text.delta","delta":"甲"}"#.into(),
-                r#"{"type":"response.output_text.delta","delta":"乙"}"#.into(),
-                r#"{"type":"response.completed"}"#.into(),
-            ])
+            .push(&AuditEntry::ModelResponse {
+                finish: "stop".into(),
+                text: "甲乙".into(),
+                tool_calls: 0,
+            })
             .unwrap();
         audit.push_llm_request(1, &second_request).unwrap();
         audit.finish().unwrap();
@@ -2357,7 +2182,7 @@ mod tests {
         assert_eq!(requests[1]["request_encoding"], "delta");
         assert!(
             requests[1].to_string().len() < second_request.len(),
-            "共享前后文较大时，增量审计必须小于重复保存完整请求"
+            "共享前后文较大时，增量审计必须小于重复保存完整模型输入"
         );
         let prefix = requests[1]["prefix_bytes"].as_u64().unwrap() as usize;
         let removed = requests[1]["removed_bytes"].as_u64().unwrap() as usize;
@@ -2367,25 +2192,17 @@ mod tests {
         reconstructed.push_str(inserted);
         reconstructed.push_str(&first_request[prefix + removed..]);
         assert_eq!(reconstructed, second_request, "UTF-8 增量必须逐字可逆");
-        let streams: Vec<&serde_json::Value> = audit_lines
+        let responses: Vec<&serde_json::Value> = audit_lines
             .iter()
-            .filter(|entry| entry["direction"] == "llm_event_stream")
+            .filter(|entry| entry["direction"] == "model_response")
             .collect();
-        assert_eq!(streams.len(), 1, "一次响应流只应产生一个审计项");
-        assert_eq!(streams[0]["event_count"], 3);
-        let event_data: Vec<&str> = audit_lines
-            .iter()
-            .filter(|entry| entry["direction"] == "llm_event_data")
-            .map(|entry| entry["data"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            event_data,
-            [
-                r#"{"type":"response.output_text.delta","delta":"甲"}"#,
-                r#"{"type":"response.output_text.delta","delta":"乙"}"#,
-                r#"{"type":"response.completed"}"#,
-            ],
-            "合并后必须保留每个原始负载的文字、边界和顺序"
+        assert_eq!(responses.len(), 1, "一次成功调用只应产生一个响应审计项");
+        assert_eq!(responses[0]["text"], "甲乙");
+        assert!(
+            !fs::read_to_string(run.audit_path(7))
+                .unwrap()
+                .contains("response.output_text.delta"),
+            "供应商 SSE envelope 不得进入 worker 审计"
         );
 
         let stats = UnitStats {
@@ -2413,27 +2230,33 @@ mod tests {
         assert!(markdown.contains("状态：准备输入"), "{markdown}");
         assert!(markdown.contains("完整输入"), "{markdown}");
         assert_eq!(
-            markdown.matches("完整请求体（基准）").count(),
+            markdown.matches("完整模型输入（基准）").count(),
             1,
             "后续请求不得重复展开完整历史：{markdown}"
         );
-        assert!(markdown.contains("本轮请求变化（逐字保留）"), "{markdown}");
-        assert_eq!(
-            markdown.matches("LLM 原始事件流").count(),
-            1,
-            "SSE 片段不得各自生成标题：{markdown}"
+        assert!(
+            markdown.contains("本轮模型输入变化（逐字保留）"),
+            "{markdown}"
         );
-        assert!(markdown.contains("response.completed"), "{markdown}");
+        assert_eq!(
+            markdown.matches("模型响应").count(),
+            1,
+            "解析后的响应只生成一个标题：{markdown}"
+        );
+        assert!(markdown.contains("甲乙"), "{markdown}");
+        assert!(!markdown.contains("response.completed"), "{markdown}");
         assert!(markdown.contains("结局：`failed`"), "{markdown}");
         assert!(markdown.contains("模型拒绝执行"), "{markdown}");
         assert!(!run.audit_path(7).exists(), "成功渲染后不得保留重复 JSONL");
         assert!(
-            fs::read_dir(&run.directory).unwrap().all(|entry| entry
+            fs::read_dir(run.directory.join("workers"))
                 .unwrap()
-                .path()
-                .extension()
-                .is_some_and(|ext| ext == "md")),
-            "成功结束后不得残留请求基准或其他临时文件"
+                .all(|entry| entry
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "md")),
+            "成功结束后不得残留模型输入基准或其他临时文件"
         );
     }
 
@@ -2465,24 +2288,6 @@ mod tests {
             "inserted": "",
             "full_bytes": 3,
         });
-        let stream_header = |event_count: usize, total_bytes: usize| {
-            serde_json::json!({
-                "direction": "llm_event_stream",
-                "sequence": 1,
-                "elapsed_ms": 0,
-                "event_count": event_count,
-                "total_bytes": total_bytes,
-                "max_backtick_run": 0,
-            })
-        };
-        let stream_child = |stream_sequence: u64, index: usize| {
-            serde_json::json!({
-                "direction": "llm_event_data",
-                "stream_sequence": stream_sequence,
-                "index": index,
-                "data": "x",
-            })
-        };
         let cases = [
             ("空 object", "{}\n".to_string()),
             (
@@ -2540,35 +2345,17 @@ mod tests {
                 ),
             ),
             (
-                "stream child 数量不足",
-                format!("{}\n{}\n", stream_header(2, 2), stream_child(1, 0)),
-            ),
-            (
-                "stream child index 错误",
-                format!("{}\n{}\n", stream_header(1, 1), stream_child(1, 1)),
-            ),
-            (
-                "stream child sequence 错误",
-                format!("{}\n{}\n", stream_header(1, 1), stream_child(2, 0)),
-            ),
-            (
-                "stream total_bytes 错误",
-                format!("{}\n{}\n", stream_header(1, 2), stream_child(1, 0)),
-            ),
-            (
-                "stream max_backtick_run 极值",
-                format!(
-                    "{}\n{}\n",
-                    serde_json::json!({
-                        "direction": "llm_event_stream",
-                        "sequence": 1,
-                        "elapsed_ms": 0,
-                        "event_count": 1,
-                        "total_bytes": 1,
-                        "max_backtick_run": u64::MAX,
-                    }),
-                    stream_child(1, 0)
-                ),
+                "模型响应含未知完成类别",
+                serde_json::json!({
+                    "direction": "model_response",
+                    "sequence": 1,
+                    "elapsed_ms": 0,
+                    "finish": "unknown",
+                    "text": "",
+                    "tool_calls": 0,
+                })
+                .to_string()
+                    + "\n",
             ),
         ];
         for (name, contents) in cases {

@@ -180,10 +180,7 @@ impl super::Transform for Transform {
                         let name =
                             required_nonempty_string(content_block, "name", "tool_use", payload)?;
                         if self.tool_call_ids.contains(&call_id) {
-                            return Err(LlmError::protocol(
-                                format!("同一回合重复提供工具调用 id {call_id:?}"),
-                                payload,
-                            ));
+                            return Err(LlmError::protocol("同一回合重复提供工具调用 id", payload));
                         }
                         self.tool_call_ids.insert(call_id.clone());
                         ActiveContentBlock::ToolUse(PendingToolUse {
@@ -668,6 +665,7 @@ mod tests {
             api_key: None,
             context_window_tokens: 131072,
             anthropic_max_tokens: Some(16384),
+            ..LlmConfig::test_defaults()
         };
         let history = vec![
             Message::User("任务".into()),

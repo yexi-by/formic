@@ -23,6 +23,7 @@ pub enum OutputContract {
 pub struct StructuredOutput {
     schema: Value,
     validator: jsonschema::Validator,
+    source: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,16 +94,33 @@ impl OutputContract {
                         reason: error.to_string(),
                     }
                 })?;
-                let pretty_schema = format!(
-                    "{}\n",
-                    serde_json::to_string_pretty(&schema).expect("JSON Value 可序列化")
-                );
-                enforce_structured_directory(out_root, &schema, &pretty_schema)?;
+                validate_structured_directory(out_root, &schema)?;
                 Ok(Self::Structured(Arc::new(StructuredOutput {
                     schema,
                     validator,
+                    source: bytes,
                 })))
             }
+        }
+    }
+
+    /// 作业身份与已有结果均已通过校验后，才发布结构化 schema 记录。
+    /// `prepare` 本身只读，错误的 `--resume` 因而不会改变输出树。
+    pub fn publish_schema_record(&self, out_root: &OutputRoot) -> Result<(), OutputContractError> {
+        let Self::Structured(contract) = self else {
+            return Ok(());
+        };
+        let pretty_schema = format!(
+            "{}\n",
+            serde_json::to_string_pretty(&contract.schema).expect("JSON Value 可序列化")
+        );
+        publish_structured_schema(out_root, &contract.schema, &pretty_schema)
+    }
+
+    pub fn source_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Text => None,
+            Self::Structured(contract) => Some(&contract.source),
         }
     }
 
@@ -144,6 +162,27 @@ impl OutputContract {
 
     pub fn is_structured(&self) -> bool {
         matches!(self, Self::Structured(_))
+    }
+
+    pub fn validate_published_record(&self, bytes: &[u8]) -> Result<(), String> {
+        match self {
+            Self::Text => {
+                let text =
+                    std::str::from_utf8(bytes).map_err(|_| "完成记录不是合法 UTF-8".to_string())?;
+                if text.trim().is_empty() {
+                    return Err("完成记录为空".into());
+                }
+                Ok(())
+            }
+            Self::Structured(contract) => {
+                let value: Value = serde_json::from_slice(bytes)
+                    .map_err(|_| "完成记录不是合法 JSON".to_string())?;
+                if let Some(error) = contract.validator.iter_errors(&value).next() {
+                    return Err(format!("完成记录不符合当前 schema：{error}"));
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -285,10 +324,9 @@ fn enforce_text_directory(out_root: &OutputRoot) -> Result<(), OutputContractErr
     Ok(())
 }
 
-fn enforce_structured_directory(
+fn validate_structured_directory(
     out_root: &OutputRoot,
     schema: &Value,
-    pretty_schema: &str,
 ) -> Result<(), OutputContractError> {
     if let Some(record) = numbered_record(out_root, "md")? {
         return Err(directory_error(
@@ -324,6 +362,20 @@ fn enforce_structured_directory(
             "已有结构化完成记录但缺少 output-schema.json，无法确认其契约",
         ));
     }
+    Ok(())
+}
+
+fn publish_structured_schema(
+    out_root: &OutputRoot,
+    schema: &Value,
+    pretty_schema: &str,
+) -> Result<(), OutputContractError> {
+    // 发布前重新确认目录仍与已准备的契约一致，避免校验后并发变化被覆盖。
+    validate_structured_directory(out_root, schema)?;
+    let record = Path::new(SCHEMA_RECORD);
+    if out_root.exists(record) {
+        return Ok(());
+    }
     let temporary = Path::new(".tmp-output-schema");
     out_root
         .write(temporary, pretty_schema)
@@ -334,7 +386,7 @@ fn enforce_structured_directory(
     out_root
         .rename(temporary, record)
         .map_err(|source| OutputContractError::Write {
-            path: display_record,
+            path: out_root.display(record),
             source,
         })
 }
@@ -428,6 +480,30 @@ mod tests {
     }
 
     #[test]
+    fn compiled_contract_and_job_identity_share_one_schema_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let schema_path = directory.path().join("schema.json");
+        let source = serde_json::to_vec(&valid_schema()).unwrap();
+        fs::write(&schema_path, &source).unwrap();
+        let out = directory.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let out_root = OutputRoot::open(out.clone()).unwrap();
+
+        let contract = OutputContract::prepare(Some(&schema_path), &out_root).unwrap();
+        fs::write(
+            &schema_path,
+            r#"{"type":"object","properties":{},"required":[],"additionalProperties":false}"#,
+        )
+        .unwrap();
+
+        assert_eq!(contract.source_bytes(), Some(source.as_slice()));
+        contract.publish_schema_record(&out_root).unwrap();
+        let published: Value =
+            serde_json::from_slice(&fs::read(out.join(SCHEMA_RECORD)).unwrap()).unwrap();
+        assert_eq!(published, valid_schema());
+    }
+
+    #[test]
     fn directory_cannot_mix_modes_or_schemas() {
         let directory = tempfile::tempdir().unwrap();
         let schema_path = directory.path().join("schema.json");
@@ -438,7 +514,9 @@ mod tests {
         let out_root = OutputRoot::open(out.clone()).unwrap();
         assert!(OutputContract::prepare(Some(&schema_path), &out_root).is_err());
         fs::remove_file(out.join("1.md")).unwrap();
-        OutputContract::prepare(Some(&schema_path), &out_root).unwrap();
+        let contract = OutputContract::prepare(Some(&schema_path), &out_root).unwrap();
+        assert!(!out.join(SCHEMA_RECORD).exists());
+        contract.publish_schema_record(&out_root).unwrap();
         assert!(OutputContract::prepare(None, &out_root).is_err());
         let other = serde_json::json!({
             "type":"object","properties":{},"required":[],"additionalProperties":false
@@ -460,7 +538,9 @@ mod tests {
 
         fs::rename(&ambient, &opened_directory).unwrap();
         fs::create_dir(&ambient).unwrap();
-        OutputContract::prepare(Some(&schema_path), &out_root).unwrap();
+        let contract = OutputContract::prepare(Some(&schema_path), &out_root).unwrap();
+        assert!(!opened_directory.join(SCHEMA_RECORD).exists());
+        contract.publish_schema_record(&out_root).unwrap();
 
         assert!(opened_directory.join(SCHEMA_RECORD).exists());
         assert!(!ambient.join(SCHEMA_RECORD).exists());

@@ -4,7 +4,7 @@
 
 ## 1. 目标与边界
 
-Formic 是一次命令对应一个作业的自主批处理调度中心。调用方提供数据目录、JSONL 计划、任务说明、输出目录和 worker 并发。每个计划单元独立运行多轮 LLM 会话；完成记录以自然单元编号为键原子发布。
+Formic 是一次命令对应一个作业的自主批处理调度中心。调用方提供数据目录、JSONL 计划、任务说明和输出目录；worker 并发来自配置，并可由本次 CLI 显式覆盖。每个计划单元独立运行多轮 LLM 会话；完成记录以自然单元编号为键原子发布。
 
 系统不限制计划单元总量、对话总回合数或工具调用总数。它只限制当前活动 worker、排队工具请求和单次资源占用。合法工作在窗口满时等待，不能因为总量较大而变成容量错误。真实文件系统错误、模型上下文限制、用户配置的并发和结果大小不能绕过。
 
@@ -30,22 +30,29 @@ Formic 调度的是独立结果，不是会互相协商的角色。一个计划�
 
 ```text
 formic run --data <dir> --plan <jsonl> --task <file> --out <dir>
-           --concurrency <n> [--output-schema <schema.json>]
+           [--config <file>] [--concurrency <n>] [--resume]
+           [--output-schema <schema.json>]
 ```
 
-Formic 只读取当前工作目录的 `config.toml`，不接受配置路径参数，也不热加载。LLM 的非空环境变量逐字段覆盖文件值。协议由 `FORMIC_LLM_PROTOCOL` 选择；上下文窗口必须由配置或环境变量明确给出。只有 Anthropic Messages 另需供应商专用的 `anthropic_max_tokens`，其他协议不接受输出 token 配置。
+`--config` 明确选择配置文件，指定文件不存在时直接失败；省略时读取当前目录的 `config.toml`，不搜索父目录，也不热加载，默认文件缺失时允许完全使用环境配置。LLM 的非空环境变量逐字段覆盖文件值。协议由 `FORMIC_LLM_PROTOCOL` 选择；上下文窗口必须由配置或环境变量明确给出。只有 Anthropic Messages 另需供应商专用的 `anthropic_max_tokens`，其他协议不接受输出 token 配置。`execution.max_concurrent_units` 是正式 worker 窗口，`--concurrency` 只覆盖本轮。
 
 计划是一行一个 object 的 JSONL。单元可以指定文件集合，或一个文件的 1 起始闭区间行范围。启动边界会拒绝空分片、重复/零单元号、缺失文件、绝对路径和根目录逃逸。
 
-文本模式的完成事实是 `out/<unit>.md`。结构化模式的完成事实是 `out/<unit>.json`，并由 `out/output-schema.json` 记录该目录唯一的 schema。两种模式不得在同一输出目录混用。输出目录与数据目录不得相同或互相包含，并由进程锁保证同一时刻只有一个作业使用；锁、schema、审计、报告、统计和完成记录都相对启动时打开的同一输出目录句柄操作，运行中替换 ambient 路径不能改写写入位置或绕过锁。每次任务另建 `out/workers/<UTC任务时间戳>/`，每个计划单元对应一个 `<unit>.md` 运行档案。
+文本模式的结果是 `out/results/<unit>.md`。结构化模式的结果是 `out/results/<unit>.json`，并由 `out/results/output-schema.json` 记录该目录唯一的 schema。结果文件不可覆盖；只有结果与追加式作业状态都表明 published 时才是可继续作业中的已完成事实。两种模式不得在同一输出目录混用。输出目录与数据目录不得相同或互相包含，并由进程锁保证同一时刻只有一个作业使用；锁、schema、审计、报告、统计和结果都相对启动时打开的同一输出目录句柄操作，运行中替换 ambient 路径不能改写写入位置或绕过锁。每轮另建 `out/runs/run-000001/`，worker 档案位于 `workers/<unit>.md`，本轮统计与汇总分别为 `stats.jsonl` 和 `summary.json`。
+
+首次运行一次写入私有作业清单，内部摘要按无歧义长度 framing 覆盖 plan、task、schema 和完整 input；状态变化只追加自然序号 JSONL，不在每次更新时重写全量单元 map。`--resume` 在启动任何 MCP 或 LLM 请求前验证输入和计划单元集合未变，核对状态与每个结果，并把上次仍为 started 的单元转为 stopped。published 之外的单元可以重试；缺失状态、损坏结果、未知结果文件或模式冲突直接失败，不猜测、不覆盖现场。
 
 ## 3. 执行与取消
 
-主入口只有取得 `--concurrency` 许可后才创建 worker task。计划可以很大，但同时存在的活动 worker 数有界。每个 worker 同时最多等待一个工具调用。
+主入口边接纳 worker、边回收已完成结果，只在生效的并发窗口内创建 task。计划索引和恢复状态随单元总量线性增长；worker 对话、模型请求、档案渲染和已完成样例只随活动窗口增长，不积累全量结果。每个 worker 同时最多等待一个工具调用。
 
 取消令牌从作业传到 worker、LLM 流、调度器排队、信号量等待、本地遍历和 MCP 调用。排队时已经取消的请求不会启动。本地 `search` 和 `read` 在文件/行/匹配边界检查取消；MCP 和 LLM 的异步等待直接与取消令牌竞争。收到第一次终止信号后不再接纳单元，已发布结果保留。
 
-单元 panic、协议错误、工具运行错误、拒绝、输出截断和结构修正耗尽彼此隔离。作业按计划顺序汇总失败编号，不用并发完成顺序改变可观察结果。
+单元 panic、协议错误、工具运行错误、拒绝、输出截断和结构修正耗尽彼此隔离。作业只保留计划顺序最前的五个未完成样例，不随完成数量积累编号。终端进度只在观测到的整数百分比改变时打印普通 stderr 行，成功终态才显示 100%。
+
+LLM 的连接、单次读取、整次请求超时与网络重试由独立配置负责；`llm_attempts` 只用于模型结构修正和后续回合。所有 worker 共享一个请求门控：401、403、allowlist 中明确的 quota/account code、超长 `Retry-After` 或重试耗尽会停止接纳；普通 429 的 `Retry-After` 形成共享 not-before。可选 `requests_per_minute` 分配请求时间槽，worker 并发本身不称为限流。在途请求允许完成；等待下一次调用者停止，尚未启动的计划保持 not_started。
+
+HTTP 错误正文最多在内存读取 1 KiB，只解析固定 JSON 位置中的 allowlist code，随后丢弃。未知 code 或 message 不参与分类。HTTP 状态、公开类别、allowlist code 和 `Retry-After` 是唯一可公开的供应商错误事实；URL、reqwest 原文、错误正文和无效协议 payload 不进入 stderr、worker 档案或 stats。
 
 ## 4. 唯一工具执行入口
 
@@ -60,7 +67,7 @@ Scheduler 有界收件箱（容量 = worker 并发）
   └─ MCP：逐服务器 semaphore + 逐工具 semaphore + async client
 ```
 
-`ToolRegistry` 在 worker 启动前冻结模型可见的名称、schema、来源和执行目标，并按名称稳定排序。worker 不能直接持有 MCP client 或本地 executor，因此限流、取消、缓存、计时和审计没有第二套规则。
+`ToolRegistry` 在 worker 启动前冻结模型可见的名称、schema、来源和执行目标，并按名称稳定排序。worker 不能直接持有 MCP client 或本地 executor，因此工具准入、取消、缓存、计时和审计没有第二套规则。
 
 并发限制完全来自操作者配置。内核不会依据 server 或工具产品名设置特殊吞吐上限。不同 MCP server 使用独立许可，一个慢 server 不占用其他 server 或内置工具的许可。统计记录每个工具的排队/执行时间及每个 MCP server 的当前和峰值在途数。
 
@@ -100,7 +107,7 @@ MCP 结果接受 text 与 `structuredContent`。纯结构数据稳定序列化�
 
 ## 8. 缓存与请求稳定性
 
-工具目录、工具 schema、输出 schema、名称和顺序在作业内不变。系统 instructions、任务说明和数据清单位于分片前；动态分片与后续历史只追加在末尾。当前不发送供应商专有 cache hint，避免将后端特性冒充公共契约。
+工具目录、工具 schema、输出 schema、名称和顺序在作业内不变。系统 instructions 与任务说明位于共享前缀；提示只说明完整 input 根可由工具搜索，不重复列出全量文件。当前单元文件或行区间与后续历史只追加在末尾。当前不发送供应商专有 cache hint，避免将后端特性冒充公共契约。
 
 Completions 与 Responses 的请求只包含模型名、实际消息或 input、工具目录和 `stream`；
 不发送 temperature、top_p、任何 max token、reasoning、verbosity、seed、stop、penalty 或
@@ -130,16 +137,16 @@ anthropic: context_window_tokens - anthropic_max_tokens - context_safety_tokens
 
 ## 10. Worker 运行档案、统计与验证
 
-worker 运行时把状态变化、上下文预算、LLM 请求、原始 SSE、工具参数/来源/结果、排队与执行时间、缓存决定、重试、结构校验和压缩事件写入当前任务目录中的临时 JSONL。普通请求与压缩请求分别以第一份完整正文为基准，后续同类请求保存可逆字节增量；上一份请求只放在磁盘临时基准中，不随历史增长占用 worker 内存。一次调用的 SSE data 负载按到达顺序合并为一个事件流审计项。响应流超过 64 MiB 时调用失败；审计保存此前全部字节，并为触发超限的网络块保存最多 64 KiB 原始前缀及块长度、遗漏长度、超限量和编码，避免静默丢失证据或再次产生无界分配。每个时间线项带自然序号和相对 worker 启动时间；审计写入失败会阻止单元发布。
+worker 运行时把状态变化、上下文预算、协议无关的 LLM 输入语义、通过协议与回合验收后的模型响应事实、工具参数/来源/结果、排队与执行时间、缓存决定、重试、结构校验和压缩事件写入当前 run 的临时 JSONL。普通调用与压缩调用分别以第一份完整输入为基准，后续同类输入保存可逆字节增量；上一份输入只放在磁盘临时基准中，不随历史增长占用 worker 内存。实际 HTTP body、URL 和 header 不进入档案；Responses 的 opaque/encrypted replay item 只记录数量。模型响应事实只保存完成类别、解析后的助手正文和工具调用数量。供应商 SSE envelope、残帧、超限块、错误正文和无效协议 payload 不进入档案；超时、取消、传输、流量超限和协议失败只保留类型化原因。每个时间线项带自然序号和相对毫秒时间；审计写入失败会阻止单元发布。
 
-worker 结束后，运行时流式读取临时事件并原子生成 `workers/<UTC任务时间戳>/<unit>.md`。文档先呈现结局、冻结配置、统计和按时间排序的逻辑状态；首份请求、后续请求变化量和未触发流上限的完整原始响应流放在折叠区，不推测模型不可见的内部思维。请求增量按记录中的前缀、删除量和插入原文可逐字还原，因此去重不以丢失审计证据为代价。Markdown 成功后删除临时 JSONL，因此一个 worker 最终只有一份完整证据；渲染失败会产生用户可见诊断并保留临时文件，避免现场丢失。成功、失败、取消和 panic 都走同一渲染入口。
+worker 结束后，运行时流式读取临时事件并原子生成 `runs/run-N/workers/<unit>.md`。文档先呈现结局、冻结配置、统计和按时间排序的逻辑状态；首份协议无关输入、后续输入变化量和解析后的助手正文放在折叠区，不推测模型不可见的内部思维，也不展示供应商传输 envelope。输入增量按记录中的前缀、删除量和插入原文可逐字还原，因此去重不以丢失允许审计事实为代价。Markdown 成功后删除临时 JSONL，因此一个 worker 最终只有一份完整证据；渲染失败会产生用户可见诊断并保留临时文件，避免现场丢失。成功、失败、停止和 panic 都走同一渲染入口。
 
-`stats.jsonl` 保存回合、调用、重试、工具计数、本地 token 估算、供应商 usage、缓存命中/合并/淘汰、工具等待/执行时间、MCP 在途峰值以及压缩前后 token。stats 是派生观测，写入失败只产生诊断，不改写已经确定的业务结果。
+每轮 `stats.jsonl` 保存回合、真实调用、网络重试、工具计数、本地 token 估算、供应商 usage、缓存命中/合并/淘汰、工具等待/执行时间、MCP 在途峰值以及压缩前后 token。`summary.json` 保存七种单元数量、自然样例、失败原因、停发原因，以及模型调用有/无 provider usage 的数量。stats 是派生观测，写入失败只产生诊断，不改写已经确定的业务结果。
 
-测试覆盖三种 LLM 协议的文本/结构化成功、非法修正、混合工具、拒绝、截断和耗尽；本地 read/search 路径边界；缓存 singleflight/LRU；真实 stdio 与 Streamable HTTP fake MCP 的分页发现、认证、job/unit 会话、超时无重放；上下文压缩；以及 1000 个单元经过有界调度器而不产生容量错误。
+测试覆盖三种 LLM 协议的文本/结构化成功、非法修正、混合工具、拒绝、截断和耗尽；401/403/quota/account、429 数字与 HTTP-date、503、超时、坏协议、停发竞态和敏感正文不泄漏；resume 的完整、部分、全完成、输入变化和损坏现场；本地 read/search 路径边界；缓存 singleflight/LRU；真实 stdio 与 Streamable HTTP fake MCP 的分页发现、认证、job/unit 会话、超时无重放；上下文压缩；以及高单元量追加状态和有界活动 worker。
 
 ## 11. 参考实现的取舍
 
-`reference/codex` 提供了 headless 会话、统一工具调度、Responses 请求映射和结构化结果处理的参考；`reference/grok-build` 提供了多协议 transform、伪终止工具、本地 schema 二次校验和有界修正的参考。Formic 采用这些职责划分，不采用它们的 TUI、审批、插话、会话恢复或通用 shell 能力。
+`reference/codex` 提供了 headless 会话、统一工具调度、Responses 请求映射和结构化结果处理的参考；`reference/grok-build` 提供了多协议 transform、伪终止工具、本地 schema 二次校验和有界修正的参考。Formic 采用这些职责划分，不采用它们的 TUI、审批、插话、模型会话恢复或通用 shell 能力；Formic 自己的 `--resume` 只依据不可变结果和机器作业状态继续独立单元，不重放对话。
 
 网络搜索不是 Formic 内核中的特殊协议。内置 `search` 只检索本地输入/输出文件；远端搜索由操作者选择任意 MCP server 提供，并与其他 MCP 一样经过冻结目录、限流、取消和审计。这样不会把 Firecrawl、SearXNG、Playwright 或其他实现硬编码成产品限制。

@@ -4,8 +4,9 @@ Formic 是面向大量独立语义任务的 Rust CLI。调用方提供数据目�
 任务说明，Formic 为每个单元运行独立的多轮 `LLM ↔ 工具` 会话，并负责并发、限流、
 取消、缓存、上下文压缩、原子发布和 worker 运行档案。
 
-Formic 不限制单元总量、总回合数或工具调用总数。`--concurrency` 只限制同时活动的
-worker，工具调度器再按用户配置限制当前在途调用；窗口满时后续工作等待。
+Formic 不限制单元总量、总回合数或工具调用总数。`execution.max_concurrent_units` 限制
+同时活动的 worker，`--concurrency` 只对本次运行显式覆盖；工具调度器再按用户配置限制
+当前在途调用。并发窗口不是请求频率限制，需要时另用 `requests_per_minute`。
 
 ## 什么时候使用 Formic
 
@@ -24,8 +25,8 @@ Formic 的工作单元必须能够独立完成、独立重试、独立发布。�
 
 ## 快速开始
 
-需要 Rust 1.88 或更高版本。复制 [`config.example.toml`](config.example.toml) 为当前
-工作目录的 `config.toml`，填写模型信息，并设置 `FORMIC_LLM_PROTOCOL`。
+需要 Rust 1.88 或更高版本。复制 [`config.example.toml`](config.example.toml)，填写模型
+信息，并设置 `FORMIC_LLM_PROTOCOL`。配置可以留在固定位置，不需要复制到作业目录。
 
 ```bash
 cargo build --release
@@ -35,20 +36,25 @@ formic run \
   --plan <plan.jsonl> \
   --task <task.md> \
   --out <输出目录> \
-  --concurrency <同时活动的单元数>
+  --config <config.toml>
 ```
 
-结构化输出额外传入 `--output-schema <schema.json>`。Formic 始终读取 `./config.toml`，
-不支持指定其他配置路径；非空 LLM 环境变量覆盖文件值。
+省略 `--config` 时读取当前目录的 `config.toml`；显式指定的文件不存在会直接报错。结构化输出额外传入
+`--output-schema <schema.json>`；需要继续同一输出区时增加 `--resume`。已发布结果不会覆盖，
+续跑只处理失败、停止和未开始的单元，并在请求前确认 plan、task、schema 与 input 未变。
 
 每个 worker 结束后都会生成：
 
 ```text
-out/workers/<UTC任务时间戳>/<worker编号>.md
+out/results/<worker编号>.md
+out/runs/run-000001/workers/<worker编号>.md
+out/runs/run-000001/stats.jsonl
+out/runs/run-000001/summary.json
 ```
 
-档案包含运行状态、触发条件、完整模型请求与响应、工具调用、缓存、重试、压缩、校验和
-最终结局；成功生成后不会再保留重复的 audit JSONL。
+档案包含运行状态、触发条件、协议无关的模型输入、验收后的模型响应事实、工具调用、缓存、
+重试、压缩、校验和最终结局。HTTP 错误正文和无效协议负载不会进入终端或档案；成功生成
+档案后不再保留重复的 audit JSONL。
 
 ## 文档
 

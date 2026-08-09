@@ -30,6 +30,12 @@ pub enum Shard {
     Lines { file: PathBuf, start: u64, end: u64 },
 }
 
+/// 本轮执行使用的计划单元及其同一次读取得到的原始字节。
+pub struct LoadedPlan {
+    pub units: Vec<PlanUnit>,
+    pub source: Vec<u8>,
+}
+
 /// 计划错误：自带计划文件、行号、单元号与原因。
 #[derive(Debug)]
 pub struct PlanError {
@@ -73,14 +79,21 @@ struct RawLine {
 }
 
 /// 读取并校验整个计划；返回按文件顺序排列的单元列表。
+#[cfg(test)]
 pub fn load(plan_path: &Path, data_root: &ReadRoot) -> Result<Vec<PlanUnit>, PlanError> {
+    load_snapshot(plan_path, data_root).map(|loaded| loaded.units)
+}
+
+/// 读取一次计划，并让解析结果与作业指纹共享同一份原始字节。
+pub fn load_snapshot(plan_path: &Path, data_root: &ReadRoot) -> Result<LoadedPlan, PlanError> {
     let err = |line: usize, unit: Option<u64>, reason: String| PlanError {
         plan: plan_path.to_path_buf(),
         line,
         unit,
         reason,
     };
-    let text = fs::read_to_string(plan_path).map_err(|e| err(0, None, format!("无法读取：{e}")))?;
+    let source = fs::read(plan_path).map_err(|e| err(0, None, format!("无法读取：{e}")))?;
+    let text = std::str::from_utf8(&source).map_err(|e| err(0, None, format!("无法读取：{e}")))?;
     let mut units = Vec::new();
     let mut seen = HashSet::new();
     let mut line_counts: HashMap<PathBuf, u64> = HashMap::new();
@@ -147,7 +160,7 @@ pub fn load(plan_path: &Path, data_root: &ReadRoot) -> Result<Vec<PlanUnit>, Pla
     if units.is_empty() {
         return Err(err(0, None, "计划不含任何单元".into()));
     }
-    Ok(units)
+    Ok(LoadedPlan { units, source })
 }
 
 /// 校验单个根内相对路径：非绝对、存在、是文件、解析后不逃逸数据根。
@@ -167,7 +180,7 @@ fn validate_file(root: &ReadRoot, rel: &Path) -> Result<(), String> {
             rel.display()
         ));
     }
-    crate::tools::open_root_file(root, rel).map_err(|error| {
+    root.check_file(rel).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             format!("{} 在数据根内不存在", rel.display())
         } else {
@@ -231,6 +244,18 @@ mod tests {
                 shard: Shard::Files(vec![PathBuf::from("a.txt"), PathBuf::from("big.txt")]),
             }]
         );
+    }
+
+    #[test]
+    fn parsed_units_and_job_identity_share_one_plan_read() {
+        let f = fixture("{\"unit\": 1, \"files\": [\"a.txt\"]}\n");
+        let expected = fs::read(&f.plan).unwrap();
+        let loaded = load_snapshot(&f.plan, &f.read_root).unwrap();
+        fs::write(&f.plan, "{\"unit\": 2, \"files\": [\"big.txt\"]}\n").unwrap();
+
+        assert_eq!(loaded.source, expected);
+        assert_eq!(loaded.units.len(), 1);
+        assert_eq!(loaded.units[0].unit, 1);
     }
 
     #[test]

@@ -274,10 +274,7 @@ impl super::Transform for Transform {
                             ));
                         }
                         if !call_ids.insert(call.call_id.as_str()) {
-                            return Err(LlmError::protocol(
-                                format!("同一回合重复提供工具调用 id {:?}", call.call_id),
-                                payload,
-                            ));
+                            return Err(LlmError::protocol("同一回合重复提供工具调用 id", payload));
                         }
                     }
                     let mut events: Vec<LlmEvent> = self
@@ -297,10 +294,7 @@ impl super::Transform for Transform {
                     events.push(LlmEvent::Finished(Finish::ToolUse));
                     Ok(events)
                 }
-                other => Err(LlmError::protocol(
-                    format!("未知 finish_reason {other:?}"),
-                    payload,
-                )),
+                _ => Err(LlmError::protocol("未知 finish_reason", payload)),
             },
             _ => Ok(Vec::new()),
         }?;
@@ -534,6 +528,7 @@ mod tests {
             api_key: None,
             context_window_tokens: 131072,
             anthropic_max_tokens: None,
+            ..LlmConfig::test_defaults()
         };
         let history = vec![
             Message::User("任务".into()),
