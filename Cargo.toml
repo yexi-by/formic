@@ -1,6 +1,6 @@
 [package]
 name = "formic"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "批处理自主执行内核：文件进、记录出"
