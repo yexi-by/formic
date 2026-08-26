@@ -1331,7 +1331,7 @@ impl ActiveSession {
             force_kill.cancel();
         } else {
             // HTTP transport 没有可直接关闭的子进程，通过 rmcp service token 停止本地会话。
-            // 慢 initialize 的底层 TCP 回收限制见 design.md §6。
+            // 慢 initialize 的底层 TCP 回收限制见 docs/usage.md 的 MCP 说明。
             if let Some(service_cancel) = self
                 .service_cancel
                 .lock()
@@ -1507,7 +1507,7 @@ async fn connect(name: &str, config: &McpServerConfig) -> Result<Arc<ActiveSessi
             let client = BoundedHttpClient::new(max_message_bytes)
                 .map_err(|error| format!("无法创建 HTTP client：{error}"))?;
             // 取消本地 initialize future 不保证 Hyper 立即关闭已经写完请求的 TCP
-            // 连接；调用方期限与这条连接的最终回收语义见 design.md §6。
+            // 连接；调用方期限与这条连接的最终回收语义见 docs/usage.md 的 MCP 说明。
             let attempt_guard = client.transport_cancel.clone().drop_guard();
             let transport =
                 StreamableHttpClientTransport::with_client(client.clone(), transport_config);

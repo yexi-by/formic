@@ -41,7 +41,7 @@ mod worker;
 use llm::{LlmClient, Protocol};
 use output::RunSummary;
 
-/// 任务说明的大小上限（结构校验的一部分，语义边界见 design.md §3）。
+/// 任务说明的大小上限（用户输入契约见 docs/usage.md）。
 const MAX_TASK_BYTES: u64 = 1024 * 1024;
 
 #[derive(Parser)]

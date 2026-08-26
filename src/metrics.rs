@@ -1,5 +1,5 @@
-//! 规模观测：静态原子量 + FORMIC_METRICS=1 时的每秒汇总（stderr，机器可 grep）。
-//! 附属证据，不参与任何业务状态与准入判断（AGENTS.md §9）；未设置环境变量时
+//! 规模观测：静态原子量 + FORMIC_METRICS=1 时的定期汇总（stderr，机器可 grep）。
+//! 附属证据，不参与任何业务状态与准入判断（见 docs/observability.md）；未设置环境变量时
 //! 不启动汇总任务、不产生输出，原子量更新本身零分配。
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
