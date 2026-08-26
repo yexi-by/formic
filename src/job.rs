@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::output::{OutputRoot, RecordFormat};
+use crate::output_access::WorkerOutputAccess;
 use crate::plan::PlanUnit;
 use crate::structured::OutputContract;
 
@@ -35,6 +36,7 @@ struct Manifest {
     schema_digest: Option<String>,
     input_digest: String,
     output_format: String,
+    worker_output_access: WorkerOutputAccess,
     units: Vec<u64>,
 }
 
@@ -52,6 +54,7 @@ pub struct Fingerprints {
     schema_digest: Option<String>,
     input_digest: String,
     output_format: String,
+    worker_output_access: WorkerOutputAccess,
 }
 
 pub struct JobState {
@@ -73,6 +76,8 @@ pub enum JobError {
     ResumeRequired,
     #[error("输出目录没有可继续的 Formic 作业；请移除 --resume")]
     NoJob,
+    #[error("作业清单不符合当前契约；旧输出目录不能续跑，请按当前参数重新运行")]
+    CurrentManifestRequired,
     #[error("作业状态文件无效；不能确认已发布结果和剩余单元")]
     InvalidState,
     #[error("当前 {0} 与首次运行不同；未发送模型请求")]
@@ -104,6 +109,7 @@ impl Fingerprints {
         schema: Option<&[u8]>,
         input_digest: String,
         format: RecordFormat,
+        worker_output_access: WorkerOutputAccess,
     ) -> Self {
         Self {
             plan_digest: digest_bytes(plan),
@@ -111,6 +117,7 @@ impl Fingerprints {
             schema_digest: schema.map(digest_bytes),
             input_digest,
             output_format: format.extension().into(),
+            worker_output_access,
         }
     }
 }
@@ -140,7 +147,8 @@ impl JobState {
                     path: root.display(manifest_path),
                     source,
                 })?;
-            serde_json::from_slice::<Manifest>(&bytes).map_err(|_| JobError::InvalidState)?
+            serde_json::from_slice::<Manifest>(&bytes)
+                .map_err(|_| JobError::CurrentManifestRequired)?
         } else {
             Manifest {
                 plan_digest: fingerprints.plan_digest.clone(),
@@ -148,6 +156,7 @@ impl JobState {
                 schema_digest: fingerprints.schema_digest.clone(),
                 input_digest: fingerprints.input_digest.clone(),
                 output_format: fingerprints.output_format.clone(),
+                worker_output_access: fingerprints.worker_output_access,
                 units: units.iter().map(|unit| unit.unit).collect(),
             }
         };
@@ -300,6 +309,9 @@ fn compare_fingerprints(manifest: &Manifest, current: &Fingerprints) -> Result<(
     }
     if manifest.output_format != current.output_format {
         return Err(JobError::InputChanged("输出格式"));
+    }
+    if manifest.worker_output_access != current.worker_output_access {
+        return Err(JobError::InputChanged("worker 输出权限"));
     }
     Ok(())
 }
@@ -465,6 +477,7 @@ mod tests {
             schema_digest: None,
             input_digest: format!("input-{label}"),
             output_format: "md".into(),
+            worker_output_access: WorkerOutputAccess::Published,
         }
     }
 
@@ -482,6 +495,7 @@ mod tests {
             None,
             "input".into(),
             RecordFormat::Markdown,
+            WorkerOutputAccess::Published,
         );
 
         assert_eq!(current.task_digest, digest_bytes(b"first task\n"));
@@ -677,6 +691,35 @@ mod tests {
     }
 
     #[test]
+    fn resume_rejects_manifest_without_current_worker_access_contract() {
+        let (_directory, root, results) = roots();
+        root.write(
+            Path::new(MANIFEST_FILE),
+            br#"{
+  "plan_digest": "plan",
+  "task_digest": "task",
+  "schema_digest": null,
+  "input_digest": "input",
+  "output_format": "md",
+  "units": [1]
+}"#,
+        )
+        .unwrap();
+
+        let error = JobState::prepare(
+            &root,
+            &results,
+            fingerprints("same"),
+            &units(1),
+            &OutputContract::Text,
+            true,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(error, JobError::CurrentManifestRequired));
+    }
+
+    #[test]
     fn resume_checks_each_immutable_job_fingerprint() {
         let base = fingerprints("same");
         let manifest = Manifest {
@@ -685,6 +728,7 @@ mod tests {
             schema_digest: base.schema_digest.clone(),
             input_digest: base.input_digest.clone(),
             output_format: base.output_format.clone(),
+            worker_output_access: base.worker_output_access,
             units: vec![1],
         };
         let mut changed = fingerprints("same");
@@ -716,6 +760,12 @@ mod tests {
         assert!(matches!(
             compare_fingerprints(&manifest, &changed),
             Err(JobError::InputChanged("输出格式"))
+        ));
+        let mut changed = fingerprints("same");
+        changed.worker_output_access = WorkerOutputAccess::None;
+        assert!(matches!(
+            compare_fingerprints(&manifest, &changed),
+            Err(JobError::InputChanged("worker 输出权限"))
         ));
     }
 
@@ -865,6 +915,7 @@ mod tests {
             schema_digest: Some("schema".into()),
             input_digest: "input".into(),
             output_format: "json".into(),
+            worker_output_access: WorkerOutputAccess::Published,
         };
         let (state, _) = JobState::prepare(
             &root,

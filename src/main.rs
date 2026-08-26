@@ -28,6 +28,7 @@ mod llm;
 mod mcp;
 mod metrics;
 mod output;
+mod output_access;
 mod plan;
 mod prompt;
 mod scheduler;
@@ -72,6 +73,9 @@ struct RunArgs {
     /// 输出区目录
     #[arg(long)]
     out: PathBuf,
+    /// Worker 读取已发布结果的权限
+    #[arg(long, value_enum)]
+    worker_output_access: output_access::WorkerOutputAccess,
     /// 配置文件；默认读取当前工作目录的 config.toml
     #[arg(long)]
     config: Option<PathBuf>,
@@ -165,6 +169,7 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: RunArgs) -> Result<u8, StartupError> {
+    let worker_output_access = args.worker_output_access;
     let config = config::load(args.config.as_deref())?;
     let concurrency = args
         .concurrency
@@ -254,6 +259,7 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         output_contract.source_bytes(),
         input_digest,
         output_contract.format(),
+        worker_output_access,
     );
     let units = loaded_plan.units;
     let (mut job_state, selection) = job::JobState::prepare(
@@ -284,6 +290,7 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
                 context_safety_tokens: config.execution.context_safety_tokens,
                 concurrency,
                 output_format: output_contract.format(),
+                worker_output_access,
                 tools: Vec::new(),
             },
         )
@@ -321,14 +328,20 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         return Ok(0);
     }
 
-    let out_read_root = tools::ReadRoot::from_dir(results_root.clone_dir().map_err(|source| {
-        StartupError::OutCanonical {
-            path: out_root.join("results"),
-            source,
-        }
-    })?);
+    let out_read_root = if worker_output_access.allows_published() {
+        Some(tools::ReadRoot::from_dir(
+            results_root
+                .clone_dir()
+                .map_err(|source| StartupError::OutCanonical {
+                    path: out_root.join("results"),
+                    source,
+                })?,
+        ))
+    } else {
+        None
+    };
     let mcp = mcp::McpManager::initialize(&config.mcp_servers).await?;
-    let registry = scheduler::ToolRegistry::with_mcp(&config.tools, mcp)?;
+    let registry = scheduler::ToolRegistry::with_mcp(&config.tools, mcp, worker_output_access)?;
     let mut model_tools = registry.specs().to_vec();
     if let Some(spec) = output_contract.submit_spec() {
         model_tools.push(spec);
@@ -344,6 +357,7 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
             context_safety_tokens: config.execution.context_safety_tokens,
             concurrency,
             output_format: output_contract.format(),
+            worker_output_access,
             tools: model_tools.iter().map(|tool| tool.name.clone()).collect(),
         },
     )
@@ -362,7 +376,7 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         &config.cache,
         concurrency,
     );
-    let instructions = prompt::instructions(output_contract.is_structured()).to_string();
+    let instructions = prompt::instructions(output_contract.is_structured(), worker_output_access);
     let publish_gate = Arc::new(tokio::sync::RwLock::new(()));
     let ctx = Arc::new(worker::JobContext {
         scheduler,

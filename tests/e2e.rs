@@ -853,7 +853,31 @@ fn run_formic(
     task: &Path,
     out: &Path,
 ) -> Output {
-    let mut command = formic_command(concurrency, data, plan, task, out);
+    run_formic_with_access(
+        protocol,
+        port,
+        concurrency,
+        data,
+        plan,
+        task,
+        out,
+        "published",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_formic_with_access(
+    protocol: &str,
+    port: u16,
+    concurrency: usize,
+    data: &Path,
+    plan: &Path,
+    task: &Path,
+    out: &Path,
+    worker_output_access: &str,
+) -> Output {
+    let mut command =
+        formic_command_with_access(concurrency, data, plan, task, out, worker_output_access);
     command
         .env("FORMIC_LLM_PROTOCOL", protocol)
         .env("FORMIC_LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
@@ -896,6 +920,17 @@ fn formic_command(
     task: &Path,
     out: &Path,
 ) -> Command {
+    formic_command_with_access(concurrency, data, plan, task, out, "published")
+}
+
+fn formic_command_with_access(
+    concurrency: usize,
+    data: &Path,
+    plan: &Path,
+    task: &Path,
+    out: &Path,
+    worker_output_access: &str,
+) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_formic"));
     command
         .current_dir(plan.parent().expect("测试计划文件有父目录"))
@@ -908,6 +943,8 @@ fn formic_command(
         .arg(task)
         .arg("--out")
         .arg(out)
+        .arg("--worker-output-access")
+        .arg(worker_output_access)
         .arg("--concurrency")
         .arg(concurrency.to_string());
     command
@@ -1322,6 +1359,113 @@ fn responses_success() {
 #[test]
 fn anthropic_success() {
     assert_success("anthropic", "/messages");
+}
+
+#[test]
+fn worker_output_access_is_required_before_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_job(dir.path(), None);
+    let mock = start_mock();
+    let output = Command::new(env!("CARGO_BIN_EXE_formic"))
+        .current_dir(dir.path())
+        .arg("run")
+        .arg("--data")
+        .arg(&data)
+        .arg("--plan")
+        .arg(&plan)
+        .arg("--task")
+        .arg(&task)
+        .arg("--out")
+        .arg(&out)
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env(
+            "FORMIC_LLM_BASE_URL",
+            format!("http://127.0.0.1:{}/v1", mock.port),
+        )
+        .env("FORMIC_LLM_MODEL", "test-model")
+        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr_of(&output).contains("--worker-output-access"));
+    assert!(mock.requests.lock().unwrap().is_empty());
+    assert!(!out.exists());
+}
+
+#[test]
+fn isolated_workers_receive_only_input_scope_under_concurrency() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_many_job(dir.path(), 4, "独立生成元数据");
+    let mock = start_mock_with_delay(20);
+    let output = run_formic_with_access(
+        "completions",
+        mock.port,
+        4,
+        &data,
+        &plan,
+        &task,
+        &out,
+        "none",
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 8);
+    for request in requests.iter() {
+        let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+        assert!(
+            body["messages"][0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("不能读取其他 worker 的结果")
+        );
+        for tool in body["tools"].as_array().unwrap() {
+            if matches!(tool["function"]["name"].as_str(), Some("read" | "search")) {
+                assert_eq!(
+                    tool["function"]["parameters"]["properties"]["scope"]["enum"],
+                    serde_json::json!(["input"])
+                );
+            }
+        }
+    }
+    drop(requests);
+
+    for unit in 1..=4 {
+        assert!(results_dir(&out).join(format!("{unit}.md")).exists());
+    }
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(out.join(".formic-job.json")).unwrap()).unwrap();
+    assert_eq!(manifest["worker_output_access"], "none");
+    assert!(worker_report(&out, 1).contains("Worker 输出读取：`none`"));
+}
+
+#[test]
+fn resume_rejects_changed_worker_output_access_before_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_job(dir.path(), None);
+    let mock = start_mock();
+    let first = run_formic("completions", mock.port, 2, &data, &plan, &task, &out);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr_of(&first));
+    let requests_before = mock.requests.lock().unwrap().len();
+
+    let mut command = formic_command_with_access(2, &data, &plan, &task, &out, "none");
+    let resumed = command
+        .arg("--resume")
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env(
+            "FORMIC_LLM_BASE_URL",
+            format!("http://127.0.0.1:{}/v1", mock.port),
+        )
+        .env("FORMIC_LLM_MODEL", "test-model")
+        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .output()
+        .unwrap();
+
+    assert_eq!(resumed.status.code(), Some(2));
+    assert!(stderr_of(&resumed).contains("worker 输出权限"));
+    assert_eq!(mock.requests.lock().unwrap().len(), requests_before);
+    assert_eq!(run_dirs(&out).len(), 1, "权限不一致不得创建新的运行档案");
 }
 
 #[test]

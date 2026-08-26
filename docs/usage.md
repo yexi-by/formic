@@ -14,6 +14,7 @@ formic run \
   --plan <plan.jsonl> \
   --task <task.md> \
   --out <输出目录> \
+  --worker-output-access none \
   --config <config.toml>
 ```
 
@@ -25,13 +26,15 @@ formic run \
   --plan plan.jsonl \
   --task task.md \
   --out out \
+  --worker-output-access none \
   --config settings/formic.toml \
   --output-schema result.schema.json
 ```
 
 `--output-schema` 是本次作业输入，不是部署配置。`--concurrency` 可选，只覆盖本次运行的
 `execution.max_concurrent_units`。作业中断或部分失败后，以完全相同的输入增加 `--resume`；
-Formic 会保留已发布结果，只处理 failed、stopped 和 not_started 单元。
+Formic 会保留已发布结果，只处理 failed、stopped 和 not_started 单元。首次运行和续跑都必须
+填写 `--worker-output-access none|published`，且续跑不能改变原作业的选择。
 
 ## 调用前提
 
@@ -155,13 +158,13 @@ worker → 冻结的 ToolRegistry → Scheduler 有界收件箱
 
 内置工具：
 
-- `search`：在 `input` 或 `output` 根搜索正则或字面文本，可设置 glob 和上下文行数；
+- `search`：搜索正则或字面文本，可设置 glob 和上下文行数；
 - `read`：读取根内相对路径的 UTF-8 文本，可指定 1 起始的闭区间行号。
 
-两者拒绝绝对路径、`.`、`..`、符号链接和根目录逃逸。input 与 output 在启动时打开为
-目录 capability；计划校验、遍历、读取以及 output 的锁和全部写入都相对固定根句柄执行，
-运行中替换路径既不能把访问引到根外，也不能改变发布位置。`output` 只暴露当前输出模式下
-顶层的数字编号完成记录，不暴露 worker 档案、stats 或 schema。
+两者拒绝绝对路径、`.`、`..`、符号链接和根目录逃逸。`--worker-output-access none` 时，schema
+只允许 `scope=input`，调度器也不持有结果目录的读取句柄；伪造 `scope=output` 会返回权限错误。
+`published` 时，`output` 只暴露当前输出模式下顶层的数字编号完成记录，不暴露 worker 档案、
+stats 或 schema。固定目录 capability 保证运行中替换路径不能改变读取或发布位置。
 
 `[mcp_servers.<name>]` 可以配置任意 MCP server。当前支持直接启动的 stdio 子进程和
 Streamable HTTP；启用后默认暴露 `tools/list` 发现的全部工具。只有需要主动筛选时才配置

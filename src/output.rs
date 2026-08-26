@@ -16,6 +16,8 @@ use cap_std::fs::{Dir, OpenOptions};
 use chrono::{DateTime, SecondsFormat, Utc};
 use fs2::FileExt;
 
+use crate::output_access::WorkerOutputAccess;
+
 const OUTPUT_LOCK_FILE: &str = ".formic-job.lock";
 
 /// 启动时绑定的输出目录能力。所有运行期输出都相对此句柄访问；`path` 只用于
@@ -184,6 +186,7 @@ pub struct JobReportFacts {
     pub context_safety_tokens: u64,
     pub concurrency: usize,
     pub output_format: RecordFormat,
+    pub worker_output_access: WorkerOutputAccess,
     pub tools: Vec<String>,
 }
 
@@ -1061,6 +1064,11 @@ fn write_report_header(
         writer,
         "- 输出模式：`{}`",
         run.facts.output_format.extension()
+    )?;
+    writeln!(
+        writer,
+        "- Worker 输出读取：`{}`",
+        run.facts.worker_output_access.as_str()
     )?;
     writeln!(writer, "- 冻结工具：`{}`", run.facts.tools.join("`, `"))?;
 
@@ -1958,6 +1966,7 @@ mod tests {
                 context_safety_tokens: 4096,
                 concurrency: 1,
                 output_format: RecordFormat::Markdown,
+                worker_output_access: WorkerOutputAccess::Published,
                 tools: Vec::new(),
             },
         )
@@ -2043,6 +2052,7 @@ mod tests {
                 context_safety_tokens: 4096,
                 concurrency: 1,
                 output_format: RecordFormat::Markdown,
+                worker_output_access: WorkerOutputAccess::Published,
                 tools: Vec::new(),
             },
         )
@@ -2135,6 +2145,7 @@ mod tests {
                 context_safety_tokens: 4096,
                 concurrency: 8,
                 output_format: RecordFormat::Markdown,
+                worker_output_access: WorkerOutputAccess::Published,
                 tools: vec!["read".into(), "search".into()],
             },
         )

@@ -1172,10 +1172,13 @@ mod tests {
         let out_root = crate::output::OutputRoot::open(out.clone()).unwrap();
         let out_read_root = ReadRoot::from_dir(out_root.clone_dir().unwrap());
         let scheduler = Scheduler::start(
-            crate::scheduler::ToolRegistry::builtins(&tools),
+            crate::scheduler::ToolRegistry::builtins(
+                &tools,
+                crate::output_access::WorkerOutputAccess::Published,
+            ),
             Roots {
                 input: ReadRoot::open(data.clone()).unwrap(),
-                output: out_read_root,
+                output: Some(out_read_root),
                 output_format: crate::output::RecordFormat::Markdown,
             },
             &tools,
@@ -1196,6 +1199,7 @@ mod tests {
                 context_safety_tokens: 4096,
                 concurrency: 4,
                 output_format: crate::output::RecordFormat::Markdown,
+                worker_output_access: crate::output_access::WorkerOutputAccess::Published,
                 tools: model_tools.iter().map(|tool| tool.name.clone()).collect(),
             },
         )
@@ -1224,7 +1228,10 @@ mod tests {
             model_tools,
             worker_run,
             publish_gate: Arc::new(tokio::sync::RwLock::new(())),
-            instructions: crate::prompt::instructions(false).to_string(),
+            instructions: crate::prompt::instructions(
+                false,
+                crate::output_access::WorkerOutputAccess::Published,
+            ),
         };
         (dir, ctx)
     }

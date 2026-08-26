@@ -30,17 +30,18 @@ Formic 调度的是独立结果，不是会互相协商的角色。一个计划�
 
 ```text
 formic run --data <dir> --plan <jsonl> --task <file> --out <dir>
+           --worker-output-access <none|published>
            [--config <file>] [--concurrency <n>] [--resume]
            [--output-schema <schema.json>]
 ```
 
-`--config` 明确选择配置文件，指定文件不存在时直接失败；省略时读取当前目录的 `config.toml`，不搜索父目录，也不热加载，默认文件缺失时允许完全使用环境配置。LLM 的非空环境变量逐字段覆盖文件值。协议由 `FORMIC_LLM_PROTOCOL` 选择；上下文窗口必须由配置或环境变量明确给出。只有 Anthropic Messages 另需供应商专用的 `anthropic_max_tokens`。可选 `extra_body_json` 把供应商扩展字段加入每次请求，但不能覆盖 Formic 管理的协议结构。`execution.max_concurrent_units` 是正式 worker 窗口，`--concurrency` 只覆盖本轮。
+`--worker-output-access` 每次都必须填写。`none` 隔离 worker；`published` 保留读取已发布数字编号结果的能力。`--config` 明确选择配置文件，指定文件不存在时直接失败；省略时读取当前目录的 `config.toml`，不搜索父目录，也不热加载，默认文件缺失时允许完全使用环境配置。LLM 的非空环境变量逐字段覆盖文件值。协议由 `FORMIC_LLM_PROTOCOL` 选择；上下文窗口必须由配置或环境变量明确给出。只有 Anthropic Messages 另需供应商专用的 `anthropic_max_tokens`。可选 `extra_body_json` 把供应商扩展字段加入每次请求，但不能覆盖 Formic 管理的协议结构。`execution.max_concurrent_units` 是正式 worker 窗口，`--concurrency` 只覆盖本轮。
 
 计划是一行一个 object 的 JSONL。单元可以指定文件集合，或一个文件的 1 起始闭区间行范围。启动边界会拒绝空分片、重复/零单元号、缺失文件、绝对路径和根目录逃逸。
 
 文本模式的结果是 `out/results/<unit>.md`。结构化模式的结果是 `out/results/<unit>.json`，并由 `out/results/output-schema.json` 记录该目录唯一的 schema。结果文件不可覆盖；只有结果与追加式作业状态都表明 published 时才是可继续作业中的已完成事实。两种模式不得在同一输出目录混用。输出目录与数据目录不得相同或互相包含，并由进程锁保证同一时刻只有一个作业使用；锁、schema、审计、报告、统计和结果都相对启动时打开的同一输出目录句柄操作，运行中替换 ambient 路径不能改写写入位置或绕过锁。每轮另建 `out/runs/run-000001/`，worker 档案位于 `workers/<unit>.md`，本轮统计与汇总分别为 `stats.jsonl` 和 `summary.json`。
 
-首次运行一次写入私有作业清单，内部摘要按无歧义长度 framing 覆盖 plan、task、schema 和完整 input；状态变化只追加自然序号 JSONL，不在每次更新时重写全量单元 map。`--resume` 在启动任何 MCP 或 LLM 请求前验证输入和计划单元集合未变，核对状态与每个结果，并把上次仍为 started 的单元转为 stopped。published 之外的单元可以重试；缺失状态、损坏结果、未知结果文件或模式冲突直接失败，不猜测、不覆盖现场。
+首次运行一次写入私有作业清单，内部摘要按无歧义长度 framing 覆盖 plan、task、schema 和完整 input，并记录 worker 输出权限；状态变化只追加自然序号 JSONL，不在每次更新时重写全量单元 map。`--resume` 在启动任何 MCP 或 LLM 请求前验证这些事实和计划单元集合未变，核对状态与每个结果，并把上次仍为 started 的单元转为 stopped。旧清单或权限变化直接失败并要求按当前契约重新运行。published 之外的单元可以重试；缺失状态、损坏结果、未知结果文件或模式冲突也直接失败，不猜测、不覆盖现场。
 
 ## 3. 执行与取消
 
@@ -75,9 +76,9 @@ Scheduler 有界收件箱（容量 = worker 并发）
 
 ## 5. 内置工具与数据可见性
 
-每个 worker 可见两棵只读根：`input` 是完整输入数据集，`output` 是当前模式下已发布的顶层数字编号记录。worker 运行档案、stats、schema、临时文件和其他扩展名不向模型暴露。
+每个 worker 始终可见只读 `input`。选择 `none` 时，工具 schema 只允许 `scope=input`，Scheduler 不持有结果目录读取能力；运行时伪造 `scope=output` 仍会返回工具错误。选择 `published` 时才额外开放当前模式下已发布的顶层数字编号记录。worker 运行档案、stats、schema、临时文件和其他扩展名始终不向模型暴露。
 
-`search` 支持正则/字面匹配、glob 和上下文行。`read` 支持 UTF-8 文本及可选闭区间行号。input 与 output 根在启动时各打开一次目录 capability，计划校验、遍历和实际读取始终相对同一根句柄完成；输出写入也使用这个固定根。运行期间替换 ambient 路径既不能把访问引向根外，也不能改变发布位置。参数在工具边界解析一次；绝对路径、`.`、`..` 和符号链接被拒绝，遍历不跟随链接。
+`search` 支持正则/字面匹配、glob 和上下文行。`read` 支持 UTF-8 文本及可选闭区间行号。input 与授权后的 output 根在启动时打开一次目录 capability，计划校验、遍历和实际读取始终相对固定句柄完成；输出写入也使用独立固定根。运行期间替换 ambient 路径既不能把访问引向根外，也不能改变发布位置。参数在工具边界解析一次；绝对路径、`.`、`..` 和符号链接被拒绝，遍历不跟随链接。
 
 匹配数、上下文行数、结果字节数、全局并发和逐工具并发来自当前配置。结果达到边界时带明确截断标记。两项工具在 blocking task 中运行，不占用 Tokio runtime worker 线程。
 

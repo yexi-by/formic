@@ -18,12 +18,13 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{ReadToolConfig, SearchToolConfig, ToolsConfig};
 use crate::llm::ToolSpec;
 use crate::output::RecordFormat;
+use crate::output_access::WorkerOutputAccess;
 
-/// 两棵只读根：input 是输入数据集；output 是已完成单元记录所在目录。
+/// input 始终存在；只有明确授权时才持有已发布结果根。
 #[derive(Clone)]
 pub struct Roots {
     pub input: ReadRoot,
-    pub output: ReadRoot,
+    pub output: Option<ReadRoot>,
     pub output_format: RecordFormat,
 }
 
@@ -358,18 +359,21 @@ impl ToolOutput {
     }
 }
 
-pub fn registrations(config: &ToolsConfig) -> Vec<BuiltinRegistration> {
+pub fn registrations(
+    config: &ToolsConfig,
+    output_access: WorkerOutputAccess,
+) -> Vec<BuiltinRegistration> {
     let mut registrations = Vec::new();
     if config.read.enabled {
         registrations.push(BuiltinRegistration {
-            spec: read_spec(),
+            spec: read_spec(output_access),
             executor: BuiltinTool::Read(config.read.clone()),
             max_in_flight: config.read.max_in_flight,
         });
     }
     if config.search.enabled {
         registrations.push(BuiltinRegistration {
-            spec: search_spec(config.search.max_context_lines),
+            spec: search_spec(config.search.max_context_lines, output_access),
             executor: BuiltinTool::Search(config.search.clone()),
             max_in_flight: config.search.max_in_flight,
         });
@@ -378,17 +382,25 @@ pub fn registrations(config: &ToolsConfig) -> Vec<BuiltinRegistration> {
     registrations
 }
 
-fn search_spec(max_context_lines: usize) -> ToolSpec {
+fn search_spec(max_context_lines: usize, output_access: WorkerOutputAccess) -> ToolSpec {
+    let scopes = if output_access.allows_published() {
+        serde_json::json!(["input", "output"])
+    } else {
+        serde_json::json!(["input"])
+    };
+    let description = if output_access.allows_published() {
+        "在只读 input 数据集或已发布结果中搜索文本；结果截断时有明确标记。"
+    } else {
+        "在只读 input 数据集中搜索文本；结果截断时有明确标记。"
+    };
     ToolSpec {
         name: "search".into(),
-        description:
-            "在只读 input 数据集或当前模式的 output 完成记录中搜索文本；结果截断时有明确标记。"
-                .into(),
+        description: description.into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "pattern": {"type": "string", "description": "正则表达式；literal 为 true 时按字面量匹配"},
-                "scope": {"type": "string", "enum": ["input", "output"]},
+                "scope": {"type": "string", "enum": scopes},
                 "glob": {"type": "string", "description": "可选，根内 glob 过滤，如 **/*.txt"},
                 "context": {"type": "integer", "minimum": 0, "maximum": max_context_lines},
                 "literal": {"type": "boolean"}
@@ -399,14 +411,24 @@ fn search_spec(max_context_lines: usize) -> ToolSpec {
     }
 }
 
-fn read_spec() -> ToolSpec {
+fn read_spec(output_access: WorkerOutputAccess) -> ToolSpec {
+    let scopes = if output_access.allows_published() {
+        serde_json::json!(["input", "output"])
+    } else {
+        serde_json::json!(["input"])
+    };
+    let description = if output_access.allows_published() {
+        "按根内相对路径读取 UTF-8 文本；行号从 1 开始，区间为闭区间。output 只允许数字编号完成记录。"
+    } else {
+        "按 input 根内相对路径读取 UTF-8 文本；行号从 1 开始，区间为闭区间。"
+    };
     ToolSpec {
         name: "read".into(),
-        description: "按根内相对路径读取 UTF-8 文本；行号从 1 开始，区间为闭区间。output 只允许读取当前模式的数字编号完成记录。".into(),
+        description: description.into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "scope": {"type": "string", "enum": ["input", "output"]},
+                "scope": {"type": "string", "enum": scopes},
                 "path": {"type": "string", "description": "根内相对路径"},
                 "start_line": {"type": "integer", "minimum": 1},
                 "end_line": {"type": "integer", "minimum": 1}
@@ -658,7 +680,7 @@ fn search(
                 .map_err(|error| format!("glob 不合法：{error}"))
         })
         .transpose()?;
-    let root = scope_root(roots, args.scope);
+    let root = scope_root(roots, args.scope)?;
     let files = scope_files(root, args.scope, roots.output_format, Some(cancel))
         .map_err(|error| format!("无法遍历根目录：{error}"))?;
 
@@ -748,7 +770,7 @@ fn read(
     if args.scope == Scope::Output {
         validate_output_record(&args.path, roots.output_format)?;
     }
-    let root = scope_root(roots, args.scope);
+    let root = scope_root(roots, args.scope)?;
     let result = read_utf8_lines(
         root,
         &args.path,
@@ -778,10 +800,13 @@ fn read(
     ))
 }
 
-fn scope_root(roots: &Roots, scope: Scope) -> &ReadRoot {
+fn scope_root(roots: &Roots, scope: Scope) -> Result<&ReadRoot, String> {
     match scope {
-        Scope::Input => &roots.input,
-        Scope::Output => &roots.output,
+        Scope::Input => Ok(&roots.input),
+        Scope::Output => roots
+            .output
+            .as_ref()
+            .ok_or_else(|| "当前 worker 无权读取已发布结果".into()),
     }
 }
 
@@ -1403,7 +1428,7 @@ mod tests {
             input_path: input.clone(),
             roots: Roots {
                 input: ReadRoot::open(input).unwrap(),
-                output: ReadRoot::open(output).unwrap(),
+                output: Some(ReadRoot::open(output).unwrap()),
                 output_format: format,
             },
             config: ToolsConfig {
@@ -1448,7 +1473,7 @@ mod tests {
 
     fn execute(fixture: &Fixture, name: &str, json: &str) -> ToolOutput {
         let value = serde_json::from_str(json).unwrap();
-        registrations(&fixture.config)
+        registrations(&fixture.config, WorkerOutputAccess::Published)
             .into_iter()
             .find(|entry| entry.spec.name == name)
             .unwrap()
@@ -1484,6 +1509,40 @@ mod tests {
             r#"{"scope":"output","path":"workers/20260808T120000.000Z/1.md"}"#,
         );
         assert!(denied.content.starts_with("错误："));
+    }
+
+    #[test]
+    fn isolated_workers_neither_advertise_nor_execute_output_access() {
+        let mut fixture = fixture(RecordFormat::Markdown);
+        fixture.roots.output = None;
+        let registrations = registrations(&fixture.config, WorkerOutputAccess::None);
+        for registration in &registrations {
+            assert_eq!(
+                registration.spec.parameters["properties"]["scope"]["enum"],
+                serde_json::json!(["input"]),
+                "{} 不得向模型暴露 output scope",
+                registration.spec.name
+            );
+        }
+
+        for (name, arguments) in [
+            (
+                "search",
+                serde_json::json!({"pattern":"苹果","scope":"output"}),
+            ),
+            ("read", serde_json::json!({"scope":"output","path":"1.md"})),
+        ] {
+            let tool = registrations
+                .iter()
+                .find(|entry| entry.spec.name == name)
+                .unwrap();
+            let output = tool.executor.execute(&fixture.roots, &arguments);
+            assert!(
+                output.content.contains("无权读取已发布结果"),
+                "{}",
+                output.content
+            );
+        }
     }
 
     #[test]
@@ -1620,7 +1679,7 @@ mod tests {
     #[test]
     fn cancelled_read_returns_an_uncacheable_error() {
         let fixture = fixture(RecordFormat::Markdown);
-        let tool = registrations(&fixture.config)
+        let tool = registrations(&fixture.config, WorkerOutputAccess::Published)
             .into_iter()
             .find(|entry| entry.spec.name == "read")
             .unwrap()
@@ -1660,7 +1719,7 @@ mod tests {
     #[test]
     fn canonical_keys_merge_omitted_defaults() {
         let fixture = fixture(RecordFormat::Markdown);
-        let tool = registrations(&fixture.config)
+        let tool = registrations(&fixture.config, WorkerOutputAccess::Published)
             .into_iter()
             .find(|entry| entry.spec.name == "search")
             .unwrap()
