@@ -7,6 +7,7 @@ description = "批处理自主执行内核：文件进、记录出"
 license = "AGPL-3.0-only"
 
 [dependencies]
+base64 = "0.23.1"
 bytes = "1"
 cap-std = "4.0.2"
 chrono = { version = "0.4", default-features = false, features = ["now", "std"] }
@@ -17,6 +18,7 @@ globset = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 http = "1"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 process-wrap = { version = "9.1.0", features = ["tokio1"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 reqwest-mcp = { package = "reqwest", version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider"] }

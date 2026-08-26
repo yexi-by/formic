@@ -2,19 +2,44 @@
 //! 兼容讲同一形状的供应商（OpenAI、DeepSeek、Moonshot、OpenRouter、vLLM 等）。
 //! 工具调用的流式增量按 index 缓冲组装，finish_reason=tool_calls 时一次性放出。
 
-use super::{Finish, LlmConfig, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq, ToolSpec};
+use super::{
+    ContentPart, Finish, LlmConfig, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq,
+    ToolSpec, UserContent,
+};
 
 pub fn build_request(
     config: &LlmConfig,
     instructions: &str,
     history: &[Message],
     tools: &[ToolSpec],
-) -> (String, String, Vec<(String, String)>) {
+) -> super::BuildRequestResult {
+    build_request_inner(config, instructions, history, tools, true)
+}
+
+pub(super) fn build_estimate_body(
+    config: &LlmConfig,
+    instructions: &str,
+    history: &[Message],
+    tools: &[ToolSpec],
+) -> Result<String, LlmError> {
+    build_request_inner(config, instructions, history, tools, false).map(|(_, body, _)| body)
+}
+
+fn build_request_inner(
+    config: &LlmConfig,
+    instructions: &str,
+    history: &[Message],
+    tools: &[ToolSpec],
+    include_image_bytes: bool,
+) -> super::BuildRequestResult {
     let mut messages = vec![serde_json::json!({"role": "system", "content": instructions})];
     for message in history {
         match message {
-            Message::User(text) => {
-                messages.push(serde_json::json!({"role": "user", "content": text}));
+            Message::User(content) => {
+                messages.push(serde_json::json!({
+                    "role": "user",
+                    "content": user_content(content, include_image_bytes)?,
+                }));
             }
             Message::Compaction(text) => {
                 messages.push(serde_json::json!({
@@ -77,11 +102,44 @@ pub fn build_request(
         .map(|key| ("authorization".to_string(), format!("Bearer {key}")))
         .into_iter()
         .collect();
-    (
+    Ok((
         format!("{}/chat/completions", config.base_url.trim_end_matches('/')),
         body.to_string(),
         headers,
-    )
+    ))
+}
+
+fn user_content(
+    content: &UserContent,
+    include_image_bytes: bool,
+) -> Result<serde_json::Value, LlmError> {
+    if let [ContentPart::Text(text)] = content.parts() {
+        return Ok(serde_json::json!(text));
+    }
+    let parts = content
+        .parts()
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text(text) => Ok(serde_json::json!({"type": "text", "text": text})),
+            ContentPart::Image(image) => {
+                let url = if include_image_bytes {
+                    image
+                        .data
+                        .data_url()
+                        .map_err(|error| LlmError::RequestBuild {
+                            reason: error.to_string(),
+                        })?
+                } else {
+                    format!("data:{};base64,", image.data.media_type().mime())
+                };
+                Ok(serde_json::json!({
+                    "type": "image_url",
+                    "image_url": {"url": url, "detail": "auto"},
+                }))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(serde_json::Value::Array(parts))
 }
 
 /// 每个 index 一条在组装的工具调用。`arguments_seen` 区分供应商实际发送了空字符串，
@@ -546,7 +604,7 @@ mod tests {
                 content: "结果".into(),
             },
         ];
-        let (_url, body, _headers) = build_request(&config, "说明", &history, &[]);
+        let (_url, body, _headers) = build_request(&config, "说明", &history, &[]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["messages"][0]["role"], "system");
         assert_eq!(v["messages"][1]["role"], "user");
@@ -566,6 +624,48 @@ mod tests {
             keys,
             std::collections::BTreeSet::from(["messages", "model", "stream"]),
             "未配置 extra_body 时不得自行添加生成控制字段"
+        );
+    }
+
+    #[test]
+    fn user_images_use_data_urls_after_text_tool_results() {
+        let mut config = LlmConfig::test_defaults();
+        config.protocol = super::super::Protocol::Completions;
+        let mut media = UserContent::new();
+        media.push_text("附加图片");
+        media.push_image(crate::image_input::test_image_input(
+            crate::image_input::ImageSource::Input("sample.png".into()),
+        ));
+        let history = vec![
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCallReq {
+                    call_id: "call_1".into(),
+                    name: "read_image".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+            Message::ToolResult {
+                call_id: "call_1".into(),
+                content: "已读取图片".into(),
+            },
+            Message::User(media),
+        ];
+        let (_, body, _) = build_request(&config, "说明", &history, &[]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["messages"][2]["role"], "tool");
+        assert!(value["messages"][2]["content"].is_string());
+        assert_eq!(value["messages"][3]["role"], "user");
+        assert_eq!(value["messages"][3]["content"][1]["type"], "image_url");
+        assert_eq!(
+            value["messages"][3]["content"][1]["image_url"]["detail"],
+            "auto"
+        );
+        assert!(
+            value["messages"][3]["content"][1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
         );
     }
 }

@@ -16,6 +16,7 @@ use cap_std::fs::{Dir, OpenOptions};
 use chrono::{DateTime, SecondsFormat, Utc};
 use fs2::FileExt;
 
+use crate::image_input::ImageData;
 use crate::output_access::WorkerOutputAccess;
 
 const OUTPUT_LOCK_FILE: &str = ".formic-job.lock";
@@ -187,6 +188,7 @@ pub struct JobReportFacts {
     pub concurrency: usize,
     pub output_format: RecordFormat,
     pub worker_output_access: WorkerOutputAccess,
+    pub model_input_modalities: Vec<String>,
     pub tools: Vec<String>,
 }
 
@@ -245,6 +247,41 @@ impl WorkerRun {
 
     pub fn report_path(&self, unit: u64) -> PathBuf {
         self.directory.join("workers").join(format!("{unit}.md"))
+    }
+
+    pub(crate) fn archive_mcp_image(
+        &self,
+        unit: u64,
+        sequence: u64,
+        image: &ImageData,
+    ) -> io::Result<PathBuf> {
+        let run_relative = Path::new("media")
+            .join(unit.to_string())
+            .join(format!("{sequence}.{}", image.media_type().extension()));
+        let temporary_run_relative = Path::new("media").join(unit.to_string()).join(format!(
+            ".tmp-{sequence}.{}",
+            image.media_type().extension()
+        ));
+        let relative = self.relative_directory.join(&run_relative);
+        let temporary = self.relative_directory.join(&temporary_run_relative);
+        if self.root.exists(&relative) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "MCP 图片留档已存在",
+            ));
+        }
+        if let Some(parent) = temporary.parent() {
+            self.root.dir.create_dir_all(parent)?;
+        }
+        if let Err(error) = self.root.write(&temporary, image.bytes()) {
+            let _ = self.root.remove_file(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = self.root.rename(&temporary, &relative) {
+            let _ = self.root.remove_file(&temporary);
+            return Err(error);
+        }
+        Ok(run_relative)
     }
 }
 
@@ -649,6 +686,16 @@ pub enum AuditEntry {
     },
     /// 工具结果文本（含 `错误：` 与截断标记）。
     ToolResult(String),
+    /// 工具返回图片的可审计来源与媒体事实，不含图片正文。
+    ToolMedia {
+        source: String,
+        path: String,
+        mime_type: String,
+        bytes: usize,
+        width: u32,
+        height: u32,
+        estimated_tokens: u64,
+    },
     /// 调度器对一次普通工具调用给出的资源与缓存事实。
     ToolExecution {
         name: String,
@@ -723,6 +770,24 @@ impl AuditEntry {
             AuditEntry::ToolResult(data) => {
                 serde_json::json!({"direction": "tool_result", "data": data})
             }
+            AuditEntry::ToolMedia {
+                source,
+                path,
+                mime_type,
+                bytes,
+                width,
+                height,
+                estimated_tokens,
+            } => serde_json::json!({
+                "direction": "tool_media",
+                "source": source,
+                "path": path,
+                "mime_type": mime_type,
+                "bytes": bytes,
+                "width": width,
+                "height": height,
+                "estimated_tokens": estimated_tokens,
+            }),
             AuditEntry::ToolExecution {
                 name,
                 cache,
@@ -1070,6 +1135,11 @@ fn write_report_header(
         "- Worker 输出读取：`{}`",
         run.facts.worker_output_access.as_str()
     )?;
+    writeln!(
+        writer,
+        "- 模型输入模态：`{}`",
+        run.facts.model_input_modalities.join("`, `")
+    )?;
     writeln!(writer, "- 冻结工具：`{}`", run.facts.tools.join("`, `"))?;
 
     writeln!(writer, "\n## 结束统计\n")?;
@@ -1382,6 +1452,38 @@ fn validate_audit_entry(
             )?;
             validate_audit_stamp(object, path, line)?;
             audit_string(object, "data", path, line)?;
+        }
+        "tool_media" => {
+            audit_exact_fields(
+                object,
+                &[
+                    "direction",
+                    "source",
+                    "path",
+                    "mime_type",
+                    "bytes",
+                    "width",
+                    "height",
+                    "estimated_tokens",
+                    "sequence",
+                    "elapsed_ms",
+                ],
+                path,
+                line,
+            )?;
+            validate_audit_stamp(object, path, line)?;
+            match audit_string(object, "source", path, line)? {
+                "input" | "run_media" => {}
+                other => {
+                    return Err(invalid_audit(path, line, format!("未知图片来源 {other:?}")));
+                }
+            }
+            audit_string(object, "path", path, line)?;
+            audit_string(object, "mime_type", path, line)?;
+            audit_usize(object, "bytes", path, line)?;
+            audit_u64(object, "width", path, line)?;
+            audit_u64(object, "height", path, line)?;
+            audit_u64(object, "estimated_tokens", path, line)?;
         }
         "retry" => {
             audit_exact_fields(
@@ -1749,6 +1851,53 @@ fn render_audit_entry(
             writeln!(writer, "工具结果 `{}` bytes。\n", data.len())?;
             write_details_code(writer, "完整工具结果", "text", data)?;
         }
+        "tool_media" => {
+            let source = value
+                .get("source")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let path = value
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            writeln!(
+                writer,
+                "来源：`{}`；类型：`{}`；尺寸：`{}`×`{}`；原始字节：`{}`；视觉 token 估算：`{}`。",
+                markdown_inline(source),
+                markdown_inline(
+                    value
+                        .get("mime_type")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                ),
+                value
+                    .get("width")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                value
+                    .get("height")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                value
+                    .get("bytes")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                value
+                    .get("estimated_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            )?;
+            if source == "run_media" {
+                writeln!(
+                    writer,
+                    "图片文件：[{}](../{})\n",
+                    markdown_inline(path),
+                    path
+                )?;
+            } else {
+                writeln!(writer, "input 相对路径：`{}`\n", markdown_inline(path))?;
+            }
+        }
         "retry" => {
             writeln!(
                 writer,
@@ -1842,6 +1991,7 @@ fn audit_title(direction: &str, value: &serde_json::Value) -> String {
         "tool_call" => "模型请求工具".into(),
         "tool_execution" => "工具执行事实".into(),
         "tool_result" => "工具结果".into(),
+        "tool_media" => "工具图片".into(),
         "retry" => "模型调用重试".into(),
         "output_validation" => "结构化结果校验".into(),
         "compaction_request" => "上下文压缩请求".into(),
@@ -1967,6 +2117,7 @@ mod tests {
                 concurrency: 1,
                 output_format: RecordFormat::Markdown,
                 worker_output_access: WorkerOutputAccess::Published,
+                model_input_modalities: vec!["text".into()],
                 tools: Vec::new(),
             },
         )
@@ -2027,6 +2178,39 @@ mod tests {
         assert!(!directory.path().join(".tmp-unit-1").exists());
     }
 
+    #[test]
+    fn mcp_media_archive_failure_is_explicit_and_leaves_no_temporary_image() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = OutputRoot::open(directory.path().to_path_buf()).unwrap();
+        let run = WorkerRun::create(
+            &root,
+            JobReportFacts {
+                protocol: "responses".into(),
+                model: "model-a".into(),
+                context_window_tokens: 100_000,
+                anthropic_max_tokens: None,
+                context_safety_tokens: 4096,
+                concurrency: 1,
+                output_format: RecordFormat::Markdown,
+                worker_output_access: WorkerOutputAccess::None,
+                model_input_modalities: vec!["text".into(), "image".into()],
+                tools: vec!["read_image".into()],
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(run.directory.join("media")).unwrap();
+        fs::write(run.directory.join("media/1"), "冲突").unwrap();
+        let image = crate::image_input::test_image_input(crate::image_input::ImageSource::Input(
+            "sample.png".into(),
+        ));
+        let error = run.archive_mcp_image(1, 1, &image.data).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            io::ErrorKind::AlreadyExists | io::ErrorKind::NotADirectory
+        ));
+        assert!(!run.directory.join("media/1/.tmp-1.png").exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn output_writes_stay_with_opened_root_after_ambient_path_is_replaced() {
@@ -2053,6 +2237,7 @@ mod tests {
                 concurrency: 1,
                 output_format: RecordFormat::Markdown,
                 worker_output_access: WorkerOutputAccess::Published,
+                model_input_modalities: vec!["text".into()],
                 tools: Vec::new(),
             },
         )
@@ -2146,6 +2331,7 @@ mod tests {
                 concurrency: 8,
                 output_format: RecordFormat::Markdown,
                 worker_output_access: WorkerOutputAccess::Published,
+                model_input_modalities: vec!["text".into()],
                 tools: vec!["read".into(), "search".into()],
             },
         )

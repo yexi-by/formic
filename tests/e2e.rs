@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use base64::Engine as _;
+
 /// 三种协议罐装响应的共同最终消息，主成功路径断言产出与它一致。
 const FINAL_TEXT: &str = "你好世界";
 
@@ -26,6 +28,7 @@ const FAIL_TWICE_MARKER: &str = "FAIL-TWICE-UNIT";
 
 /// 请求体含此标记时，completions mock 改为调用测试 MCP 工具。
 const MCP_MARKER: &str = "MCP-UNIT";
+const IMAGE_TOOL_MARKER: &str = "IMAGE-TOOL-UNIT";
 
 /// 请求体含此标记时，mock 直接提交符合 schema 的结构化结果。
 const STRUCTURED_MARKER: &str = "STRUCTURED-UNIT";
@@ -136,6 +139,45 @@ const ANTHROPIC_TOOLCALL: &str = concat!(
     "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
     "data: {\"type\":\"message_stop\"}\n\n",
 );
+
+const COMPLETIONS_IMAGE_TOOLCALL: &str = concat!(
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[",
+    "{\"index\":0,\"id\":\"read_text\",\"type\":\"function\",\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"scope\\\":\\\"input\\\",\\\"path\\\":\\\"note.txt\\\"}\"}},",
+    "{\"index\":1,\"id\":\"read_image\",\"type\":\"function\",\"function\":{\"name\":\"read_image\",\"arguments\":\"{\\\"path\\\":\\\"sample.png\\\"}\"}}",
+    "]},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+const RESPONSES_IMAGE_TOOLCALL: &str = concat!(
+    "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"fc1\",\"call_id\":\"read_text\",\"name\":\"read\",\"arguments\":\"{\\\"scope\\\":\\\"input\\\",\\\"path\\\":\\\"note.txt\\\"}\"}}\n\n",
+    "data: {\"type\":\"response.output_item.done\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"id\":\"fc2\",\"call_id\":\"read_image\",\"name\":\"read_image\",\"arguments\":\"{\\\"path\\\":\\\"sample.png\\\"}\"}}\n\n",
+    "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+);
+
+const ANTHROPIC_IMAGE_TOOLCALL: &str = concat!(
+    "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg1\",\"role\":\"assistant\",\"content\":[],\"model\":\"m\",\"stop_reason\":null}}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"read_text\",\"name\":\"read\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"scope\\\":\\\"input\\\",\\\"path\\\":\\\"note.txt\\\"}\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+    "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"read_image\",\"name\":\"read_image\"}}\n\n",
+    "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"sample.png\\\"}\"}}\n\n",
+    "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n\n",
+    "data: {\"type\":\"message_stop\"}\n\n",
+);
+
+fn image_tool_sse(path: &str) -> Option<&'static str> {
+    if path.ends_with("/chat/completions") {
+        Some(COMPLETIONS_IMAGE_TOOLCALL)
+    } else if path.ends_with("/responses") {
+        Some(RESPONSES_IMAGE_TOOLCALL)
+    } else if path.ends_with("/messages") {
+        Some(ANTHROPIC_IMAGE_TOOLCALL)
+    } else {
+        None
+    }
+}
 
 const COMPLETIONS_STRUCTURED: &str = concat!(
     "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"submit_1\",\"type\":\"function\",\"function\":{\"name\":\"formic_submit_result\",\"arguments\":\"{\\\"answer\\\":\\\"ok\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
@@ -318,21 +360,31 @@ struct McpHttpMock {
 }
 
 fn start_mcp_http_mock() -> McpHttpMock {
+    start_mcp_http_mock_with_image(None)
+}
+
+fn start_mcp_http_mock_with_image(image_base64: Option<String>) -> McpHttpMock {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let requests = Arc::new(Mutex::new(Vec::new()));
     let shared = Arc::clone(&requests);
+    let image_base64 = image_base64.map(Arc::new);
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { break };
             let shared = Arc::clone(&shared);
-            thread::spawn(move || handle_mcp_http(stream, shared));
+            let image_base64 = image_base64.clone();
+            thread::spawn(move || handle_mcp_http(stream, shared, image_base64));
         }
     });
     McpHttpMock { port, requests }
 }
 
-fn handle_mcp_http(mut stream: TcpStream, requests: Arc<Mutex<Vec<McpHttpRecorded>>>) {
+fn handle_mcp_http(
+    mut stream: TcpStream,
+    requests: Arc<Mutex<Vec<McpHttpRecorded>>>,
+    image_base64: Option<Arc<String>>,
+) {
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut request_line = String::new();
     if reader.read_line(&mut request_line).is_err() {
@@ -401,11 +453,20 @@ fn handle_mcp_http(mut stream: TcpStream, requests: Arc<Mutex<Vec<McpHttpRecorde
             "nextCursor":"page-2"
         }),
         "tools/list" => serde_json::json!({"tools":[]}),
-        "tools/call" => serde_json::json!({
-            "content":[{"type":"text","text":"http:hello"}],
-            "structuredContent":{"value":"hello"},
-            "isError":false
-        }),
+        "tools/call" => match image_base64 {
+            Some(image) => serde_json::json!({
+                "content":[
+                    {"type":"text","text":"http:image"},
+                    {"type":"image","data":image.as_str(),"mimeType":"image/png"}
+                ],
+                "isError":false
+            }),
+            None => serde_json::json!({
+                "content":[{"type":"text","text":"http:hello"}],
+                "structuredContent":{"value":"hello"},
+                "isError":false
+            }),
+        },
         _ => serde_json::json!({}),
     };
     let response = serde_json::json!({"jsonrpc":"2.0","id":id,"result":result}).to_string();
@@ -727,6 +788,17 @@ fn handle_conn(
             Some(sse) => ("200 OK", sse.to_string()),
             None => ("404 Not Found", "unknown path".to_string()),
         }
+    } else if body_text.contains(IMAGE_TOOL_MARKER) {
+        let is_second_turn = body_text.contains(tool_result_marker(&path));
+        let response = if is_second_turn {
+            sse_for(&path, false)
+        } else {
+            image_tool_sse(&path)
+        };
+        match response {
+            Some(sse) => ("200 OK", sse.to_string()),
+            None => ("404 Not Found", "unknown path".to_string()),
+        }
     } else if body_text.contains(MCP_TIMEOUT_MARKER) {
         ("200 OK", COMPLETIONS_SLOW_MCP_TOOLCALL.to_string())
     } else if body_text.contains(MCP_MARKER) {
@@ -836,6 +908,36 @@ fn write_many_job(dir: &Path, count: u64, marker: &str) -> (PathBuf, PathBuf, Pa
     (data, plan, task, out)
 }
 
+fn write_image_job(
+    dir: &Path,
+    image_in_shard: bool,
+    task_text: &str,
+) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let data = dir.join("data");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("note.txt"), "图片旁边的文字。\n").unwrap();
+    fs::write(data.join("sample.png"), test_png_bytes()).unwrap();
+    let plan = dir.join("plan.jsonl");
+    let files = if image_in_shard {
+        "[\"note.txt\",\"sample.png\"]"
+    } else {
+        "[\"note.txt\"]"
+    };
+    fs::write(&plan, format!("{{\"unit\":1,\"files\":{files}}}\n")).unwrap();
+    let task = dir.join("task.md");
+    fs::write(&task, task_text).unwrap();
+    let out = dir.join("out");
+    (data, plan, task, out)
+}
+
+fn test_png_bytes() -> Vec<u8> {
+    let mut image_bytes = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(3, 2)
+        .write_to(&mut image_bytes, image::ImageFormat::Png)
+        .unwrap();
+    image_bytes.into_inner()
+}
+
 fn write_request_policy(dir: &Path, retry_delays_ms: &str, max_retry_after_ms: u64) {
     fs::write(
         dir.join("config.toml"),
@@ -876,6 +978,31 @@ fn run_formic_with_access(
     out: &Path,
     worker_output_access: &str,
 ) -> Output {
+    run_formic_with_capabilities(
+        protocol,
+        port,
+        concurrency,
+        data,
+        plan,
+        task,
+        out,
+        worker_output_access,
+        "text",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_formic_with_capabilities(
+    protocol: &str,
+    port: u16,
+    concurrency: usize,
+    data: &Path,
+    plan: &Path,
+    task: &Path,
+    out: &Path,
+    worker_output_access: &str,
+    input_modalities: &str,
+) -> Output {
     let mut command =
         formic_command_with_access(concurrency, data, plan, task, out, worker_output_access);
     command
@@ -883,6 +1010,7 @@ fn run_formic_with_access(
         .env("FORMIC_LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
         .env("FORMIC_LLM_MODEL", "test-model")
         .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .env("FORMIC_LLM_INPUT_MODALITIES", input_modalities)
         .env_remove("FORMIC_LLM_API_KEY");
     if protocol == "anthropic" {
         command.env("FORMIC_ANTHROPIC_MAX_TOKENS", "16384");
@@ -934,6 +1062,7 @@ fn formic_command_with_access(
     let mut command = Command::new(env!("CARGO_BIN_EXE_formic"));
     command
         .current_dir(plan.parent().expect("测试计划文件有父目录"))
+        .env("FORMIC_LLM_INPUT_MODALITIES", "text")
         .arg("run")
         .arg("--data")
         .arg(data)
@@ -1361,6 +1490,347 @@ fn anthropic_success() {
     assert_success("anthropic", "/messages");
 }
 
+fn request_contains_image(protocol: &str, body: &serde_json::Value) -> bool {
+    match protocol {
+        "completions" => body["messages"].as_array().unwrap().iter().any(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image_url"))
+        }),
+        "responses" => body["input"].as_array().unwrap().iter().any(|item| {
+            item["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part["type"] == "input_image"))
+        }),
+        "anthropic" => body["messages"].as_array().unwrap().iter().any(|message| {
+            message["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image"))
+        }),
+        _ => false,
+    }
+}
+
+#[test]
+fn initial_mixed_image_shards_reach_all_protocols_without_public_base64() {
+    for protocol in ["completions", "responses", "anthropic"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (data, plan, task, out) = write_image_job(dir.path(), true, "解释当前文字和图片。\n");
+        let mock = start_mock();
+        let output = run_formic_with_capabilities(
+            protocol,
+            mock.port,
+            1,
+            &data,
+            &plan,
+            &task,
+            &out,
+            "none",
+            "text,image",
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{protocol}: {}",
+            stderr_of(&output)
+        );
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "{protocol}");
+        for request in requests.iter() {
+            let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+            assert!(
+                request_contains_image(protocol, &body),
+                "{protocol}: {body}"
+            );
+            assert!(request.body.contains("read_image"), "{protocol}");
+        }
+        drop(requests);
+
+        let report = worker_report(&out, 1);
+        assert!(report.contains("sample.png"), "{protocol}: {report}");
+        assert!(report.contains("image/png"), "{protocol}: {report}");
+        assert!(
+            report.contains("模型输入模态：`text`, `image`"),
+            "{protocol}"
+        );
+        let public = read_output_tree(&out);
+        assert!(!public.contains("data:image/png;base64,"), "{protocol}");
+        assert!(
+            !public.contains("\"source\":{\"type\":\"base64\""),
+            "{protocol}"
+        );
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(out.join(".formic-job.json")).unwrap()).unwrap();
+        assert_eq!(
+            manifest["model_input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+
+        let mut resume = formic_command_with_access(1, &data, &plan, &task, &out, "none");
+        resume
+            .arg("--resume")
+            .env("FORMIC_LLM_PROTOCOL", protocol)
+            .env(
+                "FORMIC_LLM_BASE_URL",
+                format!("http://127.0.0.1:{}/v1", mock.port),
+            )
+            .env("FORMIC_LLM_MODEL", "test-model")
+            .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+            .env("FORMIC_LLM_INPUT_MODALITIES", "text");
+        if protocol == "anthropic" {
+            resume.env("FORMIC_ANTHROPIC_MAX_TOKENS", "16384");
+        }
+        let resumed = resume.output().unwrap();
+        assert_eq!(resumed.status.code(), Some(2), "{protocol}");
+        assert!(stderr_of(&resumed).contains("模型输入模态"), "{protocol}");
+        assert_eq!(mock.requests.lock().unwrap().len(), 2, "{protocol}");
+    }
+}
+
+#[test]
+fn multi_tool_image_results_follow_all_tool_results_in_all_protocols() {
+    for protocol in ["completions", "responses", "anthropic"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (data, plan, task, out) = write_image_job(
+            dir.path(),
+            false,
+            &format!("调用文字和图片工具。{IMAGE_TOOL_MARKER}\n"),
+        );
+        let mock = start_mock();
+        let output = run_formic_with_capabilities(
+            protocol,
+            mock.port,
+            1,
+            &data,
+            &plan,
+            &task,
+            &out,
+            "none",
+            "text,image",
+        );
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{protocol}: {}",
+            stderr_of(&output)
+        );
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "{protocol}");
+        let first: serde_json::Value = serde_json::from_str(&requests[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+        assert!(!request_contains_image(protocol, &first), "{protocol}");
+        assert!(
+            request_contains_image(protocol, &second),
+            "{protocol}: {second}"
+        );
+        match protocol {
+            "completions" => {
+                let messages = second["messages"].as_array().unwrap();
+                let tool_positions: Vec<_> = messages
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, message)| (message["role"] == "tool").then_some(index))
+                    .collect();
+                let image_position = messages
+                    .iter()
+                    .position(|message| {
+                        message["content"].as_array().is_some_and(|parts| {
+                            parts.iter().any(|part| part["type"] == "image_url")
+                        })
+                    })
+                    .unwrap();
+                assert_eq!(tool_positions.len(), 2);
+                assert!(
+                    tool_positions
+                        .into_iter()
+                        .all(|index| index < image_position)
+                );
+            }
+            "responses" => {
+                let input = second["input"].as_array().unwrap();
+                let outputs: Vec<_> = input
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, item)| {
+                        (item["type"] == "function_call_output").then_some(index)
+                    })
+                    .collect();
+                let image_position = input
+                    .iter()
+                    .position(|item| {
+                        item["content"].as_array().is_some_and(|parts| {
+                            parts.iter().any(|part| part["type"] == "input_image")
+                        })
+                    })
+                    .unwrap();
+                assert_eq!(outputs.len(), 2);
+                assert!(outputs.into_iter().all(|index| index < image_position));
+            }
+            "anthropic" => {
+                let media_user = second["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|message| {
+                        message["content"]
+                            .as_array()
+                            .is_some_and(|parts| parts.iter().any(|part| part["type"] == "image"))
+                    })
+                    .unwrap();
+                let types: Vec<_> = media_user["content"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|part| part["type"].as_str().unwrap())
+                    .collect();
+                assert_eq!(&types[..2], ["tool_result", "tool_result"]);
+                assert!(types[2..].contains(&"image"));
+            }
+            _ => unreachable!(),
+        }
+        drop(requests);
+        let report = worker_report(&out, 1);
+        assert!(report.contains("工具图片"), "{protocol}: {report}");
+        assert!(
+            report.contains("input 相对路径：`sample.png`"),
+            "{protocol}: {report}"
+        );
+        assert!(!out.join("runs/run-000001/media").exists());
+        assert!(!read_output_tree(&out).contains("data:image/png;base64,"));
+    }
+}
+
+#[test]
+fn mcp_images_are_archived_once_and_only_references_enter_public_audit() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_image_job(
+        dir.path(),
+        false,
+        &format!("调用 MCP 获取图片。{MCP_MARKER}\n"),
+    );
+    let llm = start_mock();
+    let image_bytes = test_png_bytes();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&image_bytes);
+    let mcp = start_mcp_http_mock_with_image(Some(encoded.clone()));
+    fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "[mcp_servers.demo]\nenabled=true\nurl='http://127.0.0.1:{}/mcp'\n",
+            mcp.port
+        ),
+    )
+    .unwrap();
+
+    let output = run_formic_with_capabilities(
+        "completions",
+        llm.port,
+        1,
+        &data,
+        &plan,
+        &task,
+        &out,
+        "none",
+        "text,image",
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let requests = llm.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let second: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+    assert!(request_contains_image("completions", &second));
+    drop(requests);
+
+    let media = out.join("runs/run-000001/media/1/1.png");
+    assert_eq!(fs::read(&media).unwrap(), image_bytes);
+    assert_eq!(
+        fs::read_dir(media.parent().unwrap()).unwrap().count(),
+        1,
+        "一次 MCP 图片只应留下一个自然编号文件"
+    );
+    let report = worker_report(&out, 1);
+    assert!(report.contains(r"来源：`run\_media`"), "{report}");
+    assert!(
+        report.contains("[media/1/1.png](../media/1/1.png)"),
+        "{report}"
+    );
+    assert!(!report.contains(&encoded));
+    let public = read_output_tree(&out);
+    assert!(!public.contains("data:image/png;base64,"));
+    assert!(!public.contains(&encoded));
+    assert_eq!(
+        mcp.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.rpc_method == "tools/call")
+            .count(),
+        1,
+        "已完成的 MCP 调用不能因本地处理再次发送"
+    );
+}
+
+#[test]
+fn mcp_media_archive_failure_fails_worker_without_replaying_remote_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_image_job(
+        dir.path(),
+        false,
+        &format!("调用 MCP 获取图片。{MCP_MARKER}\n"),
+    );
+    let llm = start_mock_with_delay(300);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(test_png_bytes());
+    let mcp = start_mcp_http_mock_with_image(Some(encoded.clone()));
+    fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "[mcp_servers.demo]\nenabled=true\nurl='http://127.0.0.1:{}/mcp'\n",
+            mcp.port
+        ),
+    )
+    .unwrap();
+    let mut command = formic_command_with_access(1, &data, &plan, &task, &out, "none");
+    command
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env(
+            "FORMIC_LLM_BASE_URL",
+            format!("http://127.0.0.1:{}/v1", llm.port),
+        )
+        .env("FORMIC_LLM_MODEL", "test-model")
+        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .env("FORMIC_LLM_INPUT_MODALITIES", "text,image")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    let run = out.join("runs/run-000001");
+    for _ in 0..200 {
+        if run.join("workers").is_dir() {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        run.join("workers").is_dir(),
+        "worker run 应在模型响应前建立"
+    );
+    fs::write(run.join("media"), "阻止创建媒体目录").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    assert_eq!(llm.requests.lock().unwrap().len(), 1, "不得再次请求模型");
+    assert_eq!(
+        mcp.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.rpc_method == "tools/call")
+            .count(),
+        1,
+        "留档失败发生在远端调用完成后，不得重放 tools/call"
+    );
+    let report = worker_report(&out, 1);
+    assert!(report.contains("写入输出区失败"), "{report}");
+    assert!(!report.contains(&encoded));
+}
+
 #[test]
 fn worker_output_access_is_required_before_startup() {
     let dir = tempfile::tempdir().unwrap();
@@ -1384,6 +1854,7 @@ fn worker_output_access_is_required_before_startup() {
         )
         .env("FORMIC_LLM_MODEL", "test-model")
         .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .env("FORMIC_LLM_INPUT_MODALITIES", "text")
         .output()
         .unwrap();
 
@@ -1391,6 +1862,60 @@ fn worker_output_access_is_required_before_startup() {
     assert!(stderr_of(&output).contains("--worker-output-access"));
     assert!(mock.requests.lock().unwrap().is_empty());
     assert!(!out.exists());
+}
+
+#[test]
+fn model_input_modalities_are_required_before_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_job(dir.path(), None);
+    let mock = start_mock();
+    let mut command = formic_command(1, &data, &plan, &task, &out);
+    let output = command
+        .env_remove("FORMIC_LLM_INPUT_MODALITIES")
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env(
+            "FORMIC_LLM_BASE_URL",
+            format!("http://127.0.0.1:{}/v1", mock.port),
+        )
+        .env("FORMIC_LLM_MODEL", "test-model")
+        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr_of(&output).contains("FORMIC_LLM_INPUT_MODALITIES"));
+    assert!(mock.requests.lock().unwrap().is_empty());
+    assert!(!out.exists());
+}
+
+#[test]
+fn text_only_models_reject_planned_images_before_mcp_or_llm_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_image_job(dir.path(), true, "不应开始任何远端请求。\n");
+    let llm = start_mock();
+    let mcp = start_mcp_http_mock();
+    fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "[mcp_servers.demo]\nenabled=true\nurl='http://127.0.0.1:{}/mcp'\n",
+            mcp.port
+        ),
+    )
+    .unwrap();
+    let output = run_formic_with_capabilities(
+        "completions",
+        llm.port,
+        1,
+        &data,
+        &plan,
+        &task,
+        &out,
+        "none",
+        "text",
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(stderr_of(&output).contains("model_input_modalities"));
+    assert!(llm.requests.lock().unwrap().is_empty());
+    assert!(mcp.requests.lock().unwrap().is_empty());
 }
 
 #[test]

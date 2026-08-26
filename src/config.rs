@@ -10,7 +10,7 @@ use std::time::Duration;
 use reqwest::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
 
-use crate::llm::{LlmConfig, Protocol};
+use crate::llm::{InputModalities, LlmConfig, Protocol};
 
 const CONFIG_FILE: &str = "config.toml";
 const DEFAULT_LLM_ATTEMPTS: u32 = 5;
@@ -123,6 +123,7 @@ struct FileConfig {
     api_key: Option<String>,
     model: Option<String>,
     context_window_tokens: Option<u64>,
+    model_input_modalities: Option<Vec<String>>,
     /// Anthropic Messages 协议要求的必填参数；其他协议不得配置。
     anthropic_max_tokens: Option<u64>,
     extra_body_json: Option<String>,
@@ -269,6 +270,10 @@ pub enum ConfigError {
     )]
     MissingContextWindow,
     #[error(
+        "缺少模型输入模态：请设置 FORMIC_LLM_INPUT_MODALITIES=text 或 text,image，或填写 config.toml 的 model_input_modalities"
+    )]
+    MissingInputModalities,
+    #[error(
         "Anthropic Messages 缺少 max_tokens：请设置 FORMIC_ANTHROPIC_MAX_TOKENS，或填写 config.toml 的 anthropic_max_tokens"
     )]
     MissingAnthropicMaxTokens,
@@ -277,7 +282,7 @@ pub enum ConfigError {
 }
 
 /// 显式配置路径必须存在；省略路径时读取当前目录的 `config.toml`，默认文件不存在则
-/// 允许完全由环境变量提供 LLM 身份。环境变量只覆盖 LLM 身份与模型容量字段。
+/// 允许完全由环境变量提供 LLM 身份。环境变量只覆盖 LLM 身份、输入能力与模型容量字段。
 pub fn load(path: Option<&Path>) -> Result<AppConfig, ConfigError> {
     let (path, required) = path.map_or((Path::new(CONFIG_FILE), false), |path| (path, true));
     load_from_with(path, required, |name| env::var(name).ok())
@@ -322,6 +327,10 @@ fn resolve(
     .or(file.context_window_tokens)
     .ok_or(ConfigError::MissingContextWindow)?;
     require_positive(context_window_tokens, "context_window_tokens")?;
+    let input_modalities = parse_input_modalities(
+        env_value("FORMIC_LLM_INPUT_MODALITIES"),
+        file.model_input_modalities,
+    )?;
 
     let configured_anthropic_max_tokens = parse_env_u64(
         env_value("FORMIC_ANTHROPIC_MAX_TOKENS"),
@@ -454,6 +463,7 @@ fn resolve(
             api_key: env_value("FORMIC_LLM_API_KEY").or_else(|| non_empty(file.api_key)),
             context_window_tokens,
             anthropic_max_tokens,
+            input_modalities,
             extra_body,
             connect_timeout: Duration::from_millis(positive_or(
                 file.connect_timeout_ms,
@@ -486,6 +496,21 @@ fn resolve(
         cache,
         mcp_servers,
     })
+}
+
+fn parse_input_modalities(
+    environment: Option<String>,
+    file: Option<Vec<String>>,
+) -> Result<InputModalities, ConfigError> {
+    let values = if let Some(environment) = environment {
+        environment
+            .split(',')
+            .map(|value| value.trim().to_string())
+            .collect()
+    } else {
+        file.ok_or(ConfigError::MissingInputModalities)?
+    };
+    InputModalities::parse(&values).map_err(ConfigError::Invalid)
 }
 
 fn parse_extra_body_json(
@@ -791,6 +816,7 @@ url = "https://file.example/v1"
 api_key = "file-key"
 model = "file-model"
 context_window_tokens = 131072
+model_input_modalities = ["text"]
 "#;
 
     #[test]
@@ -803,6 +829,7 @@ context_window_tokens = 131072
         assert_eq!(config.llm.api_key.as_deref(), Some("file-key"));
         assert_eq!(config.llm.model, "file-model");
         assert_eq!(config.llm.context_window_tokens, 131072);
+        assert_eq!(config.llm.input_modalities, InputModalities::Text);
         assert_eq!(config.llm.anthropic_max_tokens, None);
         assert!(config.llm.extra_body.is_empty());
         assert_eq!(config.llm.connect_timeout, Duration::from_millis(30_000));
@@ -828,6 +855,41 @@ context_window_tokens = 131072
         assert_eq!(config.tools.read.max_result_bytes, 1024 * 1024);
         assert_eq!(config.tools.read.max_in_flight, 64);
         assert_eq!(config.cache.max_bytes, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn input_modalities_are_required_and_accept_only_current_combinations() {
+        let without = BASE_FILE.replace("model_input_modalities = [\"text\"]\n", "");
+        let missing = load_fixture(Some(&without), &[("FORMIC_LLM_PROTOCOL", "responses")])
+            .err()
+            .expect("输入模态必须显式声明");
+        assert!(missing.to_string().contains("FORMIC_LLM_INPUT_MODALITIES"));
+
+        for invalid in [
+            "[]",
+            "[\"image\"]",
+            "[\"image\", \"text\"]",
+            "[\"text\", \"image\", \"audio\"]",
+        ] {
+            let file = BASE_FILE.replace(
+                "model_input_modalities = [\"text\"]",
+                &format!("model_input_modalities = {invalid}"),
+            );
+            assert!(matches!(
+                load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]),
+                Err(ConfigError::Invalid(_))
+            ));
+        }
+
+        let config = load_fixture(
+            Some(BASE_FILE),
+            &[
+                ("FORMIC_LLM_PROTOCOL", "responses"),
+                ("FORMIC_LLM_INPUT_MODALITIES", "text,image"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(config.llm.input_modalities, InputModalities::TextAndImage);
     }
 
     #[test]
@@ -953,7 +1015,7 @@ context_window_tokens = 131072
 
     #[test]
     fn context_reserve_must_leave_input_room() {
-        let file = "url='x'\nmodel='m'\ncontext_window_tokens=100\n[execution]\ncontext_safety_tokens=100\n";
+        let file = "url='x'\nmodel='m'\ncontext_window_tokens=100\nmodel_input_modalities=['text']\n[execution]\ncontext_safety_tokens=100\n";
         let error = load_fixture(Some(file), &[("FORMIC_LLM_PROTOCOL", "responses")])
             .err()
             .expect("应拒绝无效配置");
@@ -989,7 +1051,7 @@ context_window_tokens = 131072
 
     #[test]
     fn anthropic_reserve_must_leave_input_room() {
-        let file = "url='x'\nmodel='m'\ncontext_window_tokens=100\nanthropic_max_tokens=90\n[execution]\ncontext_safety_tokens=10\n";
+        let file = "url='x'\nmodel='m'\ncontext_window_tokens=100\nmodel_input_modalities=['text']\nanthropic_max_tokens=90\n[execution]\ncontext_safety_tokens=10\n";
         let error = load_fixture(Some(file), &[("FORMIC_LLM_PROTOCOL", "anthropic")])
             .err()
             .expect("应拒绝无效配置");

@@ -16,7 +16,8 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{ReadToolConfig, SearchToolConfig, ToolsConfig};
-use crate::llm::ToolSpec;
+use crate::image_input::{self, ToolImage};
+use crate::llm::{InputModalities, ToolSpec};
 use crate::output::RecordFormat;
 use crate::output_access::WorkerOutputAccess;
 
@@ -329,6 +330,7 @@ fn path_identity_bytes(path: &Path) -> Vec<u8> {
 pub enum BuiltinTool {
     Search(SearchToolConfig),
     Read(ReadToolConfig),
+    ReadImage,
 }
 
 pub struct BuiltinRegistration {
@@ -340,6 +342,7 @@ pub struct BuiltinRegistration {
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
+    pub images: Vec<ToolImage>,
     pub cacheable: bool,
 }
 
@@ -347,6 +350,7 @@ impl ToolOutput {
     fn success(content: String, truncated: bool, cacheable: bool) -> Self {
         Self {
             content,
+            images: Vec::new(),
             cacheable: cacheable && !truncated,
         }
     }
@@ -354,6 +358,21 @@ impl ToolOutput {
     fn error(message: impl std::fmt::Display) -> Self {
         Self {
             content: format!("错误：{message}"),
+            images: Vec::new(),
+            cacheable: false,
+        }
+    }
+
+    fn image(path: PathBuf, data: image_input::ImageData) -> Self {
+        Self {
+            content: format!(
+                "已读取图片 {}（{}，{}×{}）",
+                crate::prompt::slash_path(&path),
+                data.media_type().mime(),
+                data.width(),
+                data.height()
+            ),
+            images: vec![ToolImage::Input { path, data }],
             cacheable: false,
         }
     }
@@ -362,6 +381,7 @@ impl ToolOutput {
 pub fn registrations(
     config: &ToolsConfig,
     output_access: WorkerOutputAccess,
+    input_modalities: InputModalities,
 ) -> Vec<BuiltinRegistration> {
     let mut registrations = Vec::new();
     if config.read.enabled {
@@ -378,8 +398,30 @@ pub fn registrations(
             max_in_flight: config.search.max_in_flight,
         });
     }
+    if input_modalities.supports_image() {
+        registrations.push(BuiltinRegistration {
+            spec: read_image_spec(),
+            executor: BuiltinTool::ReadImage,
+            max_in_flight: config.max_in_flight,
+        });
+    }
     registrations.sort_by(|left, right| left.spec.name.cmp(&right.spec.name));
     registrations
+}
+
+fn read_image_spec() -> ToolSpec {
+    ToolSpec {
+        name: "read_image".into(),
+        description: "读取冻结 input 根中的 JPEG、PNG、GIF 或 WebP 图片。".into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "input 根内相对路径"}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+    }
 }
 
 fn search_spec(max_context_lines: usize, output_access: WorkerOutputAccess) -> ToolSpec {
@@ -450,6 +492,7 @@ impl BuiltinTool {
                 .ok()
                 .filter(|args| args.scope == Scope::Input)
                 .map(|args| serde_json::to_string(&args.canonical()).expect("规范参数可序列化")),
+            Self::ReadImage => None,
         }
     }
 
@@ -473,8 +516,37 @@ impl BuiltinTool {
                 Ok(args) => read(roots, config, &args, cancel).unwrap_or_else(ToolOutput::error),
                 Err(message) => ToolOutput::error(message),
             },
+            Self::ReadImage => match parse_read_image(arguments).and_then(|path| {
+                image_input::read_input_image(&roots.input, &path, cancel)
+                    .map(|data| (path, data))
+                    .map_err(|error| error.to_string())
+            }) {
+                Ok((path, data)) => ToolOutput::image(path, data),
+                Err(message) => ToolOutput::error(message),
+            },
         }
     }
+}
+
+fn parse_read_image(arguments: &Value) -> Result<PathBuf, String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| "工具参数必须是 JSON object".to_string())?;
+    reject_unknown(object, &["path"])?;
+    let path = object
+        .get("path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "缺少字符串参数 path".to_string())?;
+    if path
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        || path
+            .get(..8)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+    {
+        return Err("path 只接受 input 根相对路径，不支持 HTTP URL".into());
+    }
+    safe_relative_path(path)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1473,12 +1545,16 @@ mod tests {
 
     fn execute(fixture: &Fixture, name: &str, json: &str) -> ToolOutput {
         let value = serde_json::from_str(json).unwrap();
-        registrations(&fixture.config, WorkerOutputAccess::Published)
-            .into_iter()
-            .find(|entry| entry.spec.name == name)
-            .unwrap()
-            .executor
-            .execute(&fixture.roots, &value)
+        registrations(
+            &fixture.config,
+            WorkerOutputAccess::Published,
+            InputModalities::Text,
+        )
+        .into_iter()
+        .find(|entry| entry.spec.name == name)
+        .unwrap()
+        .executor
+        .execute(&fixture.roots, &value)
     }
 
     #[test]
@@ -1515,7 +1591,11 @@ mod tests {
     fn isolated_workers_neither_advertise_nor_execute_output_access() {
         let mut fixture = fixture(RecordFormat::Markdown);
         fixture.roots.output = None;
-        let registrations = registrations(&fixture.config, WorkerOutputAccess::None);
+        let registrations = registrations(
+            &fixture.config,
+            WorkerOutputAccess::None,
+            InputModalities::Text,
+        );
         for registration in &registrations {
             assert_eq!(
                 registration.spec.parameters["properties"]["scope"]["enum"],
@@ -1542,6 +1622,57 @@ mod tests {
                 "{}",
                 output.content
             );
+        }
+    }
+
+    #[test]
+    fn image_models_receive_a_path_only_read_image_tool() {
+        let mut fixture = fixture(RecordFormat::Markdown);
+        fixture.config.max_in_flight = 1;
+        fixture.config.read.max_result_bytes = 1;
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 3)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        fs::write(fixture.input_path.join("sample.png"), encoded.into_inner()).unwrap();
+        fs::write(fixture.input_path.join("wrong.jpg"), b"not an image").unwrap();
+
+        let registrations = registrations(
+            &fixture.config,
+            WorkerOutputAccess::None,
+            InputModalities::TextAndImage,
+        );
+        let read_image = registrations
+            .iter()
+            .find(|entry| entry.spec.name == "read_image")
+            .unwrap();
+        assert_eq!(
+            read_image.spec.parameters["required"],
+            serde_json::json!(["path"])
+        );
+        assert!(
+            read_image.spec.parameters["properties"]
+                .as_object()
+                .unwrap()
+                .get("scope")
+                .is_none()
+        );
+
+        let output = read_image
+            .executor
+            .execute(&fixture.roots, &serde_json::json!({"path":"sample.png"}));
+        assert_eq!(output.images.len(), 1);
+        assert!(output.images[0].data().byte_len() > 1);
+        assert!(output.content.contains("2×3"));
+        for arguments in [
+            serde_json::json!({"path":"../sample.png"}),
+            serde_json::json!({"path":"https://example.com/sample.png"}),
+            serde_json::json!({"path":"sample.png","scope":"input"}),
+            serde_json::json!({"path":"wrong.jpg"}),
+        ] {
+            let output = read_image.executor.execute(&fixture.roots, &arguments);
+            assert!(output.content.starts_with("错误："), "{}", output.content);
+            assert!(output.images.is_empty());
         }
     }
 
@@ -1576,6 +1707,24 @@ mod tests {
         )
         .unwrap();
         let output = execute(&fixture, "read", r#"{"scope":"input","path":"link.txt"}"#);
+        assert!(output.content.contains("符号链接"));
+
+        symlink(
+            fixture.input_path.join("a.txt"),
+            fixture.input_path.join("link.png"),
+        )
+        .unwrap();
+        let read_image = registrations(
+            &fixture.config,
+            WorkerOutputAccess::None,
+            InputModalities::TextAndImage,
+        )
+        .into_iter()
+        .find(|entry| entry.spec.name == "read_image")
+        .unwrap();
+        let output = read_image
+            .executor
+            .execute(&fixture.roots, &serde_json::json!({"path":"link.png"}));
         assert!(output.content.contains("符号链接"));
     }
 
@@ -1679,11 +1828,15 @@ mod tests {
     #[test]
     fn cancelled_read_returns_an_uncacheable_error() {
         let fixture = fixture(RecordFormat::Markdown);
-        let tool = registrations(&fixture.config, WorkerOutputAccess::Published)
-            .into_iter()
-            .find(|entry| entry.spec.name == "read")
-            .unwrap()
-            .executor;
+        let tool = registrations(
+            &fixture.config,
+            WorkerOutputAccess::Published,
+            InputModalities::Text,
+        )
+        .into_iter()
+        .find(|entry| entry.spec.name == "read")
+        .unwrap()
+        .executor;
         let cancel = CancellationToken::new();
         cancel.cancel();
         let output = tool.execute_cancellable(
@@ -1719,11 +1872,15 @@ mod tests {
     #[test]
     fn canonical_keys_merge_omitted_defaults() {
         let fixture = fixture(RecordFormat::Markdown);
-        let tool = registrations(&fixture.config, WorkerOutputAccess::Published)
-            .into_iter()
-            .find(|entry| entry.spec.name == "search")
-            .unwrap()
-            .executor;
+        let tool = registrations(
+            &fixture.config,
+            WorkerOutputAccess::Published,
+            InputModalities::Text,
+        )
+        .into_iter()
+        .find(|entry| entry.spec.name == "search")
+        .unwrap()
+        .executor;
         let short = serde_json::json!({"pattern":"x","scope":"input"});
         let explicit =
             serde_json::json!({"literal":false,"scope":"input","context":0,"pattern":"x"});

@@ -18,7 +18,7 @@ const INSTRUCTION_START: &str = "\
 const INPUT_ONLY_ACCESS: &str = "内置工具只能读取完整 input 数据集，不能读取其他 worker 的结果。";
 const PUBLISHED_ACCESS: &str =
     "内置工具的 input 指完整输入数据集，output 指已发布单元的数字编号结果。";
-const TOOL_END: &str = "工具结果有大小上限，截断或错误会显式说明。不要无进展地重复相同调用。";
+const TOOL_END: &str = "文本工具结果有大小上限，截断或错误会显式说明；图片受上下文和实际系统资源约束。不要无进展地重复相同调用。";
 const TEXT_END: &str = "你的最后一条消息就是你的产出，运行时原样持久化。完成交付后立即停止。";
 
 /// 结构化模式把最终结果交给内部终止工具，不把普通最终文本误当成完成事实。
@@ -51,11 +51,21 @@ pub enum ShardContent {
 
 /// 写入任务说明和分片标题。完整 input 根可以通过只读工具搜索，不在每个 prompt
 /// 中重复整份文件清单。调用方可在每次 write 时实施预算。
-pub(crate) fn write_user_prefix(output: &mut impl fmt::Write, task: &str) -> fmt::Result {
+pub(crate) fn write_user_prefix(
+    output: &mut impl fmt::Write,
+    task: &str,
+    supports_image: bool,
+) -> fmt::Result {
     output.write_str(task.trim_end_matches('\n'))?;
-    output.write_str(
-        "\n\n完整 input 根可通过只读 search/read 工具按需检索；不要主动扩大当前分片。\n\n# 你的分片\n",
-    )
+    if supports_image {
+        output.write_str(
+            "\n\n完整 input 根可通过只读 search/read/read_image 工具按需检索；不要主动扩大当前分片。\n\n# 你的分片\n",
+        )
+    } else {
+        output.write_str(
+            "\n\n完整 input 根可通过只读 search/read 工具按需检索；不要主动扩大当前分片。\n\n# 你的分片\n",
+        )
+    }
 }
 
 pub(crate) fn write_file_header(
@@ -82,7 +92,7 @@ pub(crate) fn write_line_header(
 #[cfg(test)]
 pub fn build_user_message(task: &str, shard: &ShardContent) -> String {
     let mut msg = String::new();
-    write_user_prefix(&mut msg, task).expect("String 写入不会失败");
+    write_user_prefix(&mut msg, task, false).expect("String 写入不会失败");
     match shard {
         ShardContent::Files(files) => {
             for (i, (path, content)) in files.iter().enumerate() {

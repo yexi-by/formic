@@ -62,12 +62,14 @@ url = "https://api.example.com/v1"
 api_key = ""
 model = "model-name"
 context_window_tokens = 131072
+model_input_modalities = ["text"]
 ```
 
 `context_window_tokens` 是本地预算依据，不会发送给供应商。协议形状由
 `FORMIC_LLM_PROTOCOL` 指定，可选 `completions`、`responses` 或 `anthropic`。
 Anthropic Messages 还必须单独配置 `anthropic_max_tokens`；该字段只用于 Anthropic，
-其他协议出现它会直接报错。
+其他协议出现它会直接报错。`model_input_modalities` 必填，只能是 `["text"]` 或
+`["text", "image"]`；它是操作者对远端模型能力的声明。
 
 供应商要求专有参数时，可在 `extra_body_json` 中填写一个 JSON 对象。对象中的字段会加入
 每次模型请求，包括上下文压缩请求；嵌套对象、数组、布尔值和 `null` 都会保留。
@@ -91,6 +93,7 @@ Anthropic 的 `model`、`max_tokens`、`stream`、`system`、`messages`、`tools
 | `FORMIC_LLM_API_KEY` | 覆盖 `api_key` |
 | `FORMIC_LLM_MODEL` | 覆盖 `model` |
 | `FORMIC_LLM_CONTEXT_WINDOW_TOKENS` | 覆盖模型上下文大小 |
+| `FORMIC_LLM_INPUT_MODALITIES` | `text` 或 `text,image`；覆盖模型输入模态 |
 | `FORMIC_ANTHROPIC_MAX_TOKENS` | 仅 Anthropic Messages；覆盖其必填 `max_tokens` |
 | `FORMIC_METRICS=1` | 每 250 ms 向 stderr 输出进程级观测值 |
 
@@ -99,8 +102,9 @@ Anthropic 的 `model`、`max_tokens`、`stream`、`system`、`messages`、`tools
 `[]` 表示禁用网络重试。完整字段和注释见配置示例。
 
 未填写资源字段时，正式默认值面向大规模作业：内置工具和每个 MCP server 最多同时执行
-64 次，单次工具结果为 1 MiB，搜索最多返回 1000 个匹配及 100 行上下文，作业内存缓存为
-1 GiB，活动 worker 为 64，连续相同调用阈值为 16，MCP 为后续调用自动重连。LLM 默认连接、
+64 次，内置文字与单个 MCP 结果为 1 MiB，搜索最多返回 1000 个匹配及 100 行上下文，
+作业内存缓存为 1 GiB，活动 worker 为 64，连续相同调用阈值为 16，MCP 为后续调用自动重连。
+LLM 默认连接、
 单次读取和整次请求超时分别为 30 秒、10 分钟和 30 分钟；网络重试等待为 1、2、5 秒，
 `Retry-After` 最多接受 60 秒。`llm_attempts` 只用于模型结构修正和后续回合，不再充当网络
 重试次数。这些值只控制活动工作，不限制单元总量、回合总数或普通工具调用总数。
@@ -160,11 +164,17 @@ worker → 冻结的 ToolRegistry → Scheduler 有界收件箱
 
 - `search`：搜索正则或字面文本，可设置 glob 和上下文行数；
 - `read`：读取根内相对路径的 UTF-8 文本，可指定 1 起始的闭区间行号。
+- `read_image`：仅在模型声明 image 时自动出现，读取冻结 input 中的 JPEG、PNG、GIF 或 WebP。
 
-两者拒绝绝对路径、`.`、`..`、符号链接和根目录逃逸。`--worker-output-access none` 时，schema
+三者拒绝绝对路径、`.`、`..`、符号链接和根目录逃逸。`--worker-output-access none` 时，schema
 只允许 `scope=input`，调度器也不持有结果目录的读取句柄；伪造 `scope=output` 会返回权限错误。
 `published` 时，`output` 只暴露当前输出模式下顶层的数字编号完成记录，不暴露 worker 档案、
 stats 或 schema。固定目录 capability 保证运行中替换路径不能改变读取或发布位置。
+
+`files` 分片可以混合文字和图片；`file + start + end` 行区间只接受 UTF-8 文本。图片按扩展名、
+文件签名和尺寸共同校验，保持原始字节，不缩放、不转码、不截断，也不下载 HTTP URL。
+Formic 不增加图片字节数、像素数或数量上限；实际文件系统、内存、上下文和供应商错误会明确
+报告。只声明 text 的模型遇到计划图片时，会在 MCP 和 LLM 请求前失败。
 
 `[mcp_servers.<name>]` 可以配置任意 MCP server。当前支持直接启动的 stdio 子进程和
 Streamable HTTP；启用后默认暴露 `tools/list` 发现的全部工具。只有需要主动筛选时才配置
@@ -181,8 +191,9 @@ MCP 调用可配置 job/unit 会话、server/tool 并发、server 级结果大�
 server 显式配置；stderr 单行、stdio JSON、HTTP JSON 与 SSE 在解析前受大小约束。调用
 达到超时就返回，已发送的工具请求会收到协议取消，旧会话立即停止复用，中断调用绝不自动
 重放。已经收到明确工具结果后，本地结果处理不再把它改报为远端超时；本地处理失败会明确
-说明远端调用已经完成、不得重放。当前结果支持 text 与 `structuredContent`；图片、音频、
-资源和客户端工具错误也受最终结果字节上限约束。
+说明远端调用已经完成、不得重放。当前结果支持 text、`structuredContent` 和图片；图片进入
+与本地图片相同的模型通道。音频、资源和 resource link 仍不支持，客户端工具错误仍受最终
+结果字节上限约束。
 结果流可能同时承载多个工具，因此每个 server 只有一个统一的解码前与最终结果上限；
 `tool_limits` 只收紧单工具并发。
 
@@ -215,10 +226,12 @@ schema 负责结果形状，`task.md` 负责解释字段的业务含义、证据
 完整成功结果进入按字节容量淘汰的内存 LRU。`scope=output`、MCP、错误和截断结果不进入
 完成缓存。
 
-每次 LLM 调用前，Formic 按最终协议请求估算完整输入，并预留
-`context_safety_tokens`；Anthropic 另外预留其 `anthropic_max_tokens`。预计越界时只压缩最旧的完整
-`assistant(tool_calls) → tool_result` 组，保留初始任务、分片和最近历史。压缩使用同一
-模型，但只开放内部 `formic_submit_compaction`，结果必须通过固定结构和本地校验。
+每次 LLM 调用前，Formic 用 o200k 估算文字，并按解码尺寸估算图片视觉 token；base64 不按
+文字计费。随后预留 `context_safety_tokens`；Anthropic 另外预留其 `anthropic_max_tokens`。
+预计越界时只压缩最旧的完整 `assistant(tool_calls) → tool_result → 可选图片消息` 组，保留
+初始任务、分片和最近历史。压缩请求携带相关原图，摘要替换成功后释放被替换历史中的图片
+字节。压缩使用同一模型，但只开放内部 `formic_submit_compaction`，结果必须通过固定结构和
+本地校验。
 
 摘要只有在替换后更小且重新进入预算时生效，否则单元失败且原始现场进入 worker 档案。
 压缩没有人为总次数上限；一次压缩没有进展时立即失败。未知 HTTP 400 不根据显示文字
@@ -232,6 +245,7 @@ schema 负责结果形状，`task.md` 负责解释字段的业务含义、证据
 | `out/results/<unit>.json` | 结构化模式的已发布结果 |
 | `out/results/output-schema.json` | 结构化结果目录的规范化 schema |
 | `out/runs/run-000001/workers/<unit>.md` | 本轮 worker 完整运行档案 |
+| `out/runs/run-000001/media/<unit>/<n>.<ext>` | MCP 返回图片的原始字节留档 |
 | `out/runs/run-000001/stats.jsonl` | 本轮每单元回合、调用、缓存、工具和 token 统计 |
 | `out/runs/run-000001/summary.json` | 本轮 planned、状态数量、原因样例和真实请求 usage 覆盖 |
 
@@ -245,7 +259,8 @@ schema 负责结果形状，`task.md` 负责解释字段的业务含义、证据
 
 退出码：`0` 表示本次作业完整，`1` 表示存在 failed、stopped 或 not_started，`2` 表示启动
 配置、输入或 resume 一致性无效，`3` 表示收到终止信号。首次运行建立机器管理的作业身份和
-追加式状态记录；`--resume` 会在模型或 MCP 请求前验证 plan、task、schema 和完整 input 未变，
+追加式状态记录；`--resume` 会在模型或 MCP 请求前验证 plan、task、schema、完整 input、worker
+输出权限和模型输入模态未变，
 并拒绝缺失状态、损坏结果或 `results/` 中的未知文件。已发布结果永不覆盖。每轮档案保留在
 新的自然序号 `run-N` 下。
 

@@ -42,6 +42,8 @@ fn main() {
         .arg(&task)
         .arg("--out")
         .arg(&out)
+        .arg("--worker-output-access")
+        .arg("none")
         .arg("--concurrency")
         .arg(concurrency.to_string())
         .env("FORMIC_LLM_PROTOCOL", "completions")
@@ -51,6 +53,7 @@ fn main() {
         )
         .env("FORMIC_LLM_MODEL", "scale-model")
         .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .env("FORMIC_LLM_INPUT_MODALITIES", "text")
         .env("FORMIC_METRICS", "1")
         .env_remove("FORMIC_LLM_API_KEY")
         // 本地 mock 必须直连，避免开发机代理把规模实验变成代理压力测试。
@@ -137,17 +140,17 @@ struct ObservationCounts {
 
 fn count_worker_reports(out: &Path) -> ObservationCounts {
     let mut counts = ObservationCounts::default();
-    let Ok(entries) = fs::read_dir(out.join("workers")) else {
+    let Ok(entries) = fs::read_dir(out.join("runs")) else {
         return counts;
     };
     for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
+        let run = entry.path();
+        if !run.is_dir() {
             counts.unexpected += 1;
             continue;
         }
         counts.run_directories += 1;
-        let Ok(files) = fs::read_dir(path) else {
+        let Ok(files) = fs::read_dir(run.join("workers")) else {
             counts.unexpected += 1;
             continue;
         };

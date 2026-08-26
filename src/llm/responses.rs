@@ -2,22 +2,44 @@
 //! 工具调用的完整参数在 response.output_item.done 事件上取，无需增量组装。
 //! 事件类型是开放集合，未识别的一律忽略；失败类事件显式报错。
 
-use super::{Finish, LlmConfig, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq, ToolSpec};
+use super::{
+    ContentPart, Finish, LlmConfig, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq,
+    ToolSpec, UserContent,
+};
 
 pub fn build_request(
     config: &LlmConfig,
     instructions: &str,
     history: &[Message],
     tools: &[ToolSpec],
-) -> (String, String, Vec<(String, String)>) {
+) -> super::BuildRequestResult {
+    build_request_inner(config, instructions, history, tools, true)
+}
+
+pub(super) fn build_estimate_body(
+    config: &LlmConfig,
+    instructions: &str,
+    history: &[Message],
+    tools: &[ToolSpec],
+) -> Result<String, LlmError> {
+    build_request_inner(config, instructions, history, tools, false).map(|(_, body, _)| body)
+}
+
+fn build_request_inner(
+    config: &LlmConfig,
+    instructions: &str,
+    history: &[Message],
+    tools: &[ToolSpec],
+    include_image_bytes: bool,
+) -> super::BuildRequestResult {
     let mut input = Vec::new();
     for (index, message) in history.iter().enumerate() {
         match message {
-            Message::User(text) => {
+            Message::User(content) => {
                 input.push(serde_json::json!({
                     "type": "message",
                     "role": "user",
-                    "content": [{"type": "input_text", "text": text}],
+                    "content": user_content(content, include_image_bytes)?,
                 }));
             }
             Message::Compaction(text) => {
@@ -87,11 +109,41 @@ pub fn build_request(
         .map(|key| ("authorization".to_string(), format!("Bearer {key}")))
         .into_iter()
         .collect();
-    (
+    Ok((
         format!("{}/responses", config.base_url.trim_end_matches('/')),
         body.to_string(),
         headers,
-    )
+    ))
+}
+
+fn user_content(
+    content: &UserContent,
+    include_image_bytes: bool,
+) -> Result<Vec<serde_json::Value>, LlmError> {
+    content
+        .parts()
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text(text) => Ok(serde_json::json!({"type": "input_text", "text": text})),
+            ContentPart::Image(image) => {
+                let image_url = if include_image_bytes {
+                    image
+                        .data
+                        .data_url()
+                        .map_err(|error| LlmError::RequestBuild {
+                            reason: error.to_string(),
+                        })?
+                } else {
+                    format!("data:{};base64,", image.data.media_type().mime())
+                };
+                Ok(serde_json::json!({
+                    "type": "input_image",
+                    "image_url": image_url,
+                    "detail": "auto",
+                }))
+            }
+        })
+        .collect()
 }
 
 #[derive(Default)]
@@ -518,7 +570,7 @@ mod tests {
                 content: "结果".into(),
             },
         ];
-        let (_url, body, _headers) = build_request(&config, "说明", &history, &[]);
+        let (_url, body, _headers) = build_request(&config, "说明", &history, &[]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["instructions"], "说明");
         assert_eq!(v["input"][0]["role"], "user");
@@ -605,11 +657,33 @@ mod tests {
                 content: "结果".into(),
             },
         ];
-        let (_url, body, _headers) = build_request(&config, "说明", &history, &[]);
+        let (_url, body, _headers) = build_request(&config, "说明", &history, &[]).unwrap();
         let value: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(value["input"][1], reasoning);
         assert_eq!(value["input"][2], function_call);
         assert_eq!(value["input"][3]["type"], "function_call_output");
         assert_eq!(value["input"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn user_images_map_to_input_image_blocks() {
+        let mut config = LlmConfig::test_defaults();
+        config.protocol = super::super::Protocol::Responses;
+        let mut content = UserContent::new();
+        content.push_text("看图");
+        content.push_image(crate::image_input::test_image_input(
+            crate::image_input::ImageSource::Input("sample.png".into()),
+        ));
+        let (_, body, _) = build_request(&config, "说明", &[Message::User(content)], &[]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(value["input"][0]["content"][1]["type"], "input_image");
+        assert_eq!(value["input"][0]["content"][1]["detail"], "auto");
+        assert!(
+            value["input"][0]["content"][1]["image_url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
     }
 }

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::llm::InputModalities;
 use crate::output::{OutputRoot, RecordFormat};
 use crate::output_access::WorkerOutputAccess;
 use crate::plan::PlanUnit;
@@ -37,6 +38,7 @@ struct Manifest {
     input_digest: String,
     output_format: String,
     worker_output_access: WorkerOutputAccess,
+    model_input_modalities: Vec<String>,
     units: Vec<u64>,
 }
 
@@ -55,6 +57,7 @@ pub struct Fingerprints {
     input_digest: String,
     output_format: String,
     worker_output_access: WorkerOutputAccess,
+    model_input_modalities: Vec<String>,
 }
 
 pub struct JobState {
@@ -110,6 +113,7 @@ impl Fingerprints {
         input_digest: String,
         format: RecordFormat,
         worker_output_access: WorkerOutputAccess,
+        input_modalities: InputModalities,
     ) -> Self {
         Self {
             plan_digest: digest_bytes(plan),
@@ -118,6 +122,11 @@ impl Fingerprints {
             input_digest,
             output_format: format.extension().into(),
             worker_output_access,
+            model_input_modalities: input_modalities
+                .names()
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
         }
     }
 }
@@ -157,6 +166,7 @@ impl JobState {
                 input_digest: fingerprints.input_digest.clone(),
                 output_format: fingerprints.output_format.clone(),
                 worker_output_access: fingerprints.worker_output_access,
+                model_input_modalities: fingerprints.model_input_modalities.clone(),
                 units: units.iter().map(|unit| unit.unit).collect(),
             }
         };
@@ -312,6 +322,9 @@ fn compare_fingerprints(manifest: &Manifest, current: &Fingerprints) -> Result<(
     }
     if manifest.worker_output_access != current.worker_output_access {
         return Err(JobError::InputChanged("worker 输出权限"));
+    }
+    if manifest.model_input_modalities != current.model_input_modalities {
+        return Err(JobError::InputChanged("模型输入模态"));
     }
     Ok(())
 }
@@ -478,6 +491,7 @@ mod tests {
             input_digest: format!("input-{label}"),
             output_format: "md".into(),
             worker_output_access: WorkerOutputAccess::Published,
+            model_input_modalities: vec!["text".into()],
         }
     }
 
@@ -496,6 +510,7 @@ mod tests {
             "input".into(),
             RecordFormat::Markdown,
             WorkerOutputAccess::Published,
+            InputModalities::Text,
         );
 
         assert_eq!(current.task_digest, digest_bytes(b"first task\n"));
@@ -691,7 +706,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_rejects_manifest_without_current_worker_access_contract() {
+    fn resume_rejects_manifest_without_current_agent_contract() {
         let (_directory, root, results) = roots();
         root.write(
             Path::new(MANIFEST_FILE),
@@ -701,6 +716,7 @@ mod tests {
   "schema_digest": null,
   "input_digest": "input",
   "output_format": "md",
+  "worker_output_access": "published",
   "units": [1]
 }"#,
         )
@@ -729,6 +745,7 @@ mod tests {
             input_digest: base.input_digest.clone(),
             output_format: base.output_format.clone(),
             worker_output_access: base.worker_output_access,
+            model_input_modalities: base.model_input_modalities.clone(),
             units: vec![1],
         };
         let mut changed = fingerprints("same");
@@ -766,6 +783,12 @@ mod tests {
         assert!(matches!(
             compare_fingerprints(&manifest, &changed),
             Err(JobError::InputChanged("worker 输出权限"))
+        ));
+        let mut changed = fingerprints("same");
+        changed.model_input_modalities = vec!["text".into(), "image".into()];
+        assert!(matches!(
+            compare_fingerprints(&manifest, &changed),
+            Err(JobError::InputChanged("模型输入模态"))
         ));
     }
 
@@ -916,6 +939,7 @@ mod tests {
             input_digest: "input".into(),
             output_format: "json".into(),
             worker_output_access: WorkerOutputAccess::Published,
+            model_input_modalities: vec!["text".into()],
         };
         let (state, _) = JobState::prepare(
             &root,

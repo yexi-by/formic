@@ -10,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::ExecutionConfig;
 use crate::llm::{
     Finish, LlmClient, LlmError, LlmEvent, Message, ProviderUsage, RequestObservation, ToolCallReq,
-    ToolSpec,
+    ToolSpec, UserContent,
 };
 use crate::output::{AuditEntry, AuditLog, WorkerState};
 use crate::structured::SUBMIT_RESULT_TOOL;
@@ -139,10 +139,11 @@ pub async fn compact_if_needed(
             break;
         }
         largest_fitting = Some((end, compact_history));
-        let removed_tokens: u64 = history[1..end]
+        let removed_tokens = history[1..end]
             .iter()
             .map(crate::tokenize::count_message)
-            .sum();
+            .try_fold(0u64, u64::checked_add)
+            .unwrap_or(u64::MAX);
         if force || removed_tokens >= overflow.saturating_add(512) {
             chosen = largest_fitting.clone();
             break;
@@ -226,23 +227,30 @@ fn complete_prefix_ends(history: &[Message]) -> Vec<usize> {
             break;
         }
         index = result_end;
+        if matches!(history.get(index), Some(Message::User(content)) if content.has_images()) {
+            index += 1;
+        }
         ends.push(index);
     }
     ends
 }
 
-fn render_transcript(history: &[Message]) -> String {
-    let mut output = String::from("# 待压缩的原始历史\n");
+fn render_transcript(history: &[Message]) -> UserContent {
+    let mut output = UserContent::from("# 待压缩的原始历史\n");
     for message in history {
         match message {
-            Message::User(text) => output.push_str(&format!("\n[user]\n{text}\n")),
+            Message::User(content) => {
+                output.push_text("\n[user]\n");
+                output.extend(content);
+                output.push_text("\n");
+            }
             Message::Compaction(text) => {
-                output.push_str(&format!("\n[previous_compaction]\n{text}\n"));
+                output.push_text(format!("\n[previous_compaction]\n{text}\n"));
             }
             Message::Assistant { text, tool_calls } => {
-                output.push_str(&format!("\n[assistant]\n{text}\n"));
+                output.push_text(format!("\n[assistant]\n{text}\n"));
                 for call in tool_calls {
-                    output.push_str(&format!(
+                    output.push_text(format!(
                         "[tool_call id={} name={}]\n{}\n",
                         call.call_id, call.name, call.arguments
                     ));
@@ -252,7 +260,7 @@ fn render_transcript(history: &[Message]) -> String {
             // encrypted_content；压缩提示使用相邻 Assistant 的可见语义即可。
             Message::ResponseOutputItems(_) => {}
             Message::ToolResult { call_id, content } => {
-                output.push_str(&format!("\n[tool_result id={call_id}]\n{content}\n"));
+                output.push_text(format!("\n[tool_result id={call_id}]\n{content}\n"));
             }
         }
     }
@@ -263,25 +271,25 @@ fn render_compaction_input(
     normal_instructions: &str,
     initial: &Message,
     output_contract: Option<&ToolSpec>,
-    transcript: &str,
-) -> String {
-    let mut output = String::from("# 当前执行契约\n\n## 正常执行说明\n");
-    output.push_str(normal_instructions);
-    output.push_str("\n\n## 初始任务与数据\n");
-    output.push_str(&render_transcript(std::slice::from_ref(initial)));
-    output.push_str("\n## 最终输出契约\n");
+    transcript: &UserContent,
+) -> UserContent {
+    let mut output = UserContent::from("# 当前执行契约\n\n## 正常执行说明\n");
+    output.push_text(normal_instructions);
+    output.push_text("\n\n## 初始任务与数据\n");
+    output.extend(&render_transcript(std::slice::from_ref(initial)));
+    output.push_text("\n## 最终输出契约\n");
     if let Some(tool) = output_contract {
-        output.push_str(&format!(
+        output.push_text(format!(
             "工具名：{}\n说明：{}\n参数 schema：\n{}\n",
             tool.name,
             tool.description,
             serde_json::to_string_pretty(&tool.parameters).expect("工具 schema 可以序列化")
         ));
     } else {
-        output.push_str("最终结果按正常执行说明直接输出文本。\n");
+        output.push_text("最终结果按正常执行说明直接输出文本。\n");
     }
-    output.push('\n');
-    output.push_str(transcript);
+    output.push_text("\n");
+    output.extend(transcript);
     output
 }
 
@@ -308,7 +316,7 @@ async fn request_compaction(
                 return Err(CompactionError::CompactionRequestTooLarge);
             }
             call_number += 1;
-            let prepared = llm.prepare_call(INSTRUCTIONS, &history, tools);
+            let prepared = llm.prepare_call(INSTRUCTIONS, &history, tools)?;
             audit.push_compaction_request(call_number, prepared.audit_body())?;
             let observation = RequestObservation::default();
             let called = tokio::select! {
@@ -531,7 +539,9 @@ fn append_compaction_correction(
         if !response_output_items.is_empty() {
             history.push(Message::ResponseOutputItems(response_output_items));
         }
-        history.push(Message::User(format!("压缩结果无效：{reason}；请重新提交")));
+        history.push(Message::User(
+            format!("压缩结果无效：{reason}；请重新提交").into(),
+        ));
         return;
     }
     let mut sanitized = calls;
@@ -625,6 +635,43 @@ mod tests {
     }
 
     #[test]
+    fn tool_images_stay_inside_complete_groups_and_compaction_input() {
+        let mut media = UserContent::from("工具图片：\n");
+        media.push_image(crate::image_input::test_image_input(
+            crate::image_input::ImageSource::Archived("media/1/1.png".into()),
+        ));
+        let mut initial = UserContent::from("task");
+        initial.push_image(crate::image_input::test_image_input(
+            crate::image_input::ImageSource::Input("sample.png".into()),
+        ));
+        let history = vec![
+            Message::User(initial),
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![call("a")],
+            },
+            Message::ToolResult {
+                call_id: "a".into(),
+                content: "image ready".into(),
+            },
+            Message::User(media),
+        ];
+        assert_eq!(complete_prefix_ends(&history), [4]);
+
+        let transcript = render_transcript(&history[1..]);
+        let rendered = render_compaction_input("规则", &history[0], None, &transcript);
+        assert_eq!(
+            rendered
+                .parts()
+                .iter()
+                .filter(|part| matches!(part, crate::llm::ContentPart::Image(_)))
+                .count(),
+            2,
+            "压缩请求必须同时携带不可压缩的初始图和待压缩工具组原图"
+        );
+    }
+
+    #[test]
     fn compaction_input_keeps_task_instructions_and_output_contract() {
         let contract = ToolSpec {
             name: SUBMIT_RESULT_TOOL.into(),
@@ -638,8 +685,9 @@ mod tests {
             "必须依据证据回答",
             &Message::User("检查 data/a.txt".into()),
             Some(&contract),
-            "# 待压缩的原始历史\n[assistant]\n已读取文件",
+            &UserContent::from("# 待压缩的原始历史\n[assistant]\n已读取文件"),
         );
+        let rendered = rendered.as_text().unwrap();
         assert!(rendered.contains("必须依据证据回答"));
         assert!(rendered.contains("检查 data/a.txt"));
         assert!(rendered.contains(SUBMIT_RESULT_TOOL));

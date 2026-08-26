@@ -6,6 +6,9 @@ api_key = ""
 model = "model-name"
 context_window_tokens = 131072
 
+# 模型只能读文字时填 ["text"]；还能读图片时填 ["text", "image"]。
+model_input_modalities = ["text"]
+
 # 可选：把这段 JSON 加到每次模型请求，供不同模型使用专有参数。
 # 不要重复填写 Formic 自己生成的模型、消息、工具等字段。
 # extra_body_json = '''{"temperature":0.2,"reasoning":{"effort":"high"}}'''
@@ -34,7 +37,7 @@ identical_tool_call_limit = 16
 context_safety_tokens = 2048
 
 [tools]
-# 内置工具单次最多返回约 1 MB，最多同时运行 64 次。
+# 内置文字工具单次最多返回约 1 MB；所有内置工具最多同时运行 64 次。
 max_result_bytes = 1048576
 max_in_flight = 64
 

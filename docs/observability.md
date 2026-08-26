@@ -17,6 +17,8 @@ out/
       ├─ workers/
       │  ├─ 1.md                   # Worker 1 运行档案
       │  └─ 2.md                   # Worker 2 运行档案
+      ├─ media/                    # MCP 返回的原始图片
+      │  └─ 1/1.png
       ├─ stats.jsonl
       └─ summary.json
 ```
@@ -33,7 +35,7 @@ worker ID 就是计划中的自然 `unit` 编号。自然运行序号把 resume 
 每份档案包含：
 
 - 任务时间、worker ID、分片、开始/结束时间、耗时和最终结局；
-- 当次任务冻结的模型协议、模型名、上下文窗口、输出预算、worker 输出权限、并发窗口和工具目录；
+- 当次任务冻结的模型协议、模型名、输入模态、上下文窗口、输出预算、worker 输出权限、并发窗口和工具目录；
 - 回合、重试、token、缓存、工具耗时、MCP 在途峰值和压缩统计；
 - 带自然序号及相对毫秒时间的状态时间线；
 - 可逐字重建的协议无关 LLM 输入、通过协议与回合验收后的助手正文、完成类别、工具调用数量、
@@ -46,6 +48,10 @@ worker ID 就是计划中的自然 `unit` 编号。自然运行序号把 resume 
 按“上一份输入前缀 + 插入原文 + 上一份输入剩余后缀”即可逐字重建。这样不会在每一轮重复
 抄写相同的 instructions、历史和工具 schema。实际 HTTP body、URL 和 header 不进入档案；
 Responses 的 opaque/encrypted replay item 只记录数量，不保存 payload。
+
+本地图片只记录冻结 input 相对路径、MIME、原始字节数、尺寸和视觉 token 估算。MCP 图片
+另外链接当前 run 的 `media` 文件。实际模型请求中的 data URL 或 base64 永不进入档案、日志、
+错误和审计 JSON。
 
 一次调用只有在协议流完整结束、完成类别与回合内容一致后，才写一个 `model_response` 事实。
 它只含完成类别、解析后的助手正文和工具调用数量。供应商 SSE envelope、残帧、超限块、

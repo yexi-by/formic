@@ -7,6 +7,7 @@
 # 本地运行与规模实验产物
 /tmp/
 /scale-metrics.csv
+/scale-stderr.log
 
 # 本地密钥与环境配置
 /config.toml

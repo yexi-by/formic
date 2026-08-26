@@ -44,6 +44,7 @@ use tokio::sync::Mutex;
 use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec};
 
 use crate::config::{McpServerConfig, McpTransportConfig, SessionScope};
+use crate::image_input::{ToolImage, decode_mcp_image};
 use crate::llm::ToolSpec;
 use crate::tools::ToolOutput;
 
@@ -1093,6 +1094,7 @@ impl McpTool {
         let Value::Object(arguments) = arguments else {
             return Ok(ToolOutput {
                 content: "错误：MCP 工具参数必须是 JSON object".into(),
+                images: Vec::new(),
                 cacheable: false,
             });
         };
@@ -1592,13 +1594,21 @@ fn validate_model_name(name: &str) -> Result<(), String> {
 
 fn convert_result(result: CallToolResult, max_bytes: usize) -> ToolOutput {
     let mut text = String::new();
+    let mut images = Vec::new();
     let text_buffer_limit = max_bytes.saturating_add(4);
     for block in result.content {
         match block {
             ContentBlock::Text(content) => {
                 push_utf8_prefix(&mut text, &content.text, text_buffer_limit)
             }
-            ContentBlock::Image(_) => return unsupported_result("image", max_bytes),
+            ContentBlock::Image(content) => {
+                match decode_mcp_image(&content.data, &content.mime_type) {
+                    Ok(image) => images.push(ToolImage::Mcp(image)),
+                    Err(error) => {
+                        return external_error(format!("MCP 图片无效：{error}"), max_bytes);
+                    }
+                }
+            }
             ContentBlock::Audio(_) => return unsupported_result("audio", max_bytes),
             ContentBlock::Resource(_) => return unsupported_result("resource", max_bytes),
             ContentBlock::ResourceLink(_) => {
@@ -1637,8 +1647,21 @@ fn convert_result(result: CallToolResult, max_bytes: usize) -> ToolOutput {
     if result.is_error == Some(true) {
         return external_error(format!("MCP 工具报告失败：{content}"), max_bytes);
     }
+    let total_bytes = images.iter().try_fold(content.len(), |total, image| {
+        total.checked_add(image.data().byte_len())
+    });
+    let Some(total_bytes) = total_bytes else {
+        return external_error("MCP 结果容量计算溢出".into(), max_bytes);
+    };
+    if total_bytes > max_bytes {
+        return external_error(
+            format!("MCP 文本和图片结果共 {total_bytes} 字节，超过 {max_bytes} 字节上限"),
+            max_bytes,
+        );
+    }
     ToolOutput {
         content,
+        images,
         cacheable: false,
     }
 }
@@ -1664,6 +1687,7 @@ fn external_error(message: String, max_bytes: usize) -> ToolOutput {
     };
     ToolOutput {
         content,
+        images: Vec::new(),
         cacheable: false,
     }
 }
@@ -2663,10 +2687,37 @@ mod tests {
     }
 
     #[test]
-    fn multimedia_is_explicitly_rejected() {
-        let result = CallToolResult::success(vec![ContentBlock::image("AA==", "image/png")]);
+    fn image_results_share_validation_and_preserve_text() {
+        let image = crate::image_input::test_image_input(crate::image_input::ImageSource::Input(
+            "sample.png".into(),
+        ));
+        let base64 = image.data.base64().unwrap();
+        let pure = convert_result(
+            CallToolResult::success(vec![ContentBlock::image(base64.clone(), "image/png")]),
+            1024,
+        );
+        assert!(pure.content.is_empty());
+        assert_eq!(pure.images.len(), 1);
+
+        let result = CallToolResult::success(vec![
+            ContentBlock::text("说明"),
+            ContentBlock::image(base64, "image/png"),
+        ]);
         let output = convert_result(result, 1024);
-        assert!(output.content.contains("不支持的结果类型 image"));
+        assert_eq!(output.content, "说明");
+        assert_eq!(output.images.len(), 1);
+
+        for result in [
+            CallToolResult::success(vec![ContentBlock::image("%%%", "image/png")]),
+            CallToolResult::success(vec![ContentBlock::image(
+                image.data.base64().unwrap(),
+                "image/jpeg",
+            )]),
+        ] {
+            let output = convert_result(result, 1024);
+            assert!(output.content.starts_with("错误："), "{}", output.content);
+            assert!(output.images.is_empty());
+        }
     }
 
     #[test]
@@ -2677,7 +2728,7 @@ mod tests {
         let mut oversized_structured =
             CallToolResult::structured(serde_json::json!({"data":"x".repeat(200)}));
         oversized_structured.content.clear();
-        let unsupported = CallToolResult::success(vec![ContentBlock::image("AA==", "image/png")]);
+        let unsupported = CallToolResult::success(vec![ContentBlock::audio("AA==", "audio/wav")]);
 
         for result in [reported_error, oversized_structured, unsupported] {
             let output = convert_result(result, 20);
@@ -2686,5 +2737,19 @@ mod tests {
             assert!(!output.cacheable);
         }
         assert!(external_error("x".repeat(100), 4).content.len() <= 4);
+    }
+
+    #[test]
+    fn decoded_images_obey_the_existing_server_result_limit() {
+        let image = crate::image_input::test_image_input(crate::image_input::ImageSource::Input(
+            "sample.png".into(),
+        ));
+        let result = CallToolResult::success(vec![ContentBlock::image(
+            image.data.base64().unwrap(),
+            "image/png",
+        )]);
+        let output = convert_result(result, image.data.byte_len().saturating_sub(1));
+        assert!(output.content.starts_with("错误："));
+        assert!(output.images.is_empty());
     }
 }

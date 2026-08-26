@@ -18,7 +18,7 @@
 
 <h2>作业入口</h2>
 <div class="row">
-  <div class="box"><b>CLI 与固定配置</b><code>src/main.rs · src/config.rs</code><br>默认读取当前目录 config.toml；--config 可指定文件。合并环境变量后校验计划、续跑身份与输出模式。</div>
+  <div class="box"><b>CLI 与固定配置</b><code>src/main.rs · src/config.rs</code><br>默认读取当前目录 config.toml；--config 可指定文件。合并环境变量后校验计划、续跑身份、输出权限与模型输入模态。</div>
   <div class="arrow">→</div>
   <div class="box"><b>活动 worker 窗口</b><code>src/main.rs</code><br>默认使用 execution.max_concurrent_units；--concurrency 只显式覆盖本次运行。取得窗口许可后才创建 task；总单元量不设上限。</div>
   <div class="arrow">→</div>
@@ -27,9 +27,9 @@
 
 <h2>模型与上下文</h2>
 <div class="row">
-  <div class="box"><b>稳定输入前缀</b><code>src/prompt.rs</code><br>输出模式 instructions 与任务冻结；user message 只列当前单元文件和分片正文，并说明完整 input 根可用 search/read 搜索核实。</div>
+  <div class="box"><b>稳定输入前缀</b><code>src/prompt.rs · src/image_input.rs</code><br>任务与能力冻结；user message 用有序文字/图片块承载当前分片，并说明完整 input 根可按需核实。</div>
   <div class="arrow">→</div>
-  <div class="box"><b>三协议适配</b><code>src/llm/</code><br>Completions、Responses、Anthropic 映射为同一消息、工具、usage 和终态。</div>
+  <div class="box"><b>三协议适配</b><code>src/llm/</code><br>Completions、Responses、Anthropic 映射同一文字/图片消息、工具、usage 和终态。</div>
   <div class="arrow">↔</div>
   <div class="box internal"><b>上下文压缩</b><code>src/compaction.rs</code><br>调用前预算；只压缩完整工具组；内部提交并本地校验。</div>
 </div>
@@ -40,7 +40,7 @@
   <div class="arrow">→</div>
   <div class="box"><b>有界 Scheduler</b><code>src/scheduler.rs · src/cache.rs</code><br>排队、取消、semaphore、singleflight/LRU、耗时和在途统计。</div>
   <div class="arrow">→</div>
-  <div class="box"><b>内置只读工具</b><code>src/tools.rs</code><br>search/read；input/output 根；路径与结果边界。</div>
+  <div class="box"><b>内置只读工具</b><code>src/tools.rs</code><br>search/read/read_image；显式 input/output 权限；路径与结果边界。</div>
   <div class="box"><b>任意自定义 MCP</b><code>src/mcp.rs</code><br>stdio 或 Streamable HTTP；启动发现；job/unit 会话；逐 server/tool 限流。</div>
 </div>
 
@@ -49,7 +49,7 @@
   <div class="box internal"><b>formic_submit_result</b><code>src/structured.rs</code><br>可选作业 schema；worker 截获并本地验证，不进入 Scheduler。</div>
   <div class="box internal"><b>formic_submit_compaction</b><code>src/compaction.rs</code><br>只用于压缩摘要，不具备外部能力。</div>
   <div class="arrow">→</div>
-  <div class="box"><b>输出与可观测性</b><code>src/output.rs</code><br>原子结果、worker 时间线 Markdown、output-schema 与 stats。</div>
+  <div class="box"><b>输出与可观测性</b><code>src/output.rs</code><br>原子结果、MCP 图片留档、worker 时间线、output-schema 与 stats。</div>
 </div>
 
 <p class="note">取消令牌贯穿 main → worker → LLM/Scheduler → 本地工具或 MCP。metrics 只记录已发生事实，不参与业务准入。</p>

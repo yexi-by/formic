@@ -141,6 +141,7 @@ mod tests {
     fn output(content: &str) -> Arc<ToolOutput> {
         Arc::new(ToolOutput {
             content: content.into(),
+            images: Vec::new(),
             cacheable: true,
         })
     }

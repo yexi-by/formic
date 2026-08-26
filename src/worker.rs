@@ -11,9 +11,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{CompactionCallUsage, CompactionError, CompactionOutcome};
 use crate::config::ExecutionConfig;
+use crate::image_input::{ImageInput, ImageSource, ToolImage};
 use crate::llm::{
-    Finish, LlmClient, LlmError, LlmEvent, Message, ProviderUsage, RequestObservation, ToolCallReq,
-    ToolSpec,
+    Finish, InputModalities, LlmClient, LlmError, LlmEvent, Message, Protocol, ProviderUsage,
+    RequestObservation, ToolCallReq, ToolSpec, UserContent,
 };
 use crate::output::{self, AuditEntry, UnitStats, WorkerState};
 use crate::plan::{PlanUnit, Shard};
@@ -58,6 +59,12 @@ pub enum UnitFailure {
     },
     #[error("分片文件 {path} 不是合法 UTF-8，无法装配进 prompt")]
     ShardEncoding { path: PathBuf },
+    #[error("分片图片 {path} 无法作为模型输入：{reason}")]
+    ShardImage { path: PathBuf, reason: String },
+    #[error("模型只声明 text 输入，无法接收工具返回的图片")]
+    ModelCannotReadToolImage,
+    #[error("工具结果容量计算溢出")]
+    ToolResultSizeOverflow,
     #[error(
         "分片在完整读取前已达到模型安全输入预算（保守估算 {estimated_tokens} token，预算 {input_budget} token）；请减小该单元的文件数量或行范围"
     )]
@@ -119,11 +126,15 @@ impl UnitFailure {
             Self::Llm(LlmError::Protocol { .. }) => "协议响应无效",
             Self::Llm(LlmError::ContextLimit { .. }) => "上下文超限",
             Self::Llm(LlmError::StreamLimit { .. }) => "响应超过本地上限",
+            Self::Llm(LlmError::RequestBuild { .. }) => "模型请求构造失败",
             Self::Llm(LlmError::AdmissionStopped { .. }) => "请求已停止",
             Self::RetriesExhausted { .. } => "请求重试耗尽",
-            Self::ReadShard { .. } | Self::ShardEncoding { .. } | Self::ShardTooLarge { .. } => {
-                "输入无效"
-            }
+            Self::ReadShard { .. }
+            | Self::ShardEncoding { .. }
+            | Self::ShardImage { .. }
+            | Self::ModelCannotReadToolImage
+            | Self::ShardTooLarge { .. } => "输入无效",
+            Self::ToolResultSizeOverflow => "工具结果无效",
             Self::Stalled { .. } => "重复工具调用停滞",
             Self::Truncated | Self::EmptyOutput | Self::Refused => "模型未产出可发布结果",
             Self::StructuredExhausted { .. } => "结构化输出无效",
@@ -174,19 +185,20 @@ pub async fn run_unit(
     let read_cancel = cancel.clone();
     let task = Arc::clone(&ctx.task);
     let input_budget = ctx.llm.input_budget(ctx.execution.context_safety_tokens);
-    let empty_history = [Message::User(String::new())];
+    let empty_history = [Message::User(UserContent::new())];
     let request_base_tokens =
         ctx.llm
             .estimate_request_tokens(&ctx.instructions, &empty_history, &ctx.model_tools);
+    let protocol = ctx.llm.protocol();
+    let input_modalities = ctx.llm.input_modalities();
+    let read_policy = ShardReadPolicy {
+        request_base_tokens,
+        input_budget,
+        protocol,
+        input_modalities,
+    };
     let reader = tokio::task::spawn_blocking(move || {
-        read_shard(
-            &root,
-            &planned_shard,
-            &task,
-            request_base_tokens,
-            input_budget,
-            &read_cancel,
-        )
+        read_shard(&root, &planned_shard, &task, read_policy, &read_cancel)
     });
     let shard_result = tokio::select! {
         biased;
@@ -293,7 +305,7 @@ pub async fn run_unit(
 
 fn message_size(message: &Message) -> i64 {
     let size: usize = match message {
-        Message::User(text) => text.len(),
+        Message::User(content) => content.byte_len(),
         Message::Compaction(text) => text.len(),
         Message::Assistant { text, tool_calls } => {
             text.len()
@@ -336,6 +348,7 @@ async fn drive_loop(
     let mut same_calls = 0u32;
     let mut invalid_submissions = 0u32;
     let mut emergency_compacted = false;
+    let mut next_media_sequence = 1u64;
 
     loop {
         let mut compaction_calls = Vec::new();
@@ -556,6 +569,7 @@ async fn drive_loop(
                 push_history(history, meter, assistant);
                 push_response_output_items(history, meter, response_output_items);
                 let mut submission_error = None;
+                let mut media_message = UserContent::new();
                 for prepared in calls {
                     let tc = prepared.req;
                     audit.push(&AuditEntry::ToolCall {
@@ -659,6 +673,7 @@ async fn drive_loop(
                         })?;
                         crate::scheduler::ToolResponse {
                             content: format!("错误：{error}"),
+                            images: Vec::new(),
                             cache: crate::scheduler::CacheDisposition::Bypassed,
                             cache_evictions: 0,
                             wait_ms: 0,
@@ -677,28 +692,50 @@ async fn drive_loop(
                             result = ctx.scheduler.execute(unit, &tc.name, prepared.arguments, cancel.clone()) => result?,
                         }
                     };
+                    let result_bytes = tool_result_bytes(&result)?;
                     audit.push(&AuditEntry::ToolExecution {
                         name: tc.name.clone(),
                         cache: cache_disposition_key(result.cache).into(),
                         wait_ms: result.wait_ms,
                         execution_ms: result.execution_ms,
-                        result_bytes: result.content.len(),
+                        result_bytes,
                         mcp_server: result.mcp_server.clone(),
                     })?;
                     audit.push(&AuditEntry::ToolResult(result.content.clone()))?;
                     meter.stats.record_tool_response(&tc.name, &result);
+                    let result_content = result.content;
+                    let result_images = result.images;
                     push_history(
                         history,
                         meter,
                         Message::ToolResult {
                             call_id: tc.call_id,
-                            content: result.content,
+                            content: result_content,
                         },
                     );
+                    for (index, image) in result_images.into_iter().enumerate() {
+                        let image = materialize_tool_image(
+                            ctx,
+                            unit,
+                            image,
+                            &mut next_media_sequence,
+                            audit,
+                        )?;
+                        media_message.push_text(format!(
+                            "工具 {} 返回的图片 {}：\n",
+                            tc.name,
+                            index + 1
+                        ));
+                        media_message.push_image(image);
+                        media_message.push_text("\n");
+                    }
                     audit.push(&AuditEntry::State {
                         state: WorkerState::Ready,
                         reason: format!("工具 {} 的结果已附加到对话历史", tc.name),
                     })?;
+                }
+                if media_message.has_images() {
+                    push_history(history, meter, Message::User(media_message));
                 }
                 if let Some(last_error) = submission_error {
                     invalid_submissions += 1;
@@ -713,6 +750,65 @@ async fn drive_loop(
             }
         }
     }
+}
+
+fn tool_result_bytes(result: &crate::scheduler::ToolResponse) -> Result<usize, UnitFailure> {
+    result
+        .images
+        .iter()
+        .try_fold(result.content.len(), |total, image| {
+            total.checked_add(image.data().byte_len())
+        })
+        .ok_or(UnitFailure::ToolResultSizeOverflow)
+}
+
+fn materialize_tool_image(
+    ctx: &JobContext,
+    unit: u64,
+    image: ToolImage,
+    next_media_sequence: &mut u64,
+    audit: &mut output::AuditLog,
+) -> Result<ImageInput, UnitFailure> {
+    let (data, source) = match image {
+        ToolImage::Input { path, data } => (data, ImageSource::Input(path)),
+        ToolImage::Mcp(data) => {
+            let sequence = *next_media_sequence;
+            let path = ctx.worker_run.archive_mcp_image(unit, sequence, &data)?;
+            *next_media_sequence = sequence
+                .checked_add(1)
+                .ok_or(UnitFailure::ToolResultSizeOverflow)?;
+            (data, ImageSource::Archived(path))
+        }
+    };
+    let estimated_tokens = ctx
+        .llm
+        .protocol()
+        .estimate_image_tokens(data.width(), data.height());
+    let image = ImageInput {
+        data,
+        source,
+        estimated_tokens,
+    };
+    audit.push(&AuditEntry::ToolMedia {
+        source: match &image.source {
+            ImageSource::Input(_) => "input".into(),
+            ImageSource::Archived(_) => "run_media".into(),
+        },
+        path: match &image.source {
+            ImageSource::Input(path) | ImageSource::Archived(path) => {
+                crate::prompt::slash_path(path)
+            }
+        },
+        mime_type: image.data.media_type().mime().into(),
+        bytes: image.data.byte_len(),
+        width: image.data.width(),
+        height: image.data.height(),
+        estimated_tokens,
+    })?;
+    if !ctx.llm.input_modalities().supports_image() {
+        return Err(UnitFailure::ModelCannotReadToolImage);
+    }
+    Ok(image)
 }
 
 fn push_history(history: &mut Vec<Message>, meter: &mut Metering<'_>, message: Message) {
@@ -805,7 +901,8 @@ async fn one_turn(
 ) -> Result<TurnEnd, CallFailure> {
     let prepared = ctx
         .llm
-        .prepare_call(&ctx.instructions, history, &ctx.model_tools);
+        .prepare_call(&ctx.instructions, history, &ctx.model_tools)
+        .map_err(|error| classify(error.into()))?;
     audit
         .push_llm_request(attempt, prepared.audit_body())
         .map_err(|e| CallFailure::Fatal(UnitFailure::Output(e)))?;
@@ -924,16 +1021,25 @@ enum ShardReadError {
     Failure(UnitFailure),
 }
 
+#[derive(Clone, Copy)]
+struct ShardReadPolicy {
+    request_base_tokens: u64,
+    input_budget: u64,
+    protocol: Protocol,
+    input_modalities: InputModalities,
+}
+
 fn read_shard(
     root: &ReadRoot,
     shard: &Shard,
     task: &str,
-    request_base_tokens: u64,
-    input_budget: u64,
+    policy: ShardReadPolicy,
     cancel: &CancellationToken,
-) -> Result<String, ShardReadError> {
-    let mut message = InitialMessageBuilder::new(request_base_tokens, input_budget)?;
-    if prompt::write_user_prefix(&mut message, task).is_err() {
+) -> Result<UserContent, ShardReadError> {
+    let mut message = InitialMessageBuilder::new(policy.request_base_tokens, policy.input_budget)?;
+    if prompt::write_user_prefix(&mut message, task, policy.input_modalities.supports_image())
+        .is_err()
+    {
         return Err(message.too_large());
     }
     match shard {
@@ -942,6 +1048,28 @@ fn read_shard(
                 let path = prompt::slash_path(file);
                 if prompt::write_file_header(&mut message, index, &path).is_err() {
                     return Err(message.too_large());
+                }
+                if crate::image_input::ImageMediaType::from_path(file).is_some() {
+                    if !policy.input_modalities.supports_image() {
+                        return Err(ShardReadError::Failure(UnitFailure::ShardImage {
+                            path: file.clone(),
+                            reason: "模型配置只声明 text 输入".into(),
+                        }));
+                    }
+                    let data = crate::image_input::read_input_image(root, file, cancel)
+                        .map_err(|error| image_shard_error(file, error))?;
+                    let image = ImageInput {
+                        estimated_tokens: policy
+                            .protocol
+                            .estimate_image_tokens(data.width(), data.height()),
+                        data,
+                        source: ImageSource::Input(file.clone()),
+                    };
+                    message.push_image(image)?;
+                    if message.write_char('\n').is_err() {
+                        return Err(message.too_large());
+                    }
+                    continue;
                 }
                 let content_start = message.len();
                 let complete = crate::tools::stream_utf8_file(root, file, cancel, |text| {
@@ -986,6 +1114,7 @@ fn read_shard(
 }
 
 struct InitialMessageBuilder {
+    content: UserContent,
     text: String,
     estimated_tokens: u64,
     rejected_tokens: u64,
@@ -995,6 +1124,7 @@ struct InitialMessageBuilder {
 impl InitialMessageBuilder {
     fn new(request_base_tokens: u64, input_budget: u64) -> Result<Self, ShardReadError> {
         let builder = Self {
+            content: UserContent::new(),
             text: String::new(),
             estimated_tokens: request_base_tokens,
             rejected_tokens: request_base_tokens,
@@ -1023,8 +1153,30 @@ impl InitialMessageBuilder {
         })
     }
 
-    fn finish(self) -> String {
-        self.text
+    fn push_image(&mut self, image: ImageInput) -> Result<(), ShardReadError> {
+        let Some(next) = self.estimated_tokens.checked_add(image.estimated_tokens) else {
+            self.rejected_tokens = u64::MAX;
+            return Err(self.too_large());
+        };
+        if next > self.input_budget {
+            self.rejected_tokens = next;
+            return Err(self.too_large());
+        }
+        self.estimated_tokens = next;
+        self.flush_text();
+        self.content.push_image(image);
+        Ok(())
+    }
+
+    fn flush_text(&mut self) {
+        if !self.text.is_empty() {
+            self.content.push_text(std::mem::take(&mut self.text));
+        }
+    }
+
+    fn finish(mut self) -> UserContent {
+        self.flush_text();
+        self.content
     }
 }
 
@@ -1034,7 +1186,10 @@ impl fmt::Write for InitialMessageBuilder {
         // 各块之和是最终请求的保守上界，不依赖字节数猜测 token。
         let encoded = serde_json::to_string(text).expect("str 可以序列化为 JSON");
         let added = tokenize::count(&encoded);
-        let next = self.estimated_tokens.saturating_add(added);
+        let Some(next) = self.estimated_tokens.checked_add(added) else {
+            self.rejected_tokens = u64::MAX;
+            return Err(fmt::Error);
+        };
         if next > self.input_budget {
             self.rejected_tokens = next;
             return Err(fmt::Error);
@@ -1042,6 +1197,17 @@ impl fmt::Write for InitialMessageBuilder {
         self.estimated_tokens = next;
         self.text.push_str(text);
         Ok(())
+    }
+}
+
+fn image_shard_error(path: &Path, error: crate::image_input::ImageError) -> ShardReadError {
+    if matches!(error, crate::image_input::ImageError::Cancelled) {
+        ShardReadError::Cancelled
+    } else {
+        ShardReadError::Failure(UnitFailure::ShardImage {
+            path: path.to_path_buf(),
+            reason: error.to_string(),
+        })
     }
 }
 
@@ -1175,6 +1341,7 @@ mod tests {
             crate::scheduler::ToolRegistry::builtins(
                 &tools,
                 crate::output_access::WorkerOutputAccess::Published,
+                InputModalities::Text,
             ),
             Roots {
                 input: ReadRoot::open(data.clone()).unwrap(),
@@ -1200,6 +1367,7 @@ mod tests {
                 concurrency: 4,
                 output_format: crate::output::RecordFormat::Markdown,
                 worker_output_access: crate::output_access::WorkerOutputAccess::Published,
+                model_input_modalities: vec!["text".into()],
                 tools: model_tools.iter().map(|tool| tool.name.clone()).collect(),
             },
         )
@@ -1258,12 +1426,19 @@ mod tests {
             &root,
             &shard,
             "任务。",
-            0,
-            u64::MAX,
+            ShardReadPolicy {
+                request_base_tokens: 0,
+                input_budget: u64::MAX,
+                protocol: Protocol::Completions,
+                input_modalities: InputModalities::Text,
+            },
             &CancellationToken::new(),
         )
         .expect("计划范围内的合法 UTF-8 应可读取");
-        assert!(result.ends_with("first\nsecond\n"), "{result}");
+        assert!(
+            result.as_text().unwrap().ends_with("first\nsecond\n"),
+            "{result:?}"
+        );
     }
 
     #[test]
@@ -1279,8 +1454,12 @@ mod tests {
             &read_root,
             &shard,
             task,
-            0,
-            u64::MAX,
+            ShardReadPolicy {
+                request_base_tokens: 0,
+                input_budget: u64::MAX,
+                protocol: Protocol::Completions,
+                input_modalities: InputModalities::Text,
+            },
             &CancellationToken::new(),
         )
         .unwrap();
@@ -1291,7 +1470,7 @@ mod tests {
                 ("b.txt".into(), "beta\r\n".into()),
             ]),
         );
-        assert_eq!(actual, expected);
+        assert_eq!(actual, expected.into());
     }
 
     #[test]
@@ -1306,8 +1485,12 @@ mod tests {
             &read_root,
             &shard,
             "任务。",
-            0,
-            1_000,
+            ShardReadPolicy {
+                request_base_tokens: 0,
+                input_budget: 1_000,
+                protocol: Protocol::Completions,
+                input_modalities: InputModalities::Text,
+            },
             &CancellationToken::new(),
         )
         .unwrap_err();

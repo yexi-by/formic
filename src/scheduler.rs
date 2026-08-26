@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::cache::{CacheLookup, FlightState, ToolCache, wait_for_flight};
 use crate::config::{CacheConfig, ToolsConfig};
-use crate::llm::ToolSpec;
+use crate::llm::{InputModalities, ToolSpec};
 use crate::mcp::{McpManager, McpStartupError, McpTool};
 use crate::output_access::WorkerOutputAccess;
 use crate::tools::{self, BuiltinTool, Roots, ToolOutput};
@@ -54,9 +54,13 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    pub fn builtins(config: &ToolsConfig, output_access: WorkerOutputAccess) -> Self {
+    pub fn builtins(
+        config: &ToolsConfig,
+        output_access: WorkerOutputAccess,
+        input_modalities: InputModalities,
+    ) -> Self {
         let mut entries = BTreeMap::new();
-        for registration in tools::registrations(config, output_access) {
+        for registration in tools::registrations(config, output_access, input_modalities) {
             entries.insert(
                 registration.spec.name.clone(),
                 RegisteredTool {
@@ -76,8 +80,9 @@ impl ToolRegistry {
         config: &ToolsConfig,
         manager: McpManager,
         output_access: WorkerOutputAccess,
+        input_modalities: InputModalities,
     ) -> Result<Self, RegistryError> {
-        let mut registry = Self::builtins(config, output_access);
+        let mut registry = Self::builtins(config, output_access, input_modalities);
         let mut entries = (*registry.entries).clone();
         for registration in manager.registrations()? {
             if entries.contains_key(&registration.model_name) {
@@ -158,6 +163,7 @@ pub enum CacheDisposition {
 #[derive(Debug, Clone)]
 pub struct ToolResponse {
     pub content: String,
+    pub images: Vec<crate::image_input::ToolImage>,
     pub cache: CacheDisposition,
     pub cache_evictions: u64,
     pub wait_ms: u64,
@@ -382,6 +388,7 @@ async fn dispatch(
     let Some(target) = targets.get(name) else {
         return Ok(ToolResponse {
             content: format!("错误：未知工具 {name}"),
+            images: Vec::new(),
             cache: CacheDisposition::Bypassed,
             cache_evictions: 0,
             wait_ms: 0,
@@ -443,6 +450,7 @@ async fn dispatch(
                                         cache.complete(&key, sender, Arc::clone(&output)).await;
                                     return Ok(ToolResponse {
                                         content: output.content.clone(),
+                                        images: output.images.clone(),
                                         cache: CacheDisposition::Miss,
                                         cache_evictions: evictions,
                                         wait_ms,
@@ -469,6 +477,7 @@ async fn dispatch(
                     .await?;
             Ok(ToolResponse {
                 content: output.content,
+                images: output.images,
                 cache: if cache.is_some() {
                     CacheDisposition::Bypassed
                 } else {
@@ -507,6 +516,7 @@ async fn dispatch(
             let output = called?;
             Ok(ToolResponse {
                 content: output.content,
+                images: output.images,
                 cache: CacheDisposition::Bypassed,
                 cache_evictions: 0,
                 wait_ms,
@@ -526,6 +536,7 @@ fn cached_response(
 ) -> ToolResponse {
     ToolResponse {
         content: output.content.clone(),
+        images: output.images.clone(),
         cache: disposition,
         cache_evictions: 0,
         wait_ms: elapsed_ms(started),
@@ -625,7 +636,8 @@ mod tests {
         fs::create_dir_all(&output).unwrap();
         fs::write(input.join("a.txt"), "苹果\n").unwrap();
         let (tools, cache) = configs(cache_enabled);
-        let registry = ToolRegistry::builtins(&tools, WorkerOutputAccess::Published);
+        let registry =
+            ToolRegistry::builtins(&tools, WorkerOutputAccess::Published, InputModalities::Text);
         let scheduler = Scheduler::start(
             registry,
             Roots {
@@ -702,7 +714,8 @@ mod tests {
     #[test]
     fn registry_order_is_stable() {
         let (tools, _) = configs(false);
-        let registry = ToolRegistry::builtins(&tools, WorkerOutputAccess::Published);
+        let registry =
+            ToolRegistry::builtins(&tools, WorkerOutputAccess::Published, InputModalities::Text);
         let specs = registry.specs();
         let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
         assert_eq!(names, ["read", "search"]);

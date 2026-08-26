@@ -2,7 +2,10 @@
 //! 工具调用的参数以 input_json_delta 增量到达，content_block_stop 时拼好放出。
 //! max_tokens 是该协议的必填字段，使用已校验的模型配置。
 
-use super::{Finish, LlmConfig, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq, ToolSpec};
+use super::{
+    ContentPart, Finish, LlmConfig, LlmError, LlmEvent, Message, ProviderUsage, ToolCallReq,
+    ToolSpec, UserContent,
+};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
@@ -11,12 +14,42 @@ pub fn build_request(
     instructions: &str,
     history: &[Message],
     tools: &[ToolSpec],
-) -> (String, String, Vec<(String, String)>) {
+) -> super::BuildRequestResult {
+    build_request_inner(config, instructions, history, tools, true)
+}
+
+pub(super) fn build_estimate_body(
+    config: &LlmConfig,
+    instructions: &str,
+    history: &[Message],
+    tools: &[ToolSpec],
+) -> Result<String, LlmError> {
+    build_request_inner(config, instructions, history, tools, false).map(|(_, body, _)| body)
+}
+
+fn build_request_inner(
+    config: &LlmConfig,
+    instructions: &str,
+    history: &[Message],
+    tools: &[ToolSpec],
+    include_image_bytes: bool,
+) -> super::BuildRequestResult {
     let mut messages: Vec<serde_json::Value> = Vec::new();
     for message in history {
         match message {
-            Message::User(text) => {
-                messages.push(serde_json::json!({"role": "user", "content": text}));
+            Message::User(content) => {
+                let blocks = user_content(content, include_image_bytes)?;
+                let fold_into = messages.last_mut().and_then(|last| {
+                    if last["role"] == "user" && last["content"].is_array() {
+                        last["content"].as_array_mut()
+                    } else {
+                        None
+                    }
+                });
+                match fold_into {
+                    Some(existing) => existing.extend(blocks),
+                    None => messages.push(serde_json::json!({"role": "user", "content": blocks})),
+                }
             }
             Message::Compaction(text) => {
                 messages.push(serde_json::json!({
@@ -93,11 +126,44 @@ pub fn build_request(
     if let Some(key) = &config.api_key {
         headers.push(("x-api-key".to_string(), key.clone()));
     }
-    (
+    Ok((
         format!("{}/messages", config.base_url.trim_end_matches('/')),
         body.to_string(),
         headers,
-    )
+    ))
+}
+
+fn user_content(
+    content: &UserContent,
+    include_image_bytes: bool,
+) -> Result<Vec<serde_json::Value>, LlmError> {
+    content
+        .parts()
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text(text) => Ok(serde_json::json!({"type": "text", "text": text})),
+            ContentPart::Image(image) => {
+                let data = if include_image_bytes {
+                    image
+                        .data
+                        .base64()
+                        .map_err(|error| LlmError::RequestBuild {
+                            reason: error.to_string(),
+                        })?
+                } else {
+                    String::new()
+                };
+                Ok(serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image.data.media_type().mime(),
+                        "data": data,
+                    },
+                }))
+            }
+        })
+        .collect()
 }
 
 struct PendingToolUse {
@@ -694,7 +760,7 @@ mod tests {
                 content: "乙".into(),
             },
         ];
-        let (_url, body, _headers) = build_request(&config, "说明", &history, &[]);
+        let (_url, body, _headers) = build_request(&config, "说明", &history, &[]).unwrap();
         let v: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(v["messages"][1]["role"], "assistant");
         assert_eq!(v["messages"][1]["content"][0]["type"], "text");
@@ -736,5 +802,44 @@ mod tests {
             )
             .unwrap();
         assert_eq!(events, vec![LlmEvent::Finished(Finish::MaxTokens)]);
+    }
+
+    #[test]
+    fn user_images_map_to_base64_blocks_and_follow_tool_results() {
+        let mut config = LlmConfig::test_defaults();
+        config.protocol = super::super::Protocol::Anthropic;
+        config.anthropic_max_tokens = Some(1024);
+        let mut media = UserContent::new();
+        media.push_image(crate::image_input::test_image_input(
+            crate::image_input::ImageSource::Archived("media/1/1.png".into()),
+        ));
+        let history = vec![
+            Message::Assistant {
+                text: String::new(),
+                tool_calls: vec![ToolCallReq {
+                    call_id: "call_1".into(),
+                    name: "read_image".into(),
+                    arguments: "{}".into(),
+                }],
+            },
+            Message::ToolResult {
+                call_id: "call_1".into(),
+                content: "已读取图片".into(),
+            },
+            Message::User(media),
+        ];
+        let (_, body, _) = build_request(&config, "说明", &history, &[]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(value["messages"][1]["content"][0]["type"], "tool_result");
+        assert_eq!(value["messages"][1]["content"][1]["type"], "image");
+        assert_eq!(
+            value["messages"][1]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
+        assert!(
+            value["messages"][1]["content"][1]["source"]["data"]
+                .as_str()
+                .is_some_and(|data| !data.is_empty())
+        );
     }
 }

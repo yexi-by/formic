@@ -26,7 +26,8 @@ Formic 的工作单元必须能够独立完成、独立重试、独立发布。�
 ## 快速开始
 
 需要 Rust 1.88 或更高版本。复制 [`config.example.toml`](config.example.toml)，填写模型
-信息，并设置 `FORMIC_LLM_PROTOCOL`。配置可以留在固定位置，不需要复制到作业目录。
+信息和 `model_input_modalities`，并设置 `FORMIC_LLM_PROTOCOL`。配置可以留在固定位置，
+不需要复制到作业目录。
 
 ```bash
 cargo build --release
@@ -42,15 +43,18 @@ formic run \
 
 省略 `--config` 时读取当前目录的 `config.toml`；显式指定的文件不存在会直接报错。结构化输出额外传入
 `--output-schema <schema.json>`；需要继续同一输出区时增加 `--resume`。已发布结果不会覆盖，
-续跑只处理失败、停止和未开始的单元，并在请求前确认 plan、task、schema 与 input 未变。
+续跑只处理失败、停止和未开始的单元，并在请求前确认作业输入、worker 权限与模型模态未变。
 `--worker-output-access none` 隔离各 worker；改为 `published` 可保留读取已发布结果的能力。
 模型服务商的专有请求参数可通过配置中的 `extra_body_json` 透传。
+声明 `["text", "image"]` 后，文件分片可混合 JPEG、PNG、GIF、WebP，worker 也会得到
+只读取冻结 input 的 `read_image`。图片保持原始字节，不下载 URL，也不自动缩放或转码。
 
 每个 worker 结束后都会生成：
 
 ```text
 out/results/<worker编号>.md
 out/runs/run-000001/workers/<worker编号>.md
+out/runs/run-000001/media/<worker编号>/<图片编号>.<扩展名>  # 仅 MCP 图片
 out/runs/run-000001/stats.jsonl
 out/runs/run-000001/summary.json
 ```

@@ -23,6 +23,7 @@ use tokio_util::sync::CancellationToken;
 mod cache;
 mod compaction;
 mod config;
+mod image_input;
 mod job;
 mod llm;
 mod mcp;
@@ -114,6 +115,10 @@ enum StartupError {
     TaskEncoding(PathBuf),
     #[error("任务说明 {0} 为空或超过 1 MiB 上限")]
     TaskInvalid(PathBuf),
+    #[error(
+        "计划包含图片 {0}，但 model_input_modalities 只声明 text；请为支持图片的模型声明 [\"text\", \"image\"]"
+    )]
+    ImageModelRequired(PathBuf),
     #[error(transparent)]
     Plan(#[from] plan::PlanError),
     #[error(transparent)]
@@ -251,6 +256,9 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
             })?;
     let task = read_task(&args.task)?;
     let loaded_plan = plan::load_snapshot(&args.plan, &data_read_root)?;
+    if !args.resume {
+        validate_planned_images(&loaded_plan.units, config.llm.input_modalities)?;
+    }
     let output_contract =
         structured::OutputContract::prepare(args.output_schema.as_deref(), &results_root)?;
     let fingerprints = job::Fingerprints::from_snapshots(
@@ -260,6 +268,7 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         input_digest,
         output_contract.format(),
         worker_output_access,
+        config.llm.input_modalities,
     );
     let units = loaded_plan.units;
     let (mut job_state, selection) = job::JobState::prepare(
@@ -270,6 +279,9 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         &output_contract,
         args.resume,
     )?;
+    if args.resume {
+        validate_planned_images(&units, config.llm.input_modalities)?;
+    }
     output_contract.publish_schema_record(&results_root)?;
     let planned = units.len() as u64;
     let already_completed = selection.already_completed;
@@ -291,6 +303,13 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
                 concurrency,
                 output_format: output_contract.format(),
                 worker_output_access,
+                model_input_modalities: config
+                    .llm
+                    .input_modalities
+                    .names()
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
                 tools: Vec::new(),
             },
         )
@@ -341,7 +360,12 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         None
     };
     let mcp = mcp::McpManager::initialize(&config.mcp_servers).await?;
-    let registry = scheduler::ToolRegistry::with_mcp(&config.tools, mcp, worker_output_access)?;
+    let registry = scheduler::ToolRegistry::with_mcp(
+        &config.tools,
+        mcp,
+        worker_output_access,
+        config.llm.input_modalities,
+    )?;
     let mut model_tools = registry.specs().to_vec();
     if let Some(spec) = output_contract.submit_spec() {
         model_tools.push(spec);
@@ -358,6 +382,13 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
             concurrency,
             output_format: output_contract.format(),
             worker_output_access,
+            model_input_modalities: config
+                .llm
+                .input_modalities
+                .names()
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             tools: model_tools.iter().map(|tool| tool.name.clone()).collect(),
         },
     )
@@ -653,6 +684,25 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
     } else {
         Ok(0)
     }
+}
+
+fn validate_planned_images(
+    units: &[plan::PlanUnit],
+    modalities: llm::InputModalities,
+) -> Result<(), StartupError> {
+    if modalities.supports_image() {
+        return Ok(());
+    }
+    for unit in units {
+        if let plan::Shard::Files(files) = &unit.shard
+            && let Some(path) = files
+                .iter()
+                .find(|path| image_input::ImageMediaType::from_path(path).is_some())
+        {
+            return Err(StartupError::ImageModelRequired(path.clone()));
+        }
+    }
+    Ok(())
 }
 
 type WorkerResult = (

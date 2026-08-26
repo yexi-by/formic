@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 
 use tiktoken_rs::CoreBPE;
 
-use crate::llm::{Message, ToolCallReq};
+use crate::llm::{ContentPart, Message, ToolCallReq, UserContent};
 
 /// 每条消息的结构开销（角色/封装的估算常量）。
 const MESSAGE_OVERHEAD: u64 = 4;
@@ -24,7 +24,7 @@ pub fn count(text: &str) -> u64 {
 /// 估算一条内部消息的 token 数（内容 + 结构开销）。
 pub fn count_message(message: &Message) -> u64 {
     let content = match message {
-        Message::User(text) => count(text),
+        Message::User(content) => count_user_content(content),
         Message::Compaction(text) => count(text),
         Message::Assistant { text, tool_calls } => {
             count(text) + tool_calls.iter().map(count_tool_call).sum::<u64>()
@@ -35,6 +35,18 @@ pub fn count_message(message: &Message) -> u64 {
         Message::ToolResult { call_id, content } => count(call_id) + count(content),
     };
     content + MESSAGE_OVERHEAD
+}
+
+fn count_user_content(content: &UserContent) -> u64 {
+    content
+        .parts()
+        .iter()
+        .map(|part| match part {
+            ContentPart::Text(text) => count(text),
+            ContentPart::Image(image) => image.estimated_tokens,
+        })
+        .try_fold(0u64, u64::checked_add)
+        .unwrap_or(u64::MAX)
 }
 
 /// 估算一次工具调用的 token 数（模型输出的一部分）。

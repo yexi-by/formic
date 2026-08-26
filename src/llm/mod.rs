@@ -17,6 +17,38 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
 
+use crate::image_input::ImageInput;
+
+pub(crate) type BuiltRequest = (String, String, Vec<(String, String)>);
+pub(crate) type BuildRequestResult = Result<BuiltRequest, LlmError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputModalities {
+    Text,
+    TextAndImage,
+}
+
+impl InputModalities {
+    pub fn parse(values: &[String]) -> Result<Self, String> {
+        match values {
+            [text] if text == "text" => Ok(Self::Text),
+            [text, image] if text == "text" && image == "image" => Ok(Self::TextAndImage),
+            _ => Err("model_input_modalities 只接受 [\"text\"] 或 [\"text\", \"image\"]".into()),
+        }
+    }
+
+    pub const fn supports_image(self) -> bool {
+        matches!(self, Self::TextAndImage)
+    }
+
+    pub const fn names(self) -> &'static [&'static str] {
+        match self {
+            Self::Text => &["text"],
+            Self::TextAndImage => &["text", "image"],
+        }
+    }
+}
+
 /// 协议形状，由环境变量 FORMIC_LLM_PROTOCOL 选择。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
@@ -52,6 +84,52 @@ impl Protocol {
             ],
         }
     }
+
+    pub fn estimate_image_tokens(self, width: u32, height: u32) -> u64 {
+        match self {
+            Self::Completions | Self::Responses => openai_image_tokens(width, height),
+            Self::Anthropic => u64::from(width)
+                .checked_mul(u64::from(height))
+                .and_then(|pixels| pixels.checked_add(749))
+                .map(|pixels| pixels / 750)
+                .unwrap_or(u64::MAX),
+        }
+    }
+}
+
+fn openai_image_tokens(width: u32, height: u32) -> u64 {
+    let mut width = u64::from(width);
+    let mut height = u64::from(height);
+    let longest = width.max(height);
+    if longest > 2048 {
+        width = ceil_mul_div(width, 2048, longest).unwrap_or(u64::MAX);
+        height = ceil_mul_div(height, 2048, longest).unwrap_or(u64::MAX);
+    }
+    let shortest = width.min(height);
+    if shortest > 768 {
+        width = ceil_mul_div(width, 768, shortest).unwrap_or(u64::MAX);
+        height = ceil_mul_div(height, 768, shortest).unwrap_or(u64::MAX);
+    }
+    let columns = ceil_div(width, 512).unwrap_or(u64::MAX);
+    let rows = ceil_div(height, 512).unwrap_or(u64::MAX);
+    columns
+        .checked_mul(rows)
+        .and_then(|tiles| tiles.checked_mul(170))
+        .and_then(|tokens| tokens.checked_add(85))
+        .unwrap_or(u64::MAX)
+}
+
+fn ceil_mul_div(value: u64, multiplier: u64, divisor: u64) -> Option<u64> {
+    value
+        .checked_mul(multiplier)?
+        .checked_add(divisor.checked_sub(1)?)?
+        .checked_div(divisor)
+}
+
+fn ceil_div(value: u64, divisor: u64) -> Option<u64> {
+    value
+        .checked_add(divisor.checked_sub(1)?)?
+        .checked_div(divisor)
 }
 
 /// 一条完整组装的工具调用请求。arguments 是模型给出的原始 JSON 文本；
@@ -63,10 +141,121 @@ pub struct ToolCallReq {
     pub arguments: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentPart {
+    Text(String),
+    Image(ImageInput),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserContent {
+    parts: Vec<ContentPart>,
+}
+
+impl UserContent {
+    pub fn new() -> Self {
+        Self { parts: Vec::new() }
+    }
+
+    pub fn parts(&self) -> &[ContentPart] {
+        &self.parts
+    }
+
+    #[cfg(test)]
+    pub fn as_text(&self) -> Option<&str> {
+        match self.parts.as_slice() {
+            [ContentPart::Text(text)] => Some(text),
+            _ => None,
+        }
+    }
+
+    pub fn push_text(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        if text.is_empty() {
+            return;
+        }
+        match self.parts.last_mut() {
+            Some(ContentPart::Text(existing)) => existing.push_str(&text),
+            _ => self.parts.push(ContentPart::Text(text)),
+        }
+    }
+
+    pub fn push_image(&mut self, image: ImageInput) {
+        self.parts.push(ContentPart::Image(image));
+    }
+
+    pub fn extend(&mut self, other: &Self) {
+        for part in &other.parts {
+            match part {
+                ContentPart::Text(text) => self.push_text(text.clone()),
+                ContentPart::Image(image) => self.push_image(image.clone()),
+            }
+        }
+    }
+
+    pub fn has_images(&self) -> bool {
+        self.parts
+            .iter()
+            .any(|part| matches!(part, ContentPart::Image(_)))
+    }
+
+    pub fn estimated_image_tokens(&self) -> u64 {
+        self.parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Image(image) => Some(image.estimated_tokens),
+                ContentPart::Text(_) => None,
+            })
+            .try_fold(0u64, u64::checked_add)
+            .unwrap_or(u64::MAX)
+    }
+
+    pub fn byte_len(&self) -> usize {
+        self.parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text(text) => text.len(),
+                ContentPart::Image(image) => image.data.byte_len(),
+            })
+            .try_fold(0usize, usize::checked_add)
+            .unwrap_or(usize::MAX)
+    }
+
+    pub fn audit_parts(&self) -> Vec<serde_json::Value> {
+        self.parts
+            .iter()
+            .map(|part| match part {
+                ContentPart::Text(text) => serde_json::json!({"type": "text", "text": text}),
+                ContentPart::Image(image) => image.audit_value(),
+            })
+            .collect()
+    }
+}
+
+impl Default for UserContent {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<String> for UserContent {
+    fn from(text: String) -> Self {
+        let mut content = Self::new();
+        content.push_text(text);
+        content
+    }
+}
+
+impl From<&str> for UserContent {
+    fn from(text: &str) -> Self {
+        text.to_string().into()
+    }
+}
+
 /// 内部对话历史：协议无关，三个协议各自翻译成自己的请求格式。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
-    User(String),
+    User(UserContent),
     /// 经内部压缩工具验证的历史摘要；不是模型可调用的普通工具结果。
     Compaction(String),
     Assistant {
@@ -239,6 +428,9 @@ pub enum LlmError {
     StreamLimit {
         limit: usize,
     },
+    RequestBuild {
+        reason: String,
+    },
     AdmissionStopped {
         reason: StopReason,
     },
@@ -309,6 +501,7 @@ impl fmt::Display for LlmError {
             Self::StreamLimit { limit } => {
                 write!(formatter, "LLM 流超过本地安全上限 {limit} 字节")
             }
+            Self::RequestBuild { reason } => write!(formatter, "LLM 请求构造失败：{reason}"),
             Self::AdmissionStopped { reason } => {
                 write!(formatter, "作业已因{reason}停止接纳后续模型调用")
             }
@@ -375,6 +568,7 @@ pub struct LlmConfig {
     pub context_window_tokens: u64,
     /// Anthropic Messages 协议要求的 max_tokens；其他协议必须为 None。
     pub anthropic_max_tokens: Option<u64>,
+    pub input_modalities: InputModalities,
     /// 加入每次模型请求根对象的供应商扩展字段。
     pub extra_body: serde_json::Map<String, serde_json::Value>,
     pub connect_timeout: Duration,
@@ -395,6 +589,7 @@ impl LlmConfig {
             api_key: None,
             context_window_tokens: 100_000,
             anthropic_max_tokens: None,
+            input_modalities: InputModalities::Text,
             extra_body: serde_json::Map::new(),
             connect_timeout: Duration::from_secs(1),
             read_timeout: Duration::from_secs(1),
@@ -606,14 +801,23 @@ impl LlmClient {
         instructions: &str,
         history: &[Message],
         tools: &[ToolSpec],
-    ) -> PreparedLlmCall {
-        let (url, body, headers) = self.build_request(instructions, history, tools);
-        PreparedLlmCall {
+    ) -> Result<PreparedLlmCall, LlmError> {
+        if !self.config.input_modalities.supports_image()
+            && history
+                .iter()
+                .any(|message| matches!(message, Message::User(content) if content.has_images()))
+        {
+            return Err(LlmError::RequestBuild {
+                reason: "模型配置只声明 text 输入，不能发送图片".into(),
+            });
+        }
+        let (url, body, headers) = self.build_request(instructions, history, tools)?;
+        Ok(PreparedLlmCall {
             url,
             body,
             audit_body: build_audit_request(instructions, history, tools),
             headers,
-        }
+        })
     }
 
     /// 发送一个已经留痕的流式调用。SSE 解析在调用方（worker）循环内驱动，
@@ -704,7 +908,7 @@ impl LlmClient {
         instructions: &str,
         history: &[Message],
         tools: &[ToolSpec],
-    ) -> (String, String, Vec<(String, String)>) {
+    ) -> BuildRequestResult {
         match self.config.protocol {
             Protocol::Completions => {
                 completions::build_request(&self.config, instructions, history, tools)
@@ -724,8 +928,29 @@ impl LlmClient {
         history: &[Message],
         tools: &[ToolSpec],
     ) -> u64 {
-        let (_, body, _) = self.build_request(instructions, history, tools);
-        crate::tokenize::count(&body)
+        let estimate_body = match self.config.protocol {
+            Protocol::Completions => {
+                completions::build_estimate_body(&self.config, instructions, history, tools)
+            }
+            Protocol::Responses => {
+                responses::build_estimate_body(&self.config, instructions, history, tools)
+            }
+            Protocol::Anthropic => {
+                anthropic::build_estimate_body(&self.config, instructions, history, tools)
+            }
+        };
+        let Ok(estimate_body) = estimate_body else {
+            return u64::MAX;
+        };
+        let text = crate::tokenize::count(&estimate_body);
+        history
+            .iter()
+            .filter_map(|message| match message {
+                Message::User(content) => Some(content.estimated_image_tokens()),
+                _ => None,
+            })
+            .try_fold(text, u64::checked_add)
+            .unwrap_or(u64::MAX)
     }
 
     pub fn input_budget(&self, safety_tokens: u64) -> u64 {
@@ -733,6 +958,14 @@ impl LlmClient {
             .context_window_tokens
             .saturating_sub(self.config.anthropic_max_tokens.unwrap_or(0))
             .saturating_sub(safety_tokens)
+    }
+
+    pub const fn input_modalities(&self) -> InputModalities {
+        self.config.input_modalities
+    }
+
+    pub const fn protocol(&self) -> Protocol {
+        self.config.protocol
     }
 }
 
@@ -742,7 +975,10 @@ fn build_audit_request(instructions: &str, history: &[Message], tools: &[ToolSpe
     let history: Vec<serde_json::Value> = history
         .iter()
         .map(|message| match message {
-            Message::User(text) => serde_json::json!({"role": "user", "text": text}),
+            Message::User(content) => serde_json::json!({
+                "role": "user",
+                "content": content.audit_parts(),
+            }),
             Message::Compaction(text) => {
                 serde_json::json!({"role": "compaction", "text": text})
             }
@@ -1407,7 +1643,7 @@ mod tests {
             }))
             .unwrap();
             let client = LlmClient::new(config);
-            let (_, body, _) = client.build_request("说明", &[], &[]);
+            let (_, body, _) = client.build_request("说明", &[], &[]).unwrap();
             let body: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(body["temperature"], 0.2, "{protocol:?}");
             assert_eq!(body["reasoning"]["effort"], "high", "{protocol:?}");
@@ -1431,7 +1667,7 @@ mod tests {
             config.protocol = protocol;
             config.anthropic_max_tokens = (protocol == Protocol::Anthropic).then_some(16_384);
             let client = LlmClient::new(config);
-            let (_, body, _) = client.build_request("说明", &[], &tools);
+            let (_, body, _) = client.build_request("说明", &[], &tools).unwrap();
             let body: serde_json::Value = serde_json::from_str(&body).unwrap();
             let actual: std::collections::BTreeSet<_> = body
                 .as_object()
@@ -1442,6 +1678,106 @@ mod tests {
             let managed = protocol.managed_request_fields().iter().copied().collect();
             assert_eq!(actual, managed, "{protocol:?}");
         }
+    }
+
+    #[test]
+    fn image_requests_keep_base64_out_of_audit_and_text_bpe_budget() {
+        for protocol in [
+            Protocol::Completions,
+            Protocol::Responses,
+            Protocol::Anthropic,
+        ] {
+            let mut config = LlmConfig::test_defaults();
+            config.protocol = protocol;
+            config.input_modalities = InputModalities::TextAndImage;
+            config.anthropic_max_tokens = (protocol == Protocol::Anthropic).then_some(1024);
+            let client = LlmClient::new(config);
+            let mut content = UserContent::from("看图");
+            let image = crate::image_input::test_image_input(
+                crate::image_input::ImageSource::Input("sample.png".into()),
+            );
+            let encoded = image.data.base64().unwrap();
+            content.push_image(image);
+            let history = [Message::User(content)];
+            let prepared = client.prepare_call("说明", &history, &[]).unwrap();
+            assert!(prepared.body.contains(&encoded), "{protocol:?}");
+            assert!(!prepared.audit_body().contains("base64"), "{protocol:?}");
+            assert!(
+                !prepared.audit_body().contains("data:image"),
+                "{protocol:?}"
+            );
+            assert!(prepared.audit_body().contains("sample.png"), "{protocol:?}");
+            let estimate_body = match protocol {
+                Protocol::Completions => {
+                    completions::build_estimate_body(&client.config, "说明", &history, &[])
+                }
+                Protocol::Responses => {
+                    responses::build_estimate_body(&client.config, "说明", &history, &[])
+                }
+                Protocol::Anthropic => {
+                    anthropic::build_estimate_body(&client.config, "说明", &history, &[])
+                }
+            }
+            .unwrap();
+            assert!(!estimate_body.contains(&encoded), "{protocol:?}");
+            assert_eq!(
+                client.estimate_request_tokens("说明", &history, &[]),
+                crate::tokenize::count(&estimate_body) + 255,
+                "{protocol:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn token_estimate_keeps_extra_body_and_responses_replay_payloads() {
+        for protocol in [
+            Protocol::Completions,
+            Protocol::Responses,
+            Protocol::Anthropic,
+        ] {
+            let mut base = LlmConfig::test_defaults();
+            base.protocol = protocol;
+            base.anthropic_max_tokens = (protocol == Protocol::Anthropic).then_some(1024);
+            let baseline = LlmClient::new(base.clone()).estimate_request_tokens("说明", &[], &[]);
+            base.extra_body.insert(
+                "provider_context".into(),
+                serde_json::json!("扩展载荷 ".repeat(512)),
+            );
+            let expanded = LlmClient::new(base).estimate_request_tokens("说明", &[], &[]);
+            assert!(expanded > baseline + 100, "{protocol:?}");
+        }
+
+        let mut config = LlmConfig::test_defaults();
+        config.protocol = Protocol::Responses;
+        let client = LlmClient::new(config);
+        let baseline = client.estimate_request_tokens("说明", &[], &[]);
+        let history = [Message::ResponseOutputItems(vec![serde_json::json!({
+            "type": "reasoning",
+            "encrypted_content": "opaque replay payload ".repeat(512),
+        })])];
+        assert!(client.estimate_request_tokens("说明", &history, &[]) > baseline + 100);
+    }
+
+    #[test]
+    fn text_only_clients_reject_images_before_request_construction() {
+        let client = LlmClient::new(LlmConfig::test_defaults());
+        let mut content = UserContent::from("看图");
+        content.push_image(crate::image_input::test_image_input(
+            crate::image_input::ImageSource::Input("sample.png".into()),
+        ));
+        let error = client
+            .prepare_call("说明", &[Message::User(content)], &[])
+            .err()
+            .unwrap();
+        assert!(matches!(error, LlmError::RequestBuild { .. }));
+        assert_eq!(client.requests_started(), 0);
+    }
+
+    #[test]
+    fn visual_token_estimates_are_dimension_based_and_checked() {
+        assert_eq!(Protocol::Anthropic.estimate_image_tokens(1000, 750), 1000);
+        assert_eq!(Protocol::Completions.estimate_image_tokens(512, 512), 255);
+        assert!(Protocol::Responses.estimate_image_tokens(4096, 2048) > 255);
     }
 
     #[tokio::test]

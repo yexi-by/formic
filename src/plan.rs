@@ -276,6 +276,18 @@ mod tests {
     }
 
     #[test]
+    fn line_ranges_accept_only_utf8_text() {
+        let f = fixture("{\"unit\": 2, \"file\": \"image.png\", \"start\": 1, \"end\": 2}\n");
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        fs::write(f.root.join("image.png"), bytes.into_inner()).unwrap();
+        let error = load(&f.plan, &f.read_root).unwrap_err();
+        assert!(error.to_string().contains("无法读取 image.png"), "{error}");
+    }
+
+    #[test]
     fn duplicate_unit_rejected() {
         let f = fixture(
             "{\"unit\": 1, \"files\": [\"a.txt\"]}\n{\"unit\": 1, \"files\": [\"big.txt\"]}\n",
