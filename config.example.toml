@@ -1,87 +1,97 @@
-# 复制到自己的固定配置位置后填写，并用 --config 指定；也可放在当前工作目录命名为
-# config.toml。明文密钥不会进入 worker 运行档案；不要提交含真实密钥的配置文件。
-# 本示例显式写出 Formic 的高吞吐默认值。只有外部服务配额或实测资源边界要求时才降低它们。
+# 复制本文件并命名为 config.toml。不要把真实密钥提交到 Git。
+# URL 写到 API 版本这一层，例如 /v1。上下文大小请查模型说明。
+# 启动前还要设置 FORMIC_LLM_PROTOCOL：completions、responses 或 anthropic。
 url = "https://api.example.com/v1"
 api_key = ""
 model = "model-name"
 context_window_tokens = 131072
-# 仅当 FORMIC_LLM_PROTOCOL=anthropic 时取消下一行注释。Anthropic Messages
-# 要求 max_tokens；completions 和 responses 不允许配置或发送任何输出 token 参数。
+
+# 可选：把这段 JSON 加到每次模型请求，供不同模型使用专有参数。
+# 不要重复填写 Formic 自己生成的模型、消息、工具等字段。
+# extra_body_json = '''{"temperature":0.2,"reasoning":{"effort":"high"}}'''
+
+# 只有 FORMIC_LLM_PROTOCOL=anthropic 时才填写。其他协议不要填写。
 # anthropic_max_tokens = 16384
-# 连接、单次读取等待和整次请求的超时，单位均为毫秒。
+
+# 这三项分别限制连接、一次读取和整个请求的等待时间。单位是毫秒。
 connect_timeout_ms = 30000
 read_timeout_ms = 600000
 request_timeout_ms = 1800000
-# 网络/HTTP 瞬时失败的重试等待；空数组表示不重试。它不消耗 llm_attempts。
+
+# 网络临时失败时按顺序等待后重试。空数组表示不重试。
+# 服务商要求等待太久时，Formic 会停止发起新请求。
 retry_delays_ms = [1000, 2000, 5000]
-# 供应商 Retry-After 超过此值时停止接纳新请求，不进行超长等待。
 max_retry_after_ms = 60000
-# 可选的作业级请求频率限制；服务没有明确限制时保持注释。
+
+# 服务商明确限制每分钟请求数时再填写。
 # requests_per_minute = 600
 
 [execution]
-# 模型结构修正最多 5 次；网络重试只由 retry_delays_ms 控制。
+# 依次控制格式修正次数、同时处理的任务数、重复调用停止线和上下文预留空间。
 llm_attempts = 5
-# 同时活动的单元窗口。--concurrency 只在本次运行中显式覆盖它。
 max_concurrent_units = 64
-# 只阻止连续完全相同且没有进展的调用；普通工具调用总数不受此值限制。
 identical_tool_call_limit = 16
-# 在声明的模型上下文中预留 2048 tokens，超出预算前自动压缩旧工具往返。
 context_safety_tokens = 2048
 
 [tools]
-# 内置工具单次最多返回 1 MiB；UTF-8 文本超出后带明确截断标记。
+# 内置工具单次最多返回约 1 MB，最多同时运行 64 次。
 max_result_bytes = 1048576
-# 内置工具最多同时执行 64 次，窗口满时排队，不拒绝合法任务。
 max_in_flight = 64
 
 [tools.search]
+# 开启文本搜索，并限制匹配数量和随结果返回的上下文行数。
 enabled = true
 max_matches = 1000
 max_context_lines = 100
-# max_result_bytes 与 max_in_flight 可覆盖 [tools]。
 
 [tools.read]
+# 开启文件读取。结果大小和并发数默认沿用 [tools]。
 enabled = true
-# max_result_bytes 与 max_in_flight 可覆盖 [tools]。
 
 [cache]
+# 缓存相同的搜索和读取结果，最多使用约 1 GB 内存。
 enabled = true
-# 作业内 input 搜索和读取结果使用 1 GiB 内存 LRU；MCP 和 output 工具不进入缓存。
 max_bytes = 1073741824
 
-# Streamable HTTP MCP 示例。默认暴露 tools/list 发现的全部工具；需要主动筛选时才写 enabled_tools。
 [mcp_servers.http_example]
+# 这是 HTTP MCP 示例。改好地址后把 enabled 设为 true。
 enabled = false
 url = "https://example.com/mcp"
+
+# 认证信息和请求头可直接写，也可从环境变量读取。环境变量优先。
 bearer_token = ""
 bearer_token_env = "EXAMPLE_TOKEN"
 headers = { "x-client" = "formic" }
-# header_env 的键是 HTTP header，值是本机环境变量名；环境变量值覆盖 headers。
 header_env = { "x-tenant" = "EXAMPLE_TENANT" }
+
+# 默认开放服务端提供的全部工具。需要限制时再填写 enabled_tools。
+# job 表示整个作业共用会话；unit 表示每个任务单独使用会话。
+# enabled_tools = ["search"]
 tool_aliases = {}
 session_scope = "job"
+
+# 依次控制并发数、启动等待、调用等待、结果大小和断线重连。
 max_in_flight = 64
 startup_timeout_sec = 60
 tool_timeout_sec = 600
-# 慢速 HTTP initialize 会受 startup_timeout_sec 限制；重连还受当前 tool_timeout_sec 限制。
-# 调用返回后底层 TCP 不保证立即关闭，见 docs/usage.md。
 max_result_bytes = 1048576
-# 只重建后续调用使用的会话，不重放已经中断的调用。
 reconnect = true
 
 [mcp_servers.http_example.tool_limits.search]
-# 单工具只配置并发上限；解码前结果字节上限统一由 server 的 max_result_bytes 负责。
+# 这里只单独限制 search 的并发数。
 max_in_flight = 32
 
-# stdio MCP 示例。command 与 url 互斥；命令不会经过 shell 拼接。
 [mcp_servers.stdio_example]
+# 这是本机命令型 MCP 示例。command 与上面的 HTTP url 只能选一种。
 enabled = false
 command = "mcp-server"
 args = ["--stdio"]
+
+# env 直接填写环境变量；env_vars 从当前系统读取，且优先使用。
 env = { LOG_LEVEL = "warn" }
-# env_vars 的键是子进程环境变量，值是本机环境变量名；环境变量值覆盖 env。
 env_vars = { SERVICE_TOKEN = "EXAMPLE_TOKEN" }
+
+# 会话、并发、超时和结果大小与 HTTP MCP 的含义相同。
 tool_aliases = {}
 session_scope = "job"
 max_in_flight = 64

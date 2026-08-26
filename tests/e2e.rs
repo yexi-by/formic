@@ -52,6 +52,7 @@ const NETWORK_CONTEXT_NETWORK_MARKER: &str = "NETWORK-CONTEXT-NETWORK-UNIT";
 const SLOW_STREAM_MARKER: &str = "SLOW-STREAM-UNIT";
 const RESPONSE_SECRET: &str = "SENSITIVE-RESPONSE-MARKER";
 const LLM_API_KEY_SECRET: &str = "SENSITIVE-LLM-API-KEY";
+const LLM_EXTRA_BODY_SECRET: &str = "SENSITIVE-LLM-EXTRA-BODY";
 const MCP_BEARER_SECRET: &str = "SENSITIVE-MCP-BEARER";
 
 // ---- 罐装 SSE：文本最终帧（三协议）----
@@ -1600,11 +1601,18 @@ fn config_file_supplies_http_settings() {
     let config_directory = dir.path().join("settings");
     fs::create_dir(&config_directory).unwrap();
     let config_path = config_directory.join("formic.toml");
+    let extra_body = serde_json::json!({
+        "temperature": 0.25,
+        "reasoning": {"effort": "high"},
+        "vendor_flag": true,
+        "vendor_secret": LLM_EXTRA_BODY_SECRET,
+    })
+    .to_string();
     fs::write(
         &config_path,
         format!(
-            "url = \"http://127.0.0.1:{}/v1\"\napi_key = \"{}\"\nmodel = \"config-model\"\ncontext_window_tokens = 131072\n",
-            mock.port, LLM_API_KEY_SECRET
+            "url = \"http://127.0.0.1:{}/v1\"\napi_key = \"{}\"\nmodel = \"config-model\"\ncontext_window_tokens = 131072\nextra_body_json = '''{extra_body}'''\n",
+            mock.port, LLM_API_KEY_SECRET,
         ),
     )
     .unwrap();
@@ -1643,6 +1651,16 @@ fn config_file_supplies_http_settings() {
             .all(|request| request.body.contains("\"model\":\"config-model\"")),
         "请求应使用 config.toml 的 model"
     );
+    assert!(
+        requests.iter().all(|request| {
+            let body: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+            body["temperature"] == 0.25
+                && body["reasoning"]["effort"] == "high"
+                && body["vendor_flag"] == true
+                && body["vendor_secret"] == LLM_EXTRA_BODY_SECRET
+        }),
+        "每次模型请求都应带上 extra_body_json"
+    );
     let expected_authorization = format!("Bearer {LLM_API_KEY_SECRET}");
     assert!(
         requests.iter().all(
@@ -1657,10 +1675,9 @@ fn config_file_supplies_http_settings() {
         stderr_of(&output),
         read_output_tree(&out)
     );
-    assert!(
-        !public.contains(LLM_API_KEY_SECRET),
-        "LLM API key 不得进入任何作业产物"
-    );
+    for secret in [LLM_API_KEY_SECRET, LLM_EXTRA_BODY_SECRET] {
+        assert!(!public.contains(secret), "LLM 密钥不得进入任何作业产物");
+    }
 }
 
 #[test]

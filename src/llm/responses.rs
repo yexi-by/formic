@@ -80,6 +80,7 @@ pub fn build_request(
             })
             .collect();
     }
+    super::add_extra_body(&mut body, config);
     let headers = config
         .api_key
         .as_ref()
@@ -535,7 +536,7 @@ mod tests {
         assert_eq!(
             keys,
             std::collections::BTreeSet::from(["input", "instructions", "model", "stream"]),
-            "Responses 请求不得夹带生成控制字段"
+            "未配置 extra_body 时不得自行添加生成控制字段"
         );
     }
 

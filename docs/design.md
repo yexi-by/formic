@@ -34,7 +34,7 @@ formic run --data <dir> --plan <jsonl> --task <file> --out <dir>
            [--output-schema <schema.json>]
 ```
 
-`--config` 明确选择配置文件，指定文件不存在时直接失败；省略时读取当前目录的 `config.toml`，不搜索父目录，也不热加载，默认文件缺失时允许完全使用环境配置。LLM 的非空环境变量逐字段覆盖文件值。协议由 `FORMIC_LLM_PROTOCOL` 选择；上下文窗口必须由配置或环境变量明确给出。只有 Anthropic Messages 另需供应商专用的 `anthropic_max_tokens`，其他协议不接受输出 token 配置。`execution.max_concurrent_units` 是正式 worker 窗口，`--concurrency` 只覆盖本轮。
+`--config` 明确选择配置文件，指定文件不存在时直接失败；省略时读取当前目录的 `config.toml`，不搜索父目录，也不热加载，默认文件缺失时允许完全使用环境配置。LLM 的非空环境变量逐字段覆盖文件值。协议由 `FORMIC_LLM_PROTOCOL` 选择；上下文窗口必须由配置或环境变量明确给出。只有 Anthropic Messages 另需供应商专用的 `anthropic_max_tokens`。可选 `extra_body_json` 把供应商扩展字段加入每次请求，但不能覆盖 Formic 管理的协议结构。`execution.max_concurrent_units` 是正式 worker 窗口，`--concurrency` 只覆盖本轮。
 
 计划是一行一个 object 的 JSONL。单元可以指定文件集合，或一个文件的 1 起始闭区间行范围。启动边界会拒绝空分片、重复/零单元号、缺失文件、绝对路径和根目录逃逸。
 
@@ -109,10 +109,10 @@ MCP 结果接受 text 与 `structuredContent`。纯结构数据稳定序列化�
 
 工具目录、工具 schema、输出 schema、名称和顺序在作业内不变。系统 instructions 与任务说明位于共享前缀；提示只说明完整 input 根可由工具搜索，不重复列出全量文件。当前单元文件或行区间与后续历史只追加在末尾。当前不发送供应商专有 cache hint，避免将后端特性冒充公共契约。
 
-Completions 与 Responses 的请求只包含模型名、实际消息或 input、工具目录和 `stream`；
-不发送 temperature、top_p、任何 max token、reasoning、verbosity、seed、stop、penalty 或
-tool choice 等生成控制字段。Anthropic Messages 只额外发送其协议必填且显式配置的
-`max_tokens`。
+三种协议先生成模型、流式开关、消息和工具等必要结构，再合并 `extra_body_json`。配置边界
+要求扩展值是 JSON 对象，并拒绝与当前协议结构同名的字段；其他字段保持原 JSON 类型加入
+普通与压缩请求。Formic 不解释扩展字段，因此它们不改变本地输出 token 预留规则。
+Anthropic 的 `max_tokens` 仍由专用配置提供并计入预算。
 
 `scope=input` 的 `search`/`read` 在参数解析和默认值合并后生成规范键。第一个调用成为 owner，相同在途调用等待同一结果；完整成功结果进入作业内存 LRU，并按 `cache.max_bytes` 淘汰。输出根调用、MCP、错误和截断结果不会留在完成缓存。取消 owner 会唤醒等待者重新竞争，不留下永远 pending 的条目。
 

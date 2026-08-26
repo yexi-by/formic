@@ -85,6 +85,7 @@ pub fn build_request(
             })
             .collect();
     }
+    super::add_extra_body(&mut body, config);
     let mut headers = vec![(
         "anthropic-version".to_string(),
         ANTHROPIC_VERSION.to_string(),
@@ -722,7 +723,7 @@ mod tests {
                 "stream",
                 "system",
             ]),
-            "Anthropic 除协议必填的 max_tokens 外不得夹带生成控制字段"
+            "未配置 extra_body 时只发送协议必填的 max_tokens"
         );
     }
 

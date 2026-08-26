@@ -42,6 +42,7 @@ formic run \
 省略 `--config` 时读取当前目录的 `config.toml`；显式指定的文件不存在会直接报错。结构化输出额外传入
 `--output-schema <schema.json>`；需要继续同一输出区时增加 `--resume`。已发布结果不会覆盖，
 续跑只处理失败、停止和未开始的单元，并在请求前确认 plan、task、schema 与 input 未变。
+模型服务商的专有请求参数可通过配置中的 `extra_body_json` 透传。
 
 每个 worker 结束后都会生成：
 

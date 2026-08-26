@@ -125,6 +125,7 @@ struct FileConfig {
     context_window_tokens: Option<u64>,
     /// Anthropic Messages 协议要求的必填参数；其他协议不得配置。
     anthropic_max_tokens: Option<u64>,
+    extra_body_json: Option<String>,
     connect_timeout_ms: Option<u64>,
     read_timeout_ms: Option<u64>,
     request_timeout_ms: Option<u64>,
@@ -313,6 +314,7 @@ fn resolve(
     let env_value = |name: &str| get_env(name).filter(|value| !value.is_empty());
     let protocol_name = env_value("FORMIC_LLM_PROTOCOL").ok_or(ConfigError::MissingProtocol)?;
     let protocol = Protocol::parse(&protocol_name).map_err(ConfigError::InvalidProtocol)?;
+    let extra_body = parse_extra_body_json(file.extra_body_json.as_deref(), protocol)?;
     let context_window_tokens = parse_env_u64(
         env_value("FORMIC_LLM_CONTEXT_WINDOW_TOKENS"),
         "FORMIC_LLM_CONTEXT_WINDOW_TOKENS",
@@ -452,6 +454,7 @@ fn resolve(
             api_key: env_value("FORMIC_LLM_API_KEY").or_else(|| non_empty(file.api_key)),
             context_window_tokens,
             anthropic_max_tokens,
+            extra_body,
             connect_timeout: Duration::from_millis(positive_or(
                 file.connect_timeout_ms,
                 DEFAULT_CONNECT_TIMEOUT_MS,
@@ -483,6 +486,35 @@ fn resolve(
         cache,
         mcp_servers,
     })
+}
+
+fn parse_extra_body_json(
+    raw: Option<&str>,
+    protocol: Protocol,
+) -> Result<serde_json::Map<String, serde_json::Value>, ConfigError> {
+    let Some(raw) = raw else {
+        return Ok(serde_json::Map::new());
+    };
+    let value: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|error| ConfigError::Invalid(format!("extra_body_json 不是有效 JSON：{error}")))?;
+    let serde_json::Value::Object(object) = value else {
+        return Err(ConfigError::Invalid(
+            "extra_body_json 必须是用 { } 包住的 JSON 对象".into(),
+        ));
+    };
+    let conflicts: Vec<_> = protocol
+        .managed_request_fields()
+        .iter()
+        .copied()
+        .filter(|field| object.contains_key(*field))
+        .collect();
+    if !conflicts.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "extra_body_json 不能修改 Formic 管理的字段：{}",
+            conflicts.join(", ")
+        )));
+    }
+    Ok(object)
 }
 
 fn resolve_mcp_server(
@@ -772,6 +804,7 @@ context_window_tokens = 131072
         assert_eq!(config.llm.model, "file-model");
         assert_eq!(config.llm.context_window_tokens, 131072);
         assert_eq!(config.llm.anthropic_max_tokens, None);
+        assert!(config.llm.extra_body.is_empty());
         assert_eq!(config.llm.connect_timeout, Duration::from_millis(30_000));
         assert_eq!(config.llm.read_timeout, Duration::from_millis(600_000));
         assert_eq!(config.llm.request_timeout, Duration::from_millis(1_800_000));
@@ -795,6 +828,40 @@ context_window_tokens = 131072
         assert_eq!(config.tools.read.max_result_bytes, 1024 * 1024);
         assert_eq!(config.tools.read.max_in_flight, 64);
         assert_eq!(config.cache.max_bytes, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn extra_body_json_accepts_nested_json_and_rejects_request_fields() {
+        let extra = r#"{"temperature":0.2,"reasoning":{"effort":"high"},"nullable":null}"#;
+        let file = format!("{BASE_FILE}\nextra_body_json = '''{extra}'''\n");
+        let config = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]).unwrap();
+        assert_eq!(config.llm.extra_body["temperature"], 0.2);
+        assert_eq!(config.llm.extra_body["reasoning"]["effort"], "high");
+        assert!(config.llm.extra_body["nullable"].is_null());
+
+        for (protocol, field) in [
+            ("completions", "messages"),
+            ("responses", "input"),
+            ("anthropic", "max_tokens"),
+        ] {
+            let extra = format!(r#"{{"{field}":[]}}"#);
+            let file = format!("{BASE_FILE}\nextra_body_json = '''{extra}'''\n");
+            let error = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", protocol)])
+                .err()
+                .expect("协议请求字段必须由 Formic 管理");
+            assert!(error.to_string().contains(field), "{error}");
+        }
+    }
+
+    #[test]
+    fn extra_body_json_must_be_a_json_object() {
+        for extra in ["[1,2]", "{broken"] {
+            let file = format!("{BASE_FILE}\nextra_body_json = '''{extra}'''\n");
+            assert!(matches!(
+                load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]),
+                Err(ConfigError::Invalid(_))
+            ));
+        }
     }
 
     #[test]

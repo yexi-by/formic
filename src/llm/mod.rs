@@ -36,6 +36,22 @@ impl Protocol {
             )),
         }
     }
+
+    /// 请求结构由 Formic 填写，扩展 JSON 不得覆盖这些字段。
+    pub(crate) fn managed_request_fields(self) -> &'static [&'static str] {
+        match self {
+            Self::Completions => &["model", "stream", "messages", "tools"],
+            Self::Responses => &["model", "stream", "instructions", "input", "tools"],
+            Self::Anthropic => &[
+                "model",
+                "max_tokens",
+                "stream",
+                "system",
+                "messages",
+                "tools",
+            ],
+        }
+    }
 }
 
 /// 一条完整组装的工具调用请求。arguments 是模型给出的原始 JSON 文本；
@@ -357,9 +373,10 @@ pub struct LlmConfig {
     pub api_key: Option<String>,
     /// 模型声明的完整上下文窗口，用于调用前预算。
     pub context_window_tokens: u64,
-    /// Anthropic Messages 协议要求的 max_tokens。其他协议必须为 None，也不会发送
-    /// 任何生成控制参数。
+    /// Anthropic Messages 协议要求的 max_tokens；其他协议必须为 None。
     pub anthropic_max_tokens: Option<u64>,
+    /// 加入每次模型请求根对象的供应商扩展字段。
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
     pub connect_timeout: Duration,
     pub read_timeout: Duration,
     pub request_timeout: Duration,
@@ -378,6 +395,7 @@ impl LlmConfig {
             api_key: None,
             context_window_tokens: 100_000,
             anthropic_max_tokens: None,
+            extra_body: serde_json::Map::new(),
             connect_timeout: Duration::from_secs(1),
             read_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(5),
@@ -385,6 +403,18 @@ impl LlmConfig {
             max_retry_after: Duration::from_secs(1),
             requests_per_minute: None,
         }
+    }
+}
+
+/// 配置边界已排除协议字段冲突，这里只完成请求组装。
+pub(crate) fn add_extra_body(body: &mut serde_json::Value, config: &LlmConfig) {
+    let object = body.as_object_mut().expect("模型请求根值必须是 JSON 对象");
+    for (key, value) in &config.extra_body {
+        assert!(
+            !object.contains_key(key),
+            "扩展请求字段必须在配置边界排除冲突"
+        );
+        object.insert(key.clone(), value.clone());
     }
 }
 
@@ -1358,6 +1388,60 @@ mod tests {
             ..common
         };
         assert_eq!(LlmClient::new(anthropic).input_budget(2_000), 90_000);
+    }
+
+    #[test]
+    fn extra_body_is_added_to_every_protocol_request() {
+        for protocol in [
+            Protocol::Completions,
+            Protocol::Responses,
+            Protocol::Anthropic,
+        ] {
+            let mut config = LlmConfig::test_defaults();
+            config.protocol = protocol;
+            config.anthropic_max_tokens = (protocol == Protocol::Anthropic).then_some(16_384);
+            config.extra_body = serde_json::from_value(serde_json::json!({
+                "temperature": 0.2,
+                "reasoning": {"effort": "high"},
+                "nullable": null,
+            }))
+            .unwrap();
+            let client = LlmClient::new(config);
+            let (_, body, _) = client.build_request("说明", &[], &[]);
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(body["temperature"], 0.2, "{protocol:?}");
+            assert_eq!(body["reasoning"]["effort"], "high", "{protocol:?}");
+            assert!(body["nullable"].is_null(), "{protocol:?}");
+        }
+    }
+
+    #[test]
+    fn managed_field_lists_match_protocol_requests() {
+        let tools = [ToolSpec {
+            name: "search".into(),
+            description: "搜索".into(),
+            parameters: serde_json::json!({"type": "object"}),
+        }];
+        for protocol in [
+            Protocol::Completions,
+            Protocol::Responses,
+            Protocol::Anthropic,
+        ] {
+            let mut config = LlmConfig::test_defaults();
+            config.protocol = protocol;
+            config.anthropic_max_tokens = (protocol == Protocol::Anthropic).then_some(16_384);
+            let client = LlmClient::new(config);
+            let (_, body, _) = client.build_request("说明", &[], &tools);
+            let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let actual: std::collections::BTreeSet<_> = body
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let managed = protocol.managed_request_fields().iter().copied().collect();
+            assert_eq!(actual, managed, "{protocol:?}");
+        }
     }
 
     #[tokio::test]

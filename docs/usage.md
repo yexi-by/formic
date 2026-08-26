@@ -48,8 +48,9 @@ Formic 会保留已发布结果，只处理 failed、stopped 和 not_started 单
 
 Formic 在进程启动时读取 `--config` 指定的文件；省略参数时读取当前目录的 `config.toml`，
 不搜索父目录，也不热加载。显式指定的文件不存在时直接报错；只有省略 `--config` 时，默认
-文件缺失才允许完全由环境变量提供 LLM 配置。配置可保存明文 API key，仓库已通过 `.gitignore` 排除默认文件；
-不要把真实密钥提交到版本库，也不必为了运行作业把含 key 的配置复制到临时目录。
+文件缺失才允许完全由环境变量提供 LLM 配置。配置可保存明文 API key，扩展 JSON 也可能
+含敏感参数；它们会用于实际请求，但不会进入 worker 档案。仓库已通过 `.gitignore` 排除
+默认文件，不要把真实密钥提交到版本库，也不必把含密钥的配置复制到临时目录。
 
 LLM 的最小配置：
 
@@ -65,9 +66,18 @@ context_window_tokens = 131072
 Anthropic Messages 还必须单独配置 `anthropic_max_tokens`；该字段只用于 Anthropic，
 其他协议出现它会直接报错。
 
-Completions 与 Responses 请求不发送 temperature、top_p、任何输出 token 上限、reasoning、
-verbosity、seed、stop、penalty、tool_choice 等生成控制字段。Anthropic 除协议必填的
-`max_tokens` 外也不发送这些字段。
+供应商要求专有参数时，可在 `extra_body_json` 中填写一个 JSON 对象。对象中的字段会加入
+每次模型请求，包括上下文压缩请求；嵌套对象、数组、布尔值和 `null` 都会保留。
+
+```toml
+extra_body_json = '''{"temperature":0.2,"reasoning":{"effort":"high"}}'''
+```
+
+Formic 仍负责协议结构，扩展 JSON 不能覆盖这些字段：Completions 的 `model`、`stream`、
+`messages`、`tools`；Responses 的 `model`、`stream`、`instructions`、`input`、`tools`；
+Anthropic 的 `model`、`max_tokens`、`stream`、`system`、`messages`、`tools`。冲突、无效 JSON
+或非对象会在发起请求前报错。其他字段只负责透传，不解释供应商含义；若额外参数会增加
+最大输出长度，应相应增大 `execution.context_safety_tokens`。
 
 下列非空环境变量按字段覆盖 `config.toml`：
 
@@ -81,9 +91,9 @@ verbosity、seed、stop、penalty、tool_choice 等生成控制字段。Anthropi
 | `FORMIC_ANTHROPIC_MAX_TOKENS` | 仅 Anthropic Messages；覆盖其必填 `max_tokens` |
 | `FORMIC_METRICS=1` | 每 250 ms 向 stderr 输出进程级观测值 |
 
-配置采用严格字段校验：未知字段、`0`、互斥传输字段或缺失的必填项都会在读取作业前
-报错。`retry_delays_ms` 是唯一允许为空的数值数组，`[]` 表示禁用网络重试。完整字段和
-注释见配置示例。
+配置采用严格字段校验：除 `extra_body_json` 对象内部的供应商字段外，未知字段、`0`、互斥
+传输字段或缺失的必填项都会在读取作业前报错。`retry_delays_ms` 是唯一允许为空的数值数组，
+`[]` 表示禁用网络重试。完整字段和注释见配置示例。
 
 未填写资源字段时，正式默认值面向大规模作业：内置工具和每个 MCP server 最多同时执行
 64 次，单次工具结果为 1 MiB，搜索最多返回 1000 个匹配及 100 行上下文，作业内存缓存为
