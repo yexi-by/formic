@@ -1161,9 +1161,7 @@ impl McpTool {
             }
             Err(AwaitCallError::Timeout) => {
                 cancellation_guard.retire("工具调用超时");
-                Err(McpCallError::Timeout {
-                    server: self.server.name.clone(),
-                })
+                Ok(timed_out_call_output(&self.server.name, max_result_bytes))
             }
             Ok(Err(error @ ServiceError::McpError(_))) => {
                 let reason = error.to_string();
@@ -1419,6 +1417,15 @@ fn interrupted_transport_output(server: &str, max_result_bytes: usize) -> ToolOu
     external_error(
         format!(
             "MCP server {server} 的会话已中断；原工具调用的结局未知，Formic 未自动重放。请改用其他工具，不要重复可能产生副作用的调用"
+        ),
+        max_result_bytes,
+    )
+}
+
+fn timed_out_call_output(server: &str, max_result_bytes: usize) -> ToolOutput {
+    external_error(
+        format!(
+            "MCP server {server} 的工具调用已超时；原工具调用的结局未知，Formic 未自动重放。请改用其他工具，不要重复可能产生副作用的调用"
         ),
         max_result_bytes,
     )
@@ -2522,10 +2529,11 @@ mod tests {
             .unwrap()
             .tool;
 
-        assert!(matches!(
-            tool.call(1, serde_json::json!({}), 1024).await,
-            Err(McpCallError::Timeout { .. })
-        ));
+        let first = tool.call(1, serde_json::json!({}), 1024).await.unwrap();
+        assert!(first.content.contains("工具调用已超时"), "{first:?}");
+        assert!(first.content.contains("结局未知"), "{first:?}");
+        assert!(first.content.contains("未自动重放"), "{first:?}");
+        assert!(!first.cacheable);
         wait_for_mock_cancellation(&state).await;
         manager.shutdown().await;
 
@@ -2611,10 +2619,11 @@ mod tests {
             .tool;
 
         let started = std::time::Instant::now();
-        assert!(matches!(
-            tool.call(1, serde_json::json!({}), 1024).await,
-            Err(McpCallError::Timeout { .. })
-        ));
+        let first = tool.call(1, serde_json::json!({}), 1024).await.unwrap();
+        assert!(first.content.contains("工具调用已超时"), "{first:?}");
+        assert!(first.content.contains("结局未知"), "{first:?}");
+        assert!(first.content.contains("未自动重放"), "{first:?}");
+        assert!(!first.cacheable);
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
             "tool_timeout 到达后不应等待远端取消响应，实际耗时 {:?}",

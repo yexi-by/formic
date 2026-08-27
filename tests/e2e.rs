@@ -30,6 +30,7 @@ const FAIL_TWICE_MARKER: &str = "FAIL-TWICE-UNIT";
 const MCP_MARKER: &str = "MCP-UNIT";
 const MCP_ERROR_MARKER: &str = "MCP-ERROR-UNIT";
 const MCP_PARALLEL_MARKER: &str = "MCP-PARALLEL-UNIT";
+const MCP_FALLBACK_FLOW_MARKER: &str = "MCP-FALLBACK-FLOW-UNIT";
 const IMAGE_TOOL_MARKER: &str = "IMAGE-TOOL-UNIT";
 
 /// 请求体含此标记时，mock 直接提交符合 schema 的结构化结果。
@@ -115,6 +116,21 @@ const COMPLETIONS_PARALLEL_MCP_TOOLCALL: &str = concat!(
     "{\"index\":0,\"id\":\"call_left\",\"type\":\"function\",\"function\":{\"name\":\"left__slow\",\"arguments\":\"{}\"}},",
     "{\"index\":1,\"id\":\"call_right\",\"type\":\"function\",\"function\":{\"name\":\"right__slow\",\"arguments\":\"{}\"}}",
     "]},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+const COMPLETIONS_TIMEOUT_AND_FAST_MCP_TOOLCALL: &str = concat!(
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[",
+    "{\"index\":0,\"id\":\"call_slow\",\"type\":\"function\",\"function\":{\"name\":\"slow__slow\",\"arguments\":\"{}\"}},",
+    "{\"index\":1,\"id\":\"call_fast\",\"type\":\"function\",\"function\":{\"name\":\"fast__echo\",\"arguments\":\"{\\\"text\\\":\\\"primary\\\"}\"}}",
+    "]},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+const COMPLETIONS_BACKUP_MCP_TOOLCALL: &str = concat!(
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_backup\",\"type\":\"function\",\"function\":{\"name\":\"backup__echo\",\"arguments\":\"{\\\"text\\\":\\\"fallback\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
     "data: [DONE]\n\n",
 );
@@ -816,6 +832,19 @@ fn handle_conn(
             Some(sse) => ("200 OK", sse.to_string()),
             None => ("404 Not Found", "unknown path".to_string()),
         }
+    } else if body_text.contains(MCP_FALLBACK_FLOW_MARKER) {
+        if !path.ends_with("/chat/completions") {
+            ("404 Not Found", "unknown path".to_string())
+        } else if body_text.contains("\"tool_call_id\":\"call_backup\"") {
+            ("200 OK", COMPLETIONS_FINAL.to_string())
+        } else if body_text.contains("\"tool_call_id\":\"call_slow\"") {
+            ("200 OK", COMPLETIONS_BACKUP_MCP_TOOLCALL.to_string())
+        } else {
+            (
+                "200 OK",
+                COMPLETIONS_TIMEOUT_AND_FAST_MCP_TOOLCALL.to_string(),
+            )
+        }
     } else if body_text.contains(MCP_ERROR_MARKER) {
         let is_second_turn = body_text.contains(tool_result_marker(&path));
         if path.ends_with("/chat/completions") && !is_second_turn {
@@ -837,7 +866,15 @@ fn handle_conn(
             }
         }
     } else if body_text.contains(MCP_TIMEOUT_MARKER) {
-        ("200 OK", COMPLETIONS_SLOW_MCP_TOOLCALL.to_string())
+        let is_second_turn = body_text.contains(tool_result_marker(&path));
+        if path.ends_with("/chat/completions") && !is_second_turn {
+            ("200 OK", COMPLETIONS_SLOW_MCP_TOOLCALL.to_string())
+        } else {
+            match sse_for(&path, false) {
+                Some(sse) => ("200 OK", sse.to_string()),
+                None => ("404 Not Found", "unknown path".to_string()),
+            }
+        }
     } else if body_text.contains(MCP_MARKER) {
         let is_second_turn = body_text.contains(tool_result_marker(&path));
         if path.ends_with("/chat/completions") && !is_second_turn {
@@ -2834,6 +2871,151 @@ fn one_worker_runs_same_turn_mcp_calls_concurrently() {
 }
 
 #[test]
+fn parallel_mcp_timeout_keeps_call_order_then_uses_backup_and_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_job(dir.path(), None);
+    fs::write(&plan, "{\"unit\":1,\"files\":[\"a.txt\"]}\n").unwrap();
+    fs::write(
+        &task,
+        format!("并发调用两个外部工具，主工具超时时改用备用工具。{MCP_FALLBACK_FLOW_MARKER}\n"),
+    )
+    .unwrap();
+    let llm = start_mock();
+    let fake_mcp = compile_fake_mcp(dir.path());
+    let slow_log = dir.path().join("fallback-slow-call.log");
+    let fast_log = dir.path().join("fallback-fast-call.log");
+    let backup_log = dir.path().join("fallback-backup-call.log");
+    fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            concat!(
+                "url = \"http://127.0.0.1:{}/v1\"\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
+                "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
+                "[mcp_servers.slow]\nenabled = true\ncommand = {}\n",
+                "env = {{ FAKE_MCP_CALL_LOG = {} }}\n",
+                "enabled_tools = [\"slow\"]\nsession_scope = \"job\"\n",
+                "max_in_flight = 1\ntool_timeout_sec = 3\nreconnect = true\n",
+                "[mcp_servers.fast]\nenabled = true\ncommand = {}\n",
+                "env = {{ FAKE_MCP_CALL_LOG = {} }}\n",
+                "enabled_tools = [\"echo\"]\nsession_scope = \"job\"\n",
+                "max_in_flight = 1\ntool_timeout_sec = 10\n",
+                "[mcp_servers.backup]\nenabled = true\ncommand = {}\n",
+                "env = {{ FAKE_MCP_CALL_LOG = {} }}\n",
+                "enabled_tools = [\"echo\"]\nsession_scope = \"job\"\n",
+                "max_in_flight = 1\ntool_timeout_sec = 10\n",
+            ),
+            llm.port,
+            toml_string(&fake_mcp),
+            toml_string(&slow_log),
+            toml_string(&fake_mcp),
+            toml_string(&fast_log),
+            toml_string(&fake_mcp),
+            toml_string(&backup_log),
+        ),
+    )
+    .unwrap();
+
+    let mut command = formic_command(1, &data, &plan, &task, &out);
+    let output = command
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env_remove("FORMIC_LLM_BASE_URL")
+        .env_remove("FORMIC_LLM_MODEL")
+        .env_remove("FORMIC_LLM_API_KEY")
+        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let call_started_ms = |path: &Path| {
+        fs::read_to_string(path)
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u128>()
+            .unwrap()
+    };
+    let slow_started = call_started_ms(&slow_log);
+    let fast_started = call_started_ms(&fast_log);
+    assert!(
+        slow_started.abs_diff(fast_started) < 2_000,
+        "slow 与 fast 必须在 slow 的 3 秒超时前并发启动：slow={slow_started}, fast={fast_started}"
+    );
+    assert_eq!(
+        fs::read_to_string(&slow_log).unwrap().lines().count(),
+        1,
+        "已发送后超时的主调用不得自动重放"
+    );
+    assert_eq!(fs::read_to_string(&fast_log).unwrap().lines().count(), 1);
+    assert_eq!(
+        fs::read_to_string(&backup_log).unwrap().lines().count(),
+        1,
+        "模型应只调用一次备用工具"
+    );
+
+    let requests = llm.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        3,
+        "应恰好经历主调用、备用调用和最终发布三轮"
+    );
+    let second: serde_json::Value = serde_json::from_str(&requests[1].body).unwrap();
+    let second_tool_results: Vec<_> = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert_eq!(second_tool_results.len(), 2);
+    assert_eq!(second_tool_results[0]["tool_call_id"], "call_slow");
+    assert!(
+        second_tool_results[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("工具调用已超时")
+    );
+    assert_eq!(second_tool_results[1]["tool_call_id"], "call_fast");
+    assert!(
+        second_tool_results[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("echo:hello")
+    );
+
+    let third: serde_json::Value = serde_json::from_str(&requests[2].body).unwrap();
+    let third_tool_results: Vec<_> = third["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .collect();
+    assert_eq!(third_tool_results.len(), 3);
+    assert_eq!(third_tool_results[2]["tool_call_id"], "call_backup");
+    assert!(
+        third_tool_results[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("echo:hello")
+    );
+    drop(requests);
+
+    assert_eq!(
+        fs::read_to_string(results_dir(&out).join("1.md")).unwrap(),
+        FINAL_TEXT
+    );
+    let report = worker_report(&out, 1);
+    assert!(report.contains("mcp:slow/slow"), "{report}");
+    assert!(report.contains("工具调用已超时"), "{report}");
+    assert!(report.contains("mcp:fast/echo"), "{report}");
+    assert!(report.contains("mcp:backup/echo"), "{report}");
+    let summary = latest_run_summary(&out);
+    assert_eq!(summary["published"], 1);
+    assert_eq!(summary["failed"], 0);
+}
+
+#[test]
 fn stdio_mcp_unit_scope_creates_and_reclaims_one_session_per_unit() {
     let dir = tempfile::tempdir().unwrap();
     let (data, plan, task, out) = write_job(dir.path(), None);
@@ -2880,7 +3062,7 @@ fn stdio_mcp_unit_scope_creates_and_reclaims_one_session_per_unit() {
 }
 
 #[test]
-fn timed_out_mcp_call_is_not_replayed() {
+fn timed_out_mcp_call_is_returned_to_model_without_replay() {
     let dir = tempfile::tempdir().unwrap();
     let (data, plan, task, out) = write_job(dir.path(), None);
     fs::write(&plan, "{\"unit\":1,\"files\":[\"a.txt\"]}\n").unwrap();
@@ -2939,14 +3121,28 @@ fn timed_out_mcp_call_is_not_replayed() {
         "tools/call 发出后，1 秒工具超时不应再等待旧 stdio 调用；实际耗时 {:?}",
         call_started.elapsed()
     );
-    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
-    assert!(worker_report(&out, 1).contains("调用超时"));
-    assert!(!results_dir(&out).join("1.md").exists());
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    assert_eq!(
+        fs::read_to_string(results_dir(&out).join("1.md")).unwrap(),
+        FINAL_TEXT
+    );
+    let report = worker_report(&out, 1);
+    assert!(report.contains("工具调用已超时"), "{report}");
+    assert!(report.contains("原工具调用的结局未知"), "{report}");
+    assert!(report.contains("未自动重放"), "{report}");
     assert_eq!(
         fs::read_to_string(call_log).unwrap().lines().count(),
         1,
         "超时的原调用不得自动重放；reconnect 只影响后续新调用"
     );
+    let requests = llm.requests.lock().unwrap();
+    let tool_result = requests
+        .iter()
+        .find(|request| request.body.contains("\"role\":\"tool\""))
+        .expect("超时工具结果必须回注模型");
+    assert!(tool_result.body.contains("工具调用已超时"));
+    assert!(tool_result.body.contains("原工具调用的结局未知"));
+    assert!(tool_result.body.contains("未自动重放"));
 }
 
 #[test]
