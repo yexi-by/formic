@@ -73,11 +73,13 @@ header_env = { "x-tenant" = "EXAMPLE_TENANT" }
 tool_aliases = {}
 session_scope = "job"
 
-# 依次控制并发数、启动等待、调用等待、结果大小和断线重连。
+# 原始传输消息允许 8 MB；送入模型的最终结果最多 1 MB。
+# 其余字段依次控制并发数、启动等待、调用等待和断线重连。
 max_in_flight = 64
 startup_timeout_sec = 60
 tool_timeout_sec = 600
 max_result_bytes = 1048576
+max_message_bytes = 8388608
 reconnect = true
 
 [mcp_servers.http_example.tool_limits.search]
@@ -94,11 +96,12 @@ args = ["--stdio"]
 env = { LOG_LEVEL = "warn" }
 env_vars = { SERVICE_TOKEN = "EXAMPLE_TOKEN" }
 
-# 会话、并发、超时和结果大小与 HTTP MCP 的含义相同。
+# 会话、并发、超时、原始消息和最终结果大小与 HTTP MCP 的含义相同。
 tool_aliases = {}
 session_scope = "job"
 max_in_flight = 64
 startup_timeout_sec = 60
 tool_timeout_sec = 600
 max_result_bytes = 1048576
+max_message_bytes = 8388608
 reconnect = true

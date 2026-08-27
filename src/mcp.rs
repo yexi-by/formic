@@ -1,5 +1,5 @@
 //! 通用 MCP 客户端：启动时发现并冻结允许的工具目录，运行时按 job/unit 管理会话。
-//! 传输失败和超时从工具结果中分离；原调用从不自动重放。
+//! 原调用从不自动重放；明确工具错误和传输关闭会作为不可缓存结果返回模型。
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
@@ -1128,6 +1128,12 @@ impl McpTool {
             Ok(Err(error)) => {
                 let reason = error.to_string();
                 cancellation_guard.retire(&reason);
+                if matches!(error, ServiceError::TransportClosed) {
+                    return Ok(interrupted_transport_output(
+                        &self.server.name,
+                        max_result_bytes,
+                    ));
+                }
                 return Err(McpCallError::Session {
                     server: self.server.name.clone(),
                     reason,
@@ -1168,6 +1174,14 @@ impl McpTool {
                     cacheable: false,
                 })
             }
+            Ok(Err(error @ ServiceError::TransportClosed)) => {
+                let reason = error.to_string();
+                cancellation_guard.retire(&reason);
+                Ok(interrupted_transport_output(
+                    &self.server.name,
+                    max_result_bytes,
+                ))
+            }
             Ok(Err(error)) => {
                 let reason = error.to_string();
                 if service_error_is_terminal(&error) {
@@ -1183,10 +1197,10 @@ impl McpTool {
             Err(AwaitCallError::Closed) => {
                 let reason = ServiceError::TransportClosed.to_string();
                 cancellation_guard.retire(&reason);
-                Err(McpCallError::Session {
-                    server: self.server.name.clone(),
-                    reason,
-                })
+                Ok(interrupted_transport_output(
+                    &self.server.name,
+                    max_result_bytes,
+                ))
             }
         }
     }
@@ -1390,13 +1404,24 @@ async fn close_slot(slot: &Arc<SessionSlot>) {
 }
 
 fn mcp_transport_message_limit(config: &McpServerConfig) -> usize {
-    mcp_result_message_limit(config.max_result_bytes)
+    config
+        .max_message_bytes
+        .unwrap_or_else(|| mcp_result_message_limit(config.max_result_bytes))
 }
 
 fn mcp_result_message_limit(max_result_bytes: usize) -> usize {
     max_result_bytes
         .saturating_mul(MCP_JSON_ESCAPE_EXPANSION)
         .saturating_add(MCP_PROTOCOL_OVERHEAD_BYTES)
+}
+
+fn interrupted_transport_output(server: &str, max_result_bytes: usize) -> ToolOutput {
+    external_error(
+        format!(
+            "MCP server {server} 的会话已中断；原工具调用的结局未知，Formic 未自动重放。请改用其他工具，不要重复可能产生副作用的调用"
+        ),
+        max_result_bytes,
+    )
 }
 
 fn stdio_system_environment(
@@ -2161,6 +2186,7 @@ mod tests {
             startup_timeout: std::time::Duration::from_secs(2),
             tool_timeout,
             max_result_bytes: 1024,
+            max_message_bytes: None,
             reconnect: true,
             tool_limits: BTreeMap::new(),
             transport: McpTransportConfig::Http {
@@ -2442,6 +2468,7 @@ mod tests {
             startup_timeout: std::time::Duration::from_secs(2),
             tool_timeout: std::time::Duration::from_millis(100),
             max_result_bytes: 1024,
+            max_message_bytes: None,
             reconnect: true,
             tool_limits: BTreeMap::new(),
             transport: McpTransportConfig::Http {
@@ -2563,6 +2590,7 @@ mod tests {
             startup_timeout: std::time::Duration::from_secs(2),
             tool_timeout: std::time::Duration::from_millis(100),
             max_result_bytes: 1024,
+            max_message_bytes: None,
             reconnect: true,
             tool_limits: BTreeMap::new(),
             transport: McpTransportConfig::Http {
@@ -2621,6 +2649,7 @@ mod tests {
             startup_timeout: std::time::Duration::from_secs(2),
             tool_timeout: std::time::Duration::from_secs(5),
             max_result_bytes: 1024,
+            max_message_bytes: None,
             reconnect: true,
             tool_limits: BTreeMap::new(),
             transport: McpTransportConfig::Http {

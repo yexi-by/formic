@@ -10,6 +10,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 fn main() {
     append_log("FAKE_MCP_START_LOG", "start\n");
     eprintln!("fake MCP stdio ready");
+    let exit_after_calls = env::var("FAKE_MCP_EXIT_AFTER_CALLS").ok().map(|value| {
+        value
+            .parse::<usize>()
+            .expect("FAKE_MCP_EXIT_AFTER_CALLS 必须是正整数")
+    });
+    let result_text_bytes = env::var("FAKE_MCP_RESULT_TEXT_BYTES").ok().map(|value| {
+        value
+            .parse::<usize>()
+            .expect("FAKE_MCP_RESULT_TEXT_BYTES 必须是正整数")
+    });
+    let mut tool_calls = 0usize;
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -18,8 +29,8 @@ fn main() {
             continue;
         };
         let result = if line.contains("\"method\":\"initialize\"") {
-            let version = string_field(&line, "protocolVersion")
-                .unwrap_or_else(|| "2025-06-18".to_string());
+            let version =
+                string_field(&line, "protocolVersion").unwrap_or_else(|| "2025-06-18".to_string());
             format!(
                 "{{\"protocolVersion\":\"{version}\",\"capabilities\":{{\"tools\":{{\"listChanged\":true}}}},\"serverInfo\":{{\"name\":\"formic-test-mcp\",\"version\":\"1\"}}}}"
             )
@@ -30,11 +41,18 @@ fn main() {
                 "{\"tools\":[{\"name\":\"echo\",\"description\":\"返回固定文本和结构数据\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"additionalProperties\":false}}],\"nextCursor\":\"page-2\"}".to_string()
             }
         } else if line.contains("\"method\":\"tools/call\"") {
+            tool_calls += 1;
             let started_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
             append_log("FAKE_MCP_CALL_LOG", &format!("call {started_ms}\n"));
+            if let Some(exit_after_calls) = exit_after_calls {
+                if tool_calls >= exit_after_calls {
+                    return;
+                }
+                continue;
+            }
             if line.contains("\"name\":\"fail\"") {
                 writeln!(
                     stdout,
@@ -46,15 +64,24 @@ fn main() {
             }
             if line.contains("\"name\":\"slow\"") {
                 thread::sleep(Duration::from_secs(5));
-                "{\"content\":[{\"type\":\"text\",\"text\":\"late\"}],\"isError\":false}".to_string()
+                "{\"content\":[{\"type\":\"text\",\"text\":\"late\"}],\"isError\":false}"
+                    .to_string()
+            } else if let Some(result_text_bytes) = result_text_bytes {
+                format!(
+                    "{{\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}],\"isError\":false}}",
+                    "x".repeat(result_text_bytes)
+                )
             } else {
                 "{\"content\":[{\"type\":\"text\",\"text\":\"echo:hello\"}],\"structuredContent\":{\"value\":\"hello\"},\"isError\":false}".to_string()
             }
         } else {
             "{}".to_string()
         };
-        writeln!(stdout, "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}")
-            .unwrap();
+        writeln!(
+            stdout,
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{result}}}"
+        )
+        .unwrap();
         stdout.flush().unwrap();
     }
 }

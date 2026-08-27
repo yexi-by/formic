@@ -2517,6 +2517,192 @@ fn custom_stdio_mcp_auto_discovers_all_tools_and_is_audited() {
 }
 
 #[test]
+fn job_scoped_stdio_transport_close_is_returned_to_all_waiters_without_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_job(dir.path(), None);
+    fs::write(
+        &task,
+        format!("共享 MCP 会话中断后仍须继续当前单元。{MCP_MARKER}\n"),
+    )
+    .unwrap();
+    let llm = start_mock();
+    let fake_mcp = compile_fake_mcp(dir.path());
+    let start_log = dir.path().join("closed-session-start.log");
+    let call_log = dir.path().join("closed-session-call.log");
+    fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            concat!(
+                "url = \"http://127.0.0.1:{}/v1\"\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
+                "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
+                "[mcp_servers.demo]\nenabled = true\ncommand = {}\n",
+                "env = {{ FAKE_MCP_START_LOG = {}, FAKE_MCP_CALL_LOG = {}, FAKE_MCP_EXIT_AFTER_CALLS = \"2\" }}\n",
+                "enabled_tools = [\"echo\"]\nsession_scope = \"job\"\n",
+                "max_in_flight = 2\ntool_timeout_sec = 10\nreconnect = true\n",
+            ),
+            llm.port,
+            toml_string(&fake_mcp),
+            toml_string(&start_log),
+            toml_string(&call_log),
+        ),
+    )
+    .unwrap();
+
+    let mut command = formic_command(2, &data, &plan, &task, &out);
+    let output = command
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env_remove("FORMIC_LLM_BASE_URL")
+        .env_remove("FORMIC_LLM_MODEL")
+        .env_remove("FORMIC_LLM_API_KEY")
+        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "共享 MCP 会话中断应作为模型可见工具结果，而不是终止 worker：{}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(&start_log).unwrap().lines().count(),
+        1,
+        "没有新的模型工具调用时不得仅因断线自动重放或重连"
+    );
+    assert_eq!(
+        fs::read_to_string(&call_log).unwrap().lines().count(),
+        2,
+        "两个已发送的原调用必须各执行一次，断线后不得自动重放"
+    );
+    for unit in [1, 2] {
+        assert_eq!(
+            fs::read_to_string(results_dir(&out).join(format!("{unit}.md"))).unwrap(),
+            FINAL_TEXT
+        );
+        let report = worker_report(&out, unit);
+        assert!(report.contains("会话已中断"), "{report}");
+        assert!(report.contains("原工具调用的结局未知"), "{report}");
+        assert!(report.contains("未自动重放"), "{report}");
+    }
+    let requests = llm.requests.lock().unwrap();
+    let tool_result_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.body.contains("\"role\":\"tool\""))
+        .collect();
+    assert_eq!(
+        tool_result_requests.len(),
+        2,
+        "每个 worker 都应把断线结果回注模型"
+    );
+    for request in tool_result_requests {
+        assert!(request.body.contains("会话已中断"), "{}", request.body);
+        assert!(
+            request.body.contains("原工具调用的结局未知"),
+            "{}",
+            request.body
+        );
+        assert!(request.body.contains("未自动重放"), "{}", request.body);
+    }
+    let summary = latest_run_summary(&out);
+    assert_eq!(summary["published"], 2);
+    assert_eq!(summary["failed"], 0);
+}
+
+#[test]
+fn stdio_message_limit_can_exceed_result_limit_and_the_session_is_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_job(dir.path(), None);
+    fs::write(
+        &task,
+        format!("读取较大的 MCP 响应并继续当前单元。{MCP_MARKER}\n"),
+    )
+    .unwrap();
+    let llm = start_mock();
+    let fake_mcp = compile_fake_mcp(dir.path());
+    let start_log = dir.path().join("large-result-start.log");
+    let call_log = dir.path().join("large-result-call.log");
+    fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            concat!(
+                "url = \"http://127.0.0.1:{}/v1\"\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
+                "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
+                "[mcp_servers.demo]\nenabled = true\ncommand = {}\n",
+                "env = {{ FAKE_MCP_START_LOG = {}, FAKE_MCP_CALL_LOG = {}, FAKE_MCP_RESULT_TEXT_BYTES = \"102400\" }}\n",
+                "enabled_tools = [\"echo\"]\nsession_scope = \"job\"\n",
+                "max_in_flight = 1\ntool_timeout_sec = 10\n",
+                "max_result_bytes = 1024\nmax_message_bytes = 262144\n",
+            ),
+            llm.port,
+            toml_string(&fake_mcp),
+            toml_string(&start_log),
+            toml_string(&call_log),
+        ),
+    )
+    .unwrap();
+
+    let mut command = formic_command(1, &data, &plan, &task, &out);
+    let output = command
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env_remove("FORMIC_LLM_BASE_URL")
+        .env_remove("FORMIC_LLM_MODEL")
+        .env_remove("FORMIC_LLM_API_KEY")
+        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "显式传输上限内的大响应应先解析、再按结果上限截断：{}",
+        stderr_of(&output)
+    );
+    assert_eq!(
+        fs::read_to_string(&start_log).unwrap().lines().count(),
+        1,
+        "两个串行单元应复用同一个健康的 job-scope 会话"
+    );
+    assert_eq!(
+        fs::read_to_string(&call_log).unwrap().lines().count(),
+        2,
+        "两个单元应各调用一次 MCP"
+    );
+    for unit in [1, 2] {
+        assert_eq!(
+            fs::read_to_string(results_dir(&out).join(format!("{unit}.md"))).unwrap(),
+            FINAL_TEXT
+        );
+        let report = worker_report(&out, unit);
+        assert!(
+            report.contains("[已截断：MCP 文本结果达到 1024 字节上限]"),
+            "{report}"
+        );
+        assert!(
+            !report.contains(&"x".repeat(2048)),
+            "公开档案不得保留未截断的大响应"
+        );
+    }
+    let requests = llm.requests.lock().unwrap();
+    let tool_result_requests: Vec<_> = requests
+        .iter()
+        .filter(|request| request.body.contains("\"role\":\"tool\""))
+        .collect();
+    assert_eq!(tool_result_requests.len(), 2);
+    assert!(tool_result_requests.iter().all(|request| {
+        request
+            .body
+            .contains("[已截断：MCP 文本结果达到 1024 字节上限]")
+    }));
+    let summary = latest_run_summary(&out);
+    assert_eq!(summary["published"], 2);
+    assert_eq!(summary["failed"], 0);
+}
+
+#[test]
 fn explicit_mcp_tool_error_is_returned_to_the_model() {
     let dir = tempfile::tempdir().unwrap();
     let (data, plan, task, out) = write_job(dir.path(), None);

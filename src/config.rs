@@ -86,6 +86,7 @@ pub struct McpServerConfig {
     pub startup_timeout: Duration,
     pub tool_timeout: Duration,
     pub max_result_bytes: usize,
+    pub max_message_bytes: Option<usize>,
     pub reconnect: bool,
     pub tool_limits: BTreeMap<String, McpToolLimit>,
     pub transport: McpTransportConfig,
@@ -233,6 +234,7 @@ struct FileMcpServerConfig {
     startup_timeout_sec: Option<u64>,
     tool_timeout_sec: Option<u64>,
     max_result_bytes: Option<usize>,
+    max_message_bytes: Option<usize>,
     reconnect: Option<bool>,
     tool_limits: BTreeMap<String, FileMcpToolLimit>,
 }
@@ -708,6 +710,10 @@ fn resolve_mcp_server(
             &format!("mcp_servers.{name}.tool_timeout_sec"),
         )?),
         max_result_bytes: server_result,
+        max_message_bytes: optional_positive(
+            file.max_message_bytes,
+            &format!("mcp_servers.{name}.max_message_bytes"),
+        )?,
         reconnect: file.reconnect.unwrap_or(true),
         tool_limits,
         transport,
@@ -1069,6 +1075,7 @@ model_input_modalities = ["text"]
         assert_eq!(automatic.session_scope, SessionScope::Job);
         assert_eq!(automatic.max_in_flight, 64);
         assert_eq!(automatic.max_result_bytes, 1024 * 1024);
+        assert_eq!(automatic.max_message_bytes, None);
         assert_eq!(automatic.startup_timeout, Duration::from_secs(60));
         assert_eq!(automatic.tool_timeout, Duration::from_secs(600));
         assert!(automatic.reconnect);
@@ -1135,6 +1142,27 @@ model_input_modalities = ["text"]
         let config = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]).unwrap();
         let limit = &config.mcp_servers["demo"].tool_limits["search"];
         assert_eq!(limit.max_in_flight, 7);
+    }
+
+    #[test]
+    fn mcp_message_limit_is_optional_and_positive() {
+        let explicit = format!(
+            "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\ncommand='server'\nmax_message_bytes=8388608\n"
+        );
+        let config =
+            load_fixture(Some(&explicit), &[("FORMIC_LLM_PROTOCOL", "responses")]).unwrap();
+        assert_eq!(
+            config.mcp_servers["demo"].max_message_bytes,
+            Some(8_388_608)
+        );
+
+        let zero = format!(
+            "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\ncommand='server'\nmax_message_bytes=0\n"
+        );
+        let error = load_fixture(Some(&zero), &[("FORMIC_LLM_PROTOCOL", "responses")])
+            .err()
+            .expect("MCP 原始消息上限必须是正整数");
+        assert!(error.to_string().contains("max_message_bytes"));
     }
 
     #[test]
