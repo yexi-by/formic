@@ -5,7 +5,7 @@ use std::env;
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 fn main() {
     append_log("FAKE_MCP_START_LOG", "start\n");
@@ -30,7 +30,11 @@ fn main() {
                 "{\"tools\":[{\"name\":\"echo\",\"description\":\"返回固定文本和结构数据\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"additionalProperties\":false}}],\"nextCursor\":\"page-2\"}".to_string()
             }
         } else if line.contains("\"method\":\"tools/call\"") {
-            append_log("FAKE_MCP_CALL_LOG", "call\n");
+            let started_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            append_log("FAKE_MCP_CALL_LOG", &format!("call {started_ms}\n"));
             if line.contains("\"name\":\"slow\"") {
                 thread::sleep(Duration::from_secs(5));
                 "{\"content\":[{\"type\":\"text\",\"text\":\"late\"}],\"isError\":false}".to_string()

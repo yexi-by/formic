@@ -11,9 +11,7 @@ use crate::output_access::WorkerOutputAccess;
 
 const INSTRUCTION_START: &str = "\
 你是一次性自主执行单元，独立完成分配给你的数据单元。没有人在场回答你的问题：\
-不要提问、不要请示，根据任务说明自行判断；无法取得进展时说明原因并停止，不要重复相同操作。
-
-你可以使用请求中列出的内置只读工具和外部 MCP 工具。";
+不要提问、不要请示，根据任务说明自行判断；无法取得进展时说明原因并停止，不要重复相同操作。";
 
 const INPUT_ONLY_ACCESS: &str = "内置工具只能读取完整 input 数据集，不能读取其他 worker 的结果。";
 const PUBLISHED_ACCESS: &str =
@@ -26,15 +24,55 @@ const STRUCTURED_END: &str = "\
 完成后必须单独调用 formic_submit_result 提交最终对象；提交回合不能包含文本或其他工具调用。\
 普通最终文本不会成为完成记录。提交成功后立即停止。";
 
+/// 当前 worker 实际拥有的 input 只读工具。它同时约束工具目录与提示词，不能只靠
+/// 自然语言假装权限不存在。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputTools {
+    pub search: bool,
+    pub read: bool,
+    pub read_image: bool,
+}
+
+impl InputTools {
+    #[cfg(test)]
+    pub const NONE: Self = Self {
+        search: false,
+        read: false,
+        read_image: false,
+    };
+
+    #[cfg(test)]
+    pub const TEXT: Self = Self {
+        search: true,
+        read: true,
+        read_image: false,
+    };
+
+    fn any(self) -> bool {
+        self.search || self.read || self.read_image
+    }
+}
+
 /// 返回本作业冻结的系统提示词。
-pub fn instructions(structured: bool, output_access: WorkerOutputAccess) -> String {
-    let access = if output_access.allows_published() {
+pub fn instructions(
+    structured: bool,
+    output_access: WorkerOutputAccess,
+    input_tools: InputTools,
+) -> String {
+    let access = if !input_tools.any() {
+        ""
+    } else if output_access.allows_published() {
         PUBLISHED_ACCESS
     } else {
         INPUT_ONLY_ACCESS
     };
     let ending = if structured { STRUCTURED_END } else { TEXT_END };
-    format!("{INSTRUCTION_START}{access} {TOOL_END}\n\n{ending}")
+    let access = if access.is_empty() {
+        String::new()
+    } else {
+        format!("{access} ")
+    };
+    format!("{INSTRUCTION_START}\n\n你可以使用请求中列出的工具。{access}{TOOL_END}\n\n{ending}")
 }
 
 /// 已读出的分片内容，路径均为面向模型的根内相对表示。
@@ -49,23 +87,32 @@ pub enum ShardContent {
     },
 }
 
-/// 写入任务说明和分片标题。完整 input 根可以通过只读工具搜索，不在每个 prompt
-/// 中重复整份文件清单。调用方可在每次 write 时实施预算。
+/// 写入任务说明、实际可用的 input 工具说明和分片标题。调用方可在每次 write 时
+/// 实施预算。
 pub(crate) fn write_user_prefix(
     output: &mut impl fmt::Write,
     task: &str,
-    supports_image: bool,
+    input_tools: InputTools,
 ) -> fmt::Result {
     output.write_str(task.trim_end_matches('\n'))?;
-    if supports_image {
-        output.write_str(
-            "\n\n完整 input 根可通过只读 search/read/read_image 工具按需检索；不要主动扩大当前分片。\n\n# 你的分片\n",
-        )
-    } else {
-        output.write_str(
-            "\n\n完整 input 根可通过只读 search/read 工具按需检索；不要主动扩大当前分片。\n\n# 你的分片\n",
-        )
+    let mut names = Vec::new();
+    if input_tools.search {
+        names.push("search");
     }
+    if input_tools.read {
+        names.push("read");
+    }
+    if input_tools.read_image {
+        names.push("read_image");
+    }
+    if !names.is_empty() {
+        write!(
+            output,
+            "\n\n完整 input 根可通过只读 {} 工具按需检索；不要主动扩大当前分片。",
+            names.join("/")
+        )?;
+    }
+    output.write_str("\n\n# 你的分片\n")
 }
 
 pub(crate) fn write_file_header(
@@ -92,7 +139,7 @@ pub(crate) fn write_line_header(
 #[cfg(test)]
 pub fn build_user_message(task: &str, shard: &ShardContent) -> String {
     let mut msg = String::new();
-    write_user_prefix(&mut msg, task, false).expect("String 写入不会失败");
+    write_user_prefix(&mut msg, task, InputTools::TEXT).expect("String 写入不会失败");
     match shard {
         ShardContent::Files(files) => {
             for (i, (path, content)) in files.iter().enumerate() {
@@ -187,8 +234,8 @@ mod tests {
 
     #[test]
     fn output_mode_has_unambiguous_completion_contract() {
-        let text = instructions(false, WorkerOutputAccess::Published);
-        let structured = instructions(true, WorkerOutputAccess::Published);
+        let text = instructions(false, WorkerOutputAccess::Published, InputTools::TEXT);
+        let structured = instructions(true, WorkerOutputAccess::Published, InputTools::TEXT);
         assert!(text.contains("最后一条消息"));
         assert!(!text.contains("formic_submit_result"));
         assert!(structured.contains("必须单独调用 formic_submit_result"));
@@ -197,11 +244,23 @@ mod tests {
 
     #[test]
     fn instructions_state_the_effective_output_access() {
-        let isolated = instructions(false, WorkerOutputAccess::None);
+        let isolated = instructions(false, WorkerOutputAccess::None, InputTools::TEXT);
         assert!(isolated.contains("不能读取其他 worker 的结果"));
         assert!(!isolated.contains("output 指"));
 
-        let published = instructions(false, WorkerOutputAccess::Published);
+        let published = instructions(false, WorkerOutputAccess::Published, InputTools::TEXT);
         assert!(published.contains("output 指已发布单元"));
+    }
+
+    #[test]
+    fn disabled_input_tools_are_not_advertised() {
+        let mut message = String::new();
+        write_user_prefix(&mut message, TASK, InputTools::NONE).unwrap();
+        assert!(!message.contains("完整 input 根"));
+        assert!(message.contains("# 你的分片"));
+
+        let instructions = instructions(false, WorkerOutputAccess::None, InputTools::NONE);
+        assert!(!instructions.contains("内置工具"));
+        assert!(!instructions.contains("input 数据集"));
     }
 }

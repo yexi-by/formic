@@ -34,6 +34,7 @@ pub struct JobContext {
     pub output_contract: OutputContract,
     pub execution: ExecutionConfig,
     pub model_tools: Arc<[ToolSpec]>,
+    pub input_tools: prompt::InputTools,
     pub worker_run: output::WorkerRun,
     /// 最终发布与作业取消的线性化边界：worker 持读锁完成审计和原子发布，
     /// 信号处理持写锁取消根令牌，保证两者有唯一先后顺序。
@@ -196,6 +197,7 @@ pub async fn run_unit(
         input_budget,
         protocol,
         input_modalities,
+        input_tools: ctx.input_tools,
     };
     let reader = tokio::task::spawn_blocking(move || {
         read_shard(&root, &planned_shard, &task, read_policy, &read_cancel)
@@ -570,8 +572,9 @@ async fn drive_loop(
                 push_response_output_items(history, meter, response_output_items);
                 let mut submission_error = None;
                 let mut media_message = UserContent::new();
-                for prepared in calls {
-                    let tc = prepared.req;
+                let mut executions = Vec::new();
+                for prepared in &calls {
+                    let tc = &prepared.req;
                     audit.push(&AuditEntry::ToolCall {
                         name: tc.name.clone(),
                         source: if tc.name == SUBMIT_RESULT_TOOL {
@@ -590,6 +593,65 @@ async fn drive_loop(
                     if tc.name == SUBMIT_RESULT_TOOL && ctx.output_contract.is_structured() {
                         last_call = None;
                         same_calls = 0;
+                        continue;
+                    }
+                    *meter.stats.tool_calls.entry(tc.name.clone()).or_default() += 1;
+                    let current = (tc.name.clone(), prepared.raw_arguments.clone());
+                    if last_call.as_ref() == Some(&current) {
+                        same_calls += 1;
+                    } else {
+                        same_calls = 1;
+                        last_call = Some(current);
+                    }
+                    if same_calls >= ctx.execution.identical_tool_call_limit {
+                        return Err(UnitFailure::Stalled {
+                            limit: ctx.execution.identical_tool_call_limit,
+                            name: tc.name.clone(),
+                            arguments: prepared.raw_arguments.clone(),
+                        });
+                    }
+                    if let Some(error) = &prepared.argument_error {
+                        audit.push(&AuditEntry::State {
+                            state: WorkerState::CorrectingToolCall,
+                            reason: format!("工具 {} 的参数无效：{error}", tc.name),
+                        })?;
+                    } else {
+                        audit.push(&AuditEntry::State {
+                            state: WorkerState::WaitingForTool,
+                            reason: format!("工具 {} 已进入调度器，等待准入和执行", tc.name),
+                        })?;
+                    }
+                    let scheduler = ctx.scheduler.clone();
+                    let name = tc.name.clone();
+                    let arguments = prepared.arguments.clone();
+                    let argument_error = prepared.argument_error.clone();
+                    let call_cancel = cancel.clone();
+                    executions.push(async move {
+                        if let Some(error) = argument_error {
+                            Ok(crate::scheduler::ToolResponse {
+                                content: format!("错误：{error}"),
+                                images: Vec::new(),
+                                cache: crate::scheduler::CacheDisposition::Bypassed,
+                                cache_evictions: 0,
+                                wait_ms: 0,
+                                execution_ms: 0,
+                                mcp_server: None,
+                                mcp_current_in_flight: None,
+                                mcp_peak_in_flight: None,
+                            })
+                        } else {
+                            scheduler.execute(unit, &name, arguments, call_cancel).await
+                        }
+                    });
+                }
+                let results = tokio::select! {
+                    _ = cancel.cancelled() => return Ok(LoopEnd::Stopped),
+                    results = futures_util::future::join_all(executions) => results,
+                };
+                let mut results = results.into_iter();
+                for prepared in calls {
+                    let tc = prepared.req;
+                    if tc.name == SUBMIT_RESULT_TOOL && ctx.output_contract.is_structured() {
                         let (validation, validation_issue) = if mixed_submit {
                             (
                                 Err(
@@ -651,47 +713,9 @@ async fn drive_loop(
                         }
                         continue;
                     }
-                    *meter.stats.tool_calls.entry(tc.name.clone()).or_default() += 1;
-                    let current = (tc.name.clone(), prepared.raw_arguments.clone());
-                    if last_call.as_ref() == Some(&current) {
-                        same_calls += 1;
-                    } else {
-                        same_calls = 1;
-                        last_call = Some(current);
-                    }
-                    if same_calls >= ctx.execution.identical_tool_call_limit {
-                        return Err(UnitFailure::Stalled {
-                            limit: ctx.execution.identical_tool_call_limit,
-                            name: tc.name,
-                            arguments: prepared.raw_arguments,
-                        });
-                    }
-                    let result = if let Some(error) = prepared.argument_error {
-                        audit.push(&AuditEntry::State {
-                            state: WorkerState::CorrectingToolCall,
-                            reason: format!("工具 {} 的参数无效：{error}", tc.name),
-                        })?;
-                        crate::scheduler::ToolResponse {
-                            content: format!("错误：{error}"),
-                            images: Vec::new(),
-                            cache: crate::scheduler::CacheDisposition::Bypassed,
-                            cache_evictions: 0,
-                            wait_ms: 0,
-                            execution_ms: 0,
-                            mcp_server: None,
-                            mcp_current_in_flight: None,
-                            mcp_peak_in_flight: None,
-                        }
-                    } else {
-                        audit.push(&AuditEntry::State {
-                            state: WorkerState::WaitingForTool,
-                            reason: format!("工具 {} 已进入调度器，等待准入和执行", tc.name),
-                        })?;
-                        tokio::select! {
-                            _ = cancel.cancelled() => return Ok(LoopEnd::Stopped),
-                            result = ctx.scheduler.execute(unit, &tc.name, prepared.arguments, cancel.clone()) => result?,
-                        }
-                    };
+                    let result = results
+                        .next()
+                        .expect("每个普通工具调用必须有一个并发执行结果")?;
                     let result_bytes = tool_result_bytes(&result)?;
                     audit.push(&AuditEntry::ToolExecution {
                         name: tc.name.clone(),
@@ -1027,6 +1051,7 @@ struct ShardReadPolicy {
     input_budget: u64,
     protocol: Protocol,
     input_modalities: InputModalities,
+    input_tools: prompt::InputTools,
 }
 
 fn read_shard(
@@ -1037,9 +1062,7 @@ fn read_shard(
     cancel: &CancellationToken,
 ) -> Result<UserContent, ShardReadError> {
     let mut message = InitialMessageBuilder::new(policy.request_base_tokens, policy.input_budget)?;
-    if prompt::write_user_prefix(&mut message, task, policy.input_modalities.supports_image())
-        .is_err()
-    {
+    if prompt::write_user_prefix(&mut message, task, policy.input_tools).is_err() {
         return Err(message.too_large());
     }
     match shard {
@@ -1394,11 +1417,13 @@ mod tests {
                 context_safety_tokens: 4096,
             },
             model_tools,
+            input_tools: prompt::InputTools::TEXT,
             worker_run,
             publish_gate: Arc::new(tokio::sync::RwLock::new(())),
             instructions: crate::prompt::instructions(
                 false,
                 crate::output_access::WorkerOutputAccess::Published,
+                prompt::InputTools::TEXT,
             ),
         };
         (dir, ctx)
@@ -1431,6 +1456,7 @@ mod tests {
                 input_budget: u64::MAX,
                 protocol: Protocol::Completions,
                 input_modalities: InputModalities::Text,
+                input_tools: prompt::InputTools::TEXT,
             },
             &CancellationToken::new(),
         )
@@ -1459,6 +1485,7 @@ mod tests {
                 input_budget: u64::MAX,
                 protocol: Protocol::Completions,
                 input_modalities: InputModalities::Text,
+                input_tools: prompt::InputTools::TEXT,
             },
             &CancellationToken::new(),
         )
@@ -1490,6 +1517,7 @@ mod tests {
                 input_budget: 1_000,
                 protocol: Protocol::Completions,
                 input_modalities: InputModalities::Text,
+                input_tools: prompt::InputTools::TEXT,
             },
             &CancellationToken::new(),
         )

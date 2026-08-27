@@ -366,6 +366,20 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         worker_output_access,
         config.llm.input_modalities,
     )?;
+    let input_tools = prompt::InputTools {
+        search: matches!(
+            registry.source("search"),
+            Some(scheduler::ToolSource::Builtin)
+        ),
+        read: matches!(
+            registry.source("read"),
+            Some(scheduler::ToolSource::Builtin)
+        ),
+        read_image: matches!(
+            registry.source("read_image"),
+            Some(scheduler::ToolSource::Builtin)
+        ),
+    };
     let mut model_tools = registry.specs().to_vec();
     if let Some(spec) = output_contract.submit_spec() {
         model_tools.push(spec);
@@ -407,7 +421,11 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         &config.cache,
         concurrency,
     );
-    let instructions = prompt::instructions(output_contract.is_structured(), worker_output_access);
+    let instructions = prompt::instructions(
+        output_contract.is_structured(),
+        worker_output_access,
+        input_tools,
+    );
     let publish_gate = Arc::new(tokio::sync::RwLock::new(()));
     let ctx = Arc::new(worker::JobContext {
         scheduler,
@@ -418,6 +436,7 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         output_contract,
         execution: config.execution.clone(),
         model_tools: model_tools.into(),
+        input_tools,
         worker_run,
         publish_gate: Arc::clone(&publish_gate),
         instructions,

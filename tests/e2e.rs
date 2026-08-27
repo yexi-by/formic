@@ -28,6 +28,7 @@ const FAIL_TWICE_MARKER: &str = "FAIL-TWICE-UNIT";
 
 /// 请求体含此标记时，completions mock 改为调用测试 MCP 工具。
 const MCP_MARKER: &str = "MCP-UNIT";
+const MCP_PARALLEL_MARKER: &str = "MCP-PARALLEL-UNIT";
 const IMAGE_TOOL_MARKER: &str = "IMAGE-TOOL-UNIT";
 
 /// 请求体含此标记时，mock 直接提交符合 schema 的结构化结果。
@@ -99,6 +100,15 @@ const COMPLETIONS_TOOLCALL: &str = concat!(
 const COMPLETIONS_MCP_TOOLCALL: &str = concat!(
     "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_mcp\",\"type\":\"function\",\"function\":{\"name\":\"demo__echo\",\"arguments\":\"{\\\"text\\\":\\\"hello\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: [DONE]\n\n",
+);
+
+const COMPLETIONS_PARALLEL_MCP_TOOLCALL: &str = concat!(
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[",
+    "{\"index\":0,\"id\":\"call_left\",\"type\":\"function\",\"function\":{\"name\":\"left__slow\",\"arguments\":\"{}\"}},",
+    "{\"index\":1,\"id\":\"call_right\",\"type\":\"function\",\"function\":{\"name\":\"right__slow\",\"arguments\":\"{}\"}}",
+    "]},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
     "data: [DONE]\n\n",
 );
 
@@ -798,6 +808,16 @@ fn handle_conn(
         match response {
             Some(sse) => ("200 OK", sse.to_string()),
             None => ("404 Not Found", "unknown path".to_string()),
+        }
+    } else if body_text.contains(MCP_PARALLEL_MARKER) {
+        let is_second_turn = body_text.contains(tool_result_marker(&path));
+        if path.ends_with("/chat/completions") && !is_second_turn {
+            ("200 OK", COMPLETIONS_PARALLEL_MCP_TOOLCALL.to_string())
+        } else {
+            match sse_for(&path, false) {
+                Some(sse) => ("200 OK", sse.to_string()),
+                None => ("404 Not Found", "unknown path".to_string()),
+            }
         }
     } else if body_text.contains(MCP_TIMEOUT_MARKER) {
         ("200 OK", COMPLETIONS_SLOW_MCP_TOOLCALL.to_string())
@@ -2470,6 +2490,90 @@ fn custom_stdio_mcp_auto_discovers_all_tools_and_is_audited() {
             .all(|request| request.body.contains("demo__echo")),
         "冻结工具目录必须出现在每个首轮请求中"
     );
+    assert!(
+        requests
+            .iter()
+            .filter(|request| !request.body.contains("\"role\":\"tool\""))
+            .all(|request| !request.body.contains("完整 input 根")),
+        "关闭全部 input 工具后，首轮提示不得继续宣称完整 input 可检索"
+    );
+}
+
+#[test]
+fn one_worker_runs_same_turn_mcp_calls_concurrently() {
+    let dir = tempfile::tempdir().unwrap();
+    let (data, plan, task, out) = write_job(dir.path(), None);
+    fs::write(&plan, "{\"unit\":1,\"files\":[\"a.txt\"]}\n").unwrap();
+    fs::write(
+        &task,
+        format!("在同一回合调用两个独立慢工具。{MCP_PARALLEL_MARKER}\n"),
+    )
+    .unwrap();
+    let mock = start_mock();
+    let fake_mcp = compile_fake_mcp(dir.path());
+    let left_log = dir.path().join("left-call.log");
+    let right_log = dir.path().join("right-call.log");
+    fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            concat!(
+                "url = \"http://127.0.0.1:{}/v1\"\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
+                "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
+                "[mcp_servers.left]\nenabled = true\ncommand = {}\n",
+                "env = {{ FAKE_MCP_CALL_LOG = {} }}\n",
+                "enabled_tools = [\"slow\"]\nsession_scope = \"job\"\n",
+                "max_in_flight = 1\ntool_timeout_sec = 10\n",
+                "[mcp_servers.right]\nenabled = true\ncommand = {}\n",
+                "env = {{ FAKE_MCP_CALL_LOG = {} }}\n",
+                "enabled_tools = [\"slow\"]\nsession_scope = \"job\"\n",
+                "max_in_flight = 1\ntool_timeout_sec = 10\n",
+            ),
+            mock.port,
+            toml_string(&fake_mcp),
+            toml_string(&left_log),
+            toml_string(&fake_mcp),
+            toml_string(&right_log),
+        ),
+    )
+    .unwrap();
+
+    let mut command = formic_command(1, &data, &plan, &task, &out);
+    let output = command
+        .env("FORMIC_LLM_PROTOCOL", "completions")
+        .env_remove("FORMIC_LLM_BASE_URL")
+        .env_remove("FORMIC_LLM_MODEL")
+        .env_remove("FORMIC_LLM_API_KEY")
+        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
+        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    let call_started_ms = |path: &Path| {
+        fs::read_to_string(path)
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse::<u128>()
+            .unwrap()
+    };
+    let left_started = call_started_ms(&left_log);
+    let right_started = call_started_ms(&right_log);
+    assert!(
+        left_started.abs_diff(right_started) < 2_000,
+        "两个各耗时 5 秒的独立工具应同时启动：left={left_started}, right={right_started}"
+    );
+    assert_eq!(fs::read_to_string(left_log).unwrap().lines().count(), 1);
+    assert_eq!(fs::read_to_string(right_log).unwrap().lines().count(), 1);
+    assert_eq!(
+        fs::read_to_string(results_dir(&out).join("1.md")).unwrap(),
+        FINAL_TEXT
+    );
+    let report = worker_report(&out, 1);
+    assert!(report.contains("mcp:left/slow"), "{report}");
+    assert!(report.contains("mcp:right/slow"), "{report}");
 }
 
 #[test]
