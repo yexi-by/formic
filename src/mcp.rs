@@ -1062,10 +1062,7 @@ async fn await_call_result(
 }
 
 fn service_error_is_terminal(error: &ServiceError) -> bool {
-    matches!(
-        error,
-        ServiceError::McpError(_) | ServiceError::Cancelled { .. }
-    )
+    matches!(error, ServiceError::Cancelled { .. })
 }
 
 async fn convert_completed_result(
@@ -1160,6 +1157,15 @@ impl McpTool {
                 cancellation_guard.retire("工具调用超时");
                 Err(McpCallError::Timeout {
                     server: self.server.name.clone(),
+                })
+            }
+            Ok(Err(error @ ServiceError::McpError(_))) => {
+                let reason = error.to_string();
+                cancellation_guard.disarm();
+                Ok(ToolOutput {
+                    content: format!("错误：MCP 工具报告失败：{reason}"),
+                    images: Vec::new(),
+                    cacheable: false,
                 })
             }
             Ok(Err(error)) => {

@@ -25,7 +25,7 @@ fn main() {
             )
         } else if line.contains("\"method\":\"tools/list\"") {
             if line.contains("\"cursor\":\"page-2\"") {
-                "{\"tools\":[{\"name\":\"slow\",\"description\":\"延迟返回\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}]}".to_string()
+                "{\"tools\":[{\"name\":\"fail\",\"description\":\"返回明确工具错误\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},{\"name\":\"slow\",\"description\":\"延迟返回\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}]}".to_string()
             } else {
                 "{\"tools\":[{\"name\":\"echo\",\"description\":\"返回固定文本和结构数据\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"text\":{\"type\":\"string\"}},\"required\":[\"text\"],\"additionalProperties\":false}}],\"nextCursor\":\"page-2\"}".to_string()
             }
@@ -35,6 +35,15 @@ fn main() {
                 .unwrap_or_default()
                 .as_millis();
             append_log("FAKE_MCP_CALL_LOG", &format!("call {started_ms}\n"));
+            if line.contains("\"name\":\"fail\"") {
+                writeln!(
+                    stdout,
+                    "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32603,\"message\":\"expected tool failure\"}}}}"
+                )
+                .unwrap();
+                stdout.flush().unwrap();
+                continue;
+            }
             if line.contains("\"name\":\"slow\"") {
                 thread::sleep(Duration::from_secs(5));
                 "{\"content\":[{\"type\":\"text\",\"text\":\"late\"}],\"isError\":false}".to_string()

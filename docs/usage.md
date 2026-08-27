@@ -246,6 +246,9 @@ MCP 可配置：
 
 已经发送但超时或中断的调用不会自动重放。收到明确远端结果后，如果本地图片留档失败，worker 会失败并明确说明不得重放该工具调用。
 
+MCP server 明确返回的 JSON-RPC 工具错误会作为普通工具结果回注模型，使模型能够改用
+其他 URL 或工具。调用超时、会话中断和其他结局未知的故障仍会失败，且不会自动重放。
+
 结果支持 text、`structuredContent` 和 JPEG/PNG/GIF/WebP 图片。音频、resource 和 resource link 不支持。MCP 图片在发送模型前原样保存到当前运行目录的 `media/`。
 
 Streamable HTTP 有一项底层限制：initialize 超时会让 Formic 按配置返回并停止复用该会话，但取消请求不能保证 Hyper 或操作系统立即关闭已经写入的 TCP 连接。该连接可能继续存在到远端或系统超时；Formic 不把“超时后固定时间收到 TCP EOF”作为契约。
