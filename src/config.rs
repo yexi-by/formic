@@ -1,8 +1,7 @@
-//! 作业启动配置：读取调用方明确指定的 `config.toml`，并在边界上完成默认值、
-//! 环境变量覆盖、外部服务密钥解析和全部资源参数校验。
+//! 作业启动配置：只读取调用方明确指定的 TOML，并在边界上完成默认值、
+//! 外部服务参数解析和全部资源参数校验。
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -34,6 +33,7 @@ const DEFAULT_MCP_TOOL_TIMEOUT_SEC: u64 = 600;
 #[derive(Clone)]
 pub struct AppConfig {
     pub llm: LlmConfig,
+    pub metrics_enabled: bool,
     pub execution: ExecutionConfig,
     pub tools: ToolsConfig,
     pub cache: CacheConfig,
@@ -120,6 +120,7 @@ pub enum McpTransportConfig {
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct FileConfig {
+    protocol: Option<String>,
     url: Option<String>,
     api_key: Option<String>,
     model: Option<String>,
@@ -134,6 +135,7 @@ struct FileConfig {
     retry_delays_ms: Option<Vec<u64>>,
     max_retry_after_ms: Option<u64>,
     requests_per_minute: Option<u32>,
+    metrics: bool,
     execution: FileExecutionConfig,
     tools: FileToolsConfig,
     cache: FileCacheConfig,
@@ -221,12 +223,9 @@ struct FileMcpServerConfig {
     command: Option<String>,
     args: Vec<String>,
     env: BTreeMap<String, String>,
-    env_vars: BTreeMap<String, String>,
     url: Option<String>,
     bearer_token: Option<String>,
-    bearer_token_env: Option<String>,
     headers: BTreeMap<String, String>,
-    header_env: BTreeMap<String, String>,
     enabled_tools: Option<Vec<String>>,
     tool_aliases: BTreeMap<String, String>,
     session_scope: Option<String>,
@@ -257,52 +256,47 @@ pub enum ConfigError {
     MissingFile(PathBuf),
     #[error("配置文件 {path} 不是有效配置：请检查 TOML 语法、字段名和字段类型")]
     Parse { path: PathBuf },
-    #[error(
-        "缺少环境变量 FORMIC_LLM_PROTOCOL：指定 API 协议形状：completions / responses / anthropic"
-    )]
+    #[error("配置缺少 protocol：填写 completions、responses 或 anthropic")]
     MissingProtocol,
     #[error("{0}")]
     InvalidProtocol(String),
-    #[error("缺少 LLM URL：请设置 FORMIC_LLM_BASE_URL，或填写 config.toml 的 url")]
+    #[error("配置缺少 url：填写模型服务地址")]
     MissingUrl,
-    #[error("缺少模型名：请设置 FORMIC_LLM_MODEL，或填写 config.toml 的 model")]
+    #[error("配置缺少 model：填写模型名")]
     MissingModel,
-    #[error(
-        "缺少模型上下文大小：请设置 FORMIC_LLM_CONTEXT_WINDOW_TOKENS，或填写 config.toml 的 context_window_tokens"
-    )]
+    #[error("配置缺少 context_window_tokens：填写模型上下文大小")]
     MissingContextWindow,
-    #[error(
-        "缺少模型输入模态：请设置 FORMIC_LLM_INPUT_MODALITIES=text 或 text,image，或填写 config.toml 的 model_input_modalities"
-    )]
+    #[error("配置缺少 model_input_modalities：填写 [\"text\"] 或 [\"text\", \"image\"]")]
     MissingInputModalities,
-    #[error(
-        "Anthropic Messages 缺少 max_tokens：请设置 FORMIC_ANTHROPIC_MAX_TOKENS，或填写 config.toml 的 anthropic_max_tokens"
-    )]
+    #[error("anthropic 协议缺少 anthropic_max_tokens")]
     MissingAnthropicMaxTokens,
+    #[error("配置文件必须使用 .toml 扩展名：{0}")]
+    InvalidExtension(PathBuf),
     #[error("配置无效：{0}")]
     Invalid(String),
 }
 
-/// 显式配置路径必须存在；省略路径时读取当前目录的 `config.toml`，默认文件不存在则
-/// 允许完全由环境变量提供 LLM 身份。环境变量只覆盖 LLM 身份、输入能力与模型容量字段。
+/// 显式配置路径必须存在；省略路径时读取当前目录的 `config.toml`。
+/// 所有部署与外部服务配置只来自该 TOML。
 pub fn load(path: Option<&Path>) -> Result<AppConfig, ConfigError> {
-    let (path, required) = path.map_or((Path::new(CONFIG_FILE), false), |path| (path, true));
-    load_from_with(path, required, |name| env::var(name).ok())
+    load_from(path.unwrap_or_else(|| Path::new(CONFIG_FILE)))
 }
 
-fn load_from_with(
-    path: &Path,
-    required: bool,
-    get_env: impl Fn(&str) -> Option<String>,
-) -> Result<AppConfig, ConfigError> {
+fn load_from(path: &Path) -> Result<AppConfig, ConfigError> {
+    if !path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("toml"))
+    {
+        return Err(ConfigError::InvalidExtension(path.to_path_buf()));
+    }
     let file = match fs::read_to_string(path) {
         Ok(contents) => toml::from_str(&contents).map_err(|_| ConfigError::Parse {
             path: path.to_path_buf(),
         })?,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound && required => {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
             return Err(ConfigError::MissingFile(path.to_path_buf()));
         }
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => FileConfig::default(),
         Err(source) => {
             return Err(ConfigError::Read {
                 path: path.to_path_buf(),
@@ -311,34 +305,20 @@ fn load_from_with(
         }
     };
 
-    resolve(file, get_env)
+    resolve(file)
 }
 
-fn resolve(
-    file: FileConfig,
-    get_env: impl Fn(&str) -> Option<String>,
-) -> Result<AppConfig, ConfigError> {
-    let env_value = |name: &str| get_env(name).filter(|value| !value.is_empty());
-    let protocol_name = env_value("FORMIC_LLM_PROTOCOL").ok_or(ConfigError::MissingProtocol)?;
+fn resolve(file: FileConfig) -> Result<AppConfig, ConfigError> {
+    let protocol_name = non_empty(file.protocol).ok_or(ConfigError::MissingProtocol)?;
     let protocol = Protocol::parse(&protocol_name).map_err(ConfigError::InvalidProtocol)?;
     let extra_body = parse_extra_body_json(file.extra_body_json.as_deref(), protocol)?;
-    let context_window_tokens = parse_env_u64(
-        env_value("FORMIC_LLM_CONTEXT_WINDOW_TOKENS"),
-        "FORMIC_LLM_CONTEXT_WINDOW_TOKENS",
-    )?
-    .or(file.context_window_tokens)
-    .ok_or(ConfigError::MissingContextWindow)?;
+    let context_window_tokens = file
+        .context_window_tokens
+        .ok_or(ConfigError::MissingContextWindow)?;
     require_positive(context_window_tokens, "context_window_tokens")?;
-    let input_modalities = parse_input_modalities(
-        env_value("FORMIC_LLM_INPUT_MODALITIES"),
-        file.model_input_modalities,
-    )?;
+    let input_modalities = parse_input_modalities(file.model_input_modalities)?;
 
-    let configured_anthropic_max_tokens = parse_env_u64(
-        env_value("FORMIC_ANTHROPIC_MAX_TOKENS"),
-        "FORMIC_ANTHROPIC_MAX_TOKENS",
-    )?
-    .or(file.anthropic_max_tokens);
+    let configured_anthropic_max_tokens = file.anthropic_max_tokens;
     let anthropic_max_tokens = match (protocol, configured_anthropic_max_tokens) {
         (Protocol::Anthropic, Some(value)) => {
             require_positive(value, "anthropic_max_tokens")?;
@@ -449,20 +429,16 @@ fn resolve(
         if !server.enabled {
             continue;
         }
-        let resolved = resolve_mcp_server(&name, server, &env_value, global_result)?;
+        let resolved = resolve_mcp_server(&name, server, global_result)?;
         mcp_servers.insert(name, resolved);
     }
 
     Ok(AppConfig {
         llm: LlmConfig {
             protocol,
-            base_url: env_value("FORMIC_LLM_BASE_URL")
-                .or_else(|| non_empty(file.url))
-                .ok_or(ConfigError::MissingUrl)?,
-            model: env_value("FORMIC_LLM_MODEL")
-                .or_else(|| non_empty(file.model))
-                .ok_or(ConfigError::MissingModel)?,
-            api_key: env_value("FORMIC_LLM_API_KEY").or_else(|| non_empty(file.api_key)),
+            base_url: non_empty(file.url).ok_or(ConfigError::MissingUrl)?,
+            model: non_empty(file.model).ok_or(ConfigError::MissingModel)?,
+            api_key: non_empty(file.api_key),
             context_window_tokens,
             anthropic_max_tokens,
             input_modalities,
@@ -493,6 +469,7 @@ fn resolve(
                 "requests_per_minute",
             )?,
         },
+        metrics_enabled: file.metrics,
         execution,
         tools,
         cache,
@@ -500,18 +477,8 @@ fn resolve(
     })
 }
 
-fn parse_input_modalities(
-    environment: Option<String>,
-    file: Option<Vec<String>>,
-) -> Result<InputModalities, ConfigError> {
-    let values = if let Some(environment) = environment {
-        environment
-            .split(',')
-            .map(|value| value.trim().to_string())
-            .collect()
-    } else {
-        file.ok_or(ConfigError::MissingInputModalities)?
-    };
+fn parse_input_modalities(file: Option<Vec<String>>) -> Result<InputModalities, ConfigError> {
+    let values = file.ok_or(ConfigError::MissingInputModalities)?;
     InputModalities::parse(&values).map_err(ConfigError::Invalid)
 }
 
@@ -547,7 +514,6 @@ fn parse_extra_body_json(
 fn resolve_mcp_server(
     name: &str,
     file: FileMcpServerConfig,
-    env_value: &impl Fn(&str) -> Option<String>,
     global_result: usize,
 ) -> Result<McpServerConfig, ConfigError> {
     let enabled_tools = file.enabled_tools;
@@ -616,46 +582,18 @@ fn resolve_mcp_server(
         );
     }
 
-    let has_stdio_extras =
-        !file.args.is_empty() || !file.env.is_empty() || !file.env_vars.is_empty();
-    let has_http_extras = file.bearer_token.is_some()
-        || file.bearer_token_env.is_some()
-        || !file.headers.is_empty()
-        || !file.header_env.is_empty();
+    let has_stdio_extras = !file.args.is_empty() || !file.env.is_empty();
+    let has_http_extras = file.bearer_token.is_some() || !file.headers.is_empty();
     let transport = match (non_empty(file.command), non_empty(file.url)) {
-        (Some(command), None) if !has_http_extras => {
-            let mut child_env = file.env;
-            for (child_name, source_name) in file.env_vars {
-                let value = env_value(&source_name).ok_or_else(|| {
-                    ConfigError::Invalid(format!(
-                        "mcp_servers.{name}.env_vars.{child_name} 引用的环境变量 {source_name} 缺失或为空"
-                    ))
-                })?;
-                child_env.insert(child_name, value);
-            }
-            McpTransportConfig::Stdio {
-                command,
-                args: file.args,
-                env: child_env,
-            }
-        }
+        (Some(command), None) if !has_http_extras => McpTransportConfig::Stdio {
+            command,
+            args: file.args,
+            env: file.env,
+        },
         (None, Some(url)) if !has_stdio_extras => {
-            let mut headers = file.headers;
-            for (header, source_name) in file.header_env {
-                let value = env_value(&source_name).ok_or_else(|| {
-                    ConfigError::Invalid(format!(
-                        "mcp_servers.{name}.header_env.{header} 引用的环境变量 {source_name} 缺失或为空"
-                    ))
-                })?;
-                headers.insert(header, value);
-            }
+            let headers = file.headers;
             validate_headers(name, &headers)?;
-            let bearer_token = match non_empty(file.bearer_token_env) {
-                Some(source_name) => {
-                    env_value(&source_name).or_else(|| non_empty(file.bearer_token))
-                }
-                None => non_empty(file.bearer_token),
-            };
+            let bearer_token = non_empty(file.bearer_token);
             McpTransportConfig::Http {
                 url,
                 bearer_token,
@@ -731,16 +669,6 @@ fn validate_headers(server: &str, headers: &BTreeMap<String, String>) -> Result<
     Ok(())
 }
 
-fn parse_env_u64(value: Option<String>, name: &str) -> Result<Option<u64>, ConfigError> {
-    value
-        .map(|value| {
-            value
-                .parse::<u64>()
-                .map_err(|_| ConfigError::Invalid(format!("环境变量 {name} 必须是正整数")))
-        })
-        .transpose()
-}
-
 fn positive_or<T>(value: Option<T>, default: T, name: &str) -> Result<T, ConfigError>
 where
     T: Copy + PartialEq + From<u8>,
@@ -788,47 +716,60 @@ fn non_empty(value: Option<String>) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-
     use super::*;
 
-    fn load_fixture(
-        contents: Option<&str>,
-        values: &[(&str, &str)],
-    ) -> Result<AppConfig, ConfigError> {
+    fn load_fixture(contents: Option<&str>) -> Result<AppConfig, ConfigError> {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CONFIG_FILE);
         if let Some(contents) = contents {
             fs::write(&path, contents).unwrap();
         }
-        let values: HashMap<&str, &str> = values.iter().copied().collect();
-        load_from_with(&path, false, |name| {
-            values.get(name).map(|value| (*value).to_string())
-        })
+        load_from(&path)
     }
 
     #[test]
     fn explicitly_selected_config_must_exist() {
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("missing.toml");
-        let error = load_from_with(&missing, true, |_| None)
-            .err()
-            .expect("显式缺失配置必须失败");
+        let error = load_from(&missing).err().expect("显式缺失配置必须失败");
         assert!(matches!(error, ConfigError::MissingFile(path) if path == missing));
     }
 
+    #[test]
+    fn default_config_must_exist() {
+        let error = load_fixture(None)
+            .err()
+            .expect("默认 config.toml 缺失必须失败");
+        assert!(matches!(
+            error,
+            ConfigError::MissingFile(path) if path.file_name().is_some_and(|name| name == CONFIG_FILE)
+        ));
+    }
+
+    #[test]
+    fn config_path_must_use_toml_extension() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.txt");
+        fs::write(&path, "protocol='responses'").unwrap();
+        assert!(matches!(
+            load_from(&path),
+            Err(ConfigError::InvalidExtension(actual)) if actual == path
+        ));
+    }
+
     const BASE_FILE: &str = r#"
+protocol = "responses"
 url = "https://file.example/v1"
 api_key = "file-key"
 model = "file-model"
 context_window_tokens = 131072
 model_input_modalities = ["text"]
+metrics = false
 "#;
 
     #[test]
     fn file_supplies_llm_and_defaults() {
-        let config =
-            load_fixture(Some(BASE_FILE), &[("FORMIC_LLM_PROTOCOL", "responses")]).unwrap();
+        let config = load_fixture(Some(BASE_FILE)).unwrap();
 
         assert_eq!(config.llm.protocol, Protocol::Responses);
         assert_eq!(config.llm.base_url, "https://file.example/v1");
@@ -836,6 +777,7 @@ model_input_modalities = ["text"]
         assert_eq!(config.llm.model, "file-model");
         assert_eq!(config.llm.context_window_tokens, 131072);
         assert_eq!(config.llm.input_modalities, InputModalities::Text);
+        assert!(!config.metrics_enabled);
         assert_eq!(config.llm.anthropic_max_tokens, None);
         assert!(config.llm.extra_body.is_empty());
         assert_eq!(config.llm.connect_timeout, Duration::from_millis(30_000));
@@ -866,10 +808,10 @@ model_input_modalities = ["text"]
     #[test]
     fn input_modalities_are_required_and_accept_only_current_combinations() {
         let without = BASE_FILE.replace("model_input_modalities = [\"text\"]\n", "");
-        let missing = load_fixture(Some(&without), &[("FORMIC_LLM_PROTOCOL", "responses")])
+        let missing = load_fixture(Some(&without))
             .err()
             .expect("输入模态必须显式声明");
-        assert!(missing.to_string().contains("FORMIC_LLM_INPUT_MODALITIES"));
+        assert!(missing.to_string().contains("model_input_modalities"));
 
         for invalid in [
             "[]",
@@ -882,19 +824,16 @@ model_input_modalities = ["text"]
                 &format!("model_input_modalities = {invalid}"),
             );
             assert!(matches!(
-                load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]),
+                load_fixture(Some(&file)),
                 Err(ConfigError::Invalid(_))
             ));
         }
 
-        let config = load_fixture(
-            Some(BASE_FILE),
-            &[
-                ("FORMIC_LLM_PROTOCOL", "responses"),
-                ("FORMIC_LLM_INPUT_MODALITIES", "text,image"),
-            ],
-        )
-        .unwrap();
+        let file = BASE_FILE.replace(
+            "model_input_modalities = [\"text\"]",
+            "model_input_modalities = [\"text\", \"image\"]",
+        );
+        let config = load_fixture(Some(&file)).unwrap();
         assert_eq!(config.llm.input_modalities, InputModalities::TextAndImage);
     }
 
@@ -902,7 +841,7 @@ model_input_modalities = ["text"]
     fn extra_body_json_accepts_nested_json_and_rejects_request_fields() {
         let extra = r#"{"temperature":0.2,"reasoning":{"effort":"high"},"nullable":null}"#;
         let file = format!("{BASE_FILE}\nextra_body_json = '''{extra}'''\n");
-        let config = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]).unwrap();
+        let config = load_fixture(Some(&file)).unwrap();
         assert_eq!(config.llm.extra_body["temperature"], 0.2);
         assert_eq!(config.llm.extra_body["reasoning"]["effort"], "high");
         assert!(config.llm.extra_body["nullable"].is_null());
@@ -913,8 +852,19 @@ model_input_modalities = ["text"]
             ("anthropic", "max_tokens"),
         ] {
             let extra = format!(r#"{{"{field}":[]}}"#);
-            let file = format!("{BASE_FILE}\nextra_body_json = '''{extra}'''\n");
-            let error = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", protocol)])
+            let file = format!(
+                "{}\nextra_body_json = '''{extra}'''\n",
+                BASE_FILE.replace(
+                    "protocol = \"responses\"",
+                    &format!("protocol = \"{protocol}\"")
+                )
+            );
+            let file = if protocol == "anthropic" {
+                format!("{file}\nanthropic_max_tokens = 16384\n")
+            } else {
+                file
+            };
+            let error = load_fixture(Some(&file))
                 .err()
                 .expect("协议请求字段必须由 Formic 管理");
             assert!(error.to_string().contains(field), "{error}");
@@ -926,7 +876,7 @@ model_input_modalities = ["text"]
         for extra in ["[1,2]", "{broken"] {
             let file = format!("{BASE_FILE}\nextra_body_json = '''{extra}'''\n");
             assert!(matches!(
-                load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]),
+                load_fixture(Some(&file)),
                 Err(ConfigError::Invalid(_))
             ));
         }
@@ -937,7 +887,7 @@ model_input_modalities = ["text"]
         let file = format!(
             "{BASE_FILE}\nconnect_timeout_ms=11\nread_timeout_ms=22\nrequest_timeout_ms=33\nretry_delays_ms=[]\nmax_retry_after_ms=44\nrequests_per_minute=55\n[execution]\nmax_concurrent_units=7\n"
         );
-        let config = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]).unwrap();
+        let config = load_fixture(Some(&file)).unwrap();
         assert_eq!(config.llm.connect_timeout, Duration::from_millis(11));
         assert_eq!(config.llm.read_timeout, Duration::from_millis(22));
         assert_eq!(config.llm.request_timeout, Duration::from_millis(33));
@@ -959,49 +909,27 @@ model_input_modalities = ["text"]
         ] {
             let file = format!("{BASE_FILE}\n{field}\n");
             assert!(
-                matches!(
-                    load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]),
-                    Err(ConfigError::Invalid(_))
-                ),
+                matches!(load_fixture(Some(&file)), Err(ConfigError::Invalid(_))),
                 "应拒绝 {field}"
             );
         }
     }
 
     #[test]
-    fn environment_overrides_every_llm_file_value() {
-        let config = load_fixture(
-            Some(BASE_FILE),
-            &[
-                ("FORMIC_LLM_PROTOCOL", "completions"),
-                ("FORMIC_LLM_BASE_URL", "https://env.example/v1"),
-                ("FORMIC_LLM_API_KEY", "env-key"),
-                ("FORMIC_LLM_MODEL", "env-model"),
-                ("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "200000"),
-            ],
-        )
-        .unwrap();
-
-        assert_eq!(config.llm.base_url, "https://env.example/v1");
-        assert_eq!(config.llm.api_key.as_deref(), Some("env-key"));
-        assert_eq!(config.llm.model, "env-model");
-        assert_eq!(config.llm.context_window_tokens, 200000);
-        assert_eq!(config.llm.anthropic_max_tokens, None);
+    fn metrics_is_selected_only_by_toml() {
+        let file = BASE_FILE.replace("metrics = false", "metrics = true");
+        let config = load_fixture(Some(&file)).unwrap();
+        assert!(config.metrics_enabled);
     }
 
     #[test]
-    fn missing_context_names_both_sources() {
-        let error = load_fixture(
-            Some("url='x'\nmodel='m'\n"),
-            &[("FORMIC_LLM_PROTOCOL", "responses")],
-        )
+    fn missing_context_names_toml_field() {
+        let error = load_fixture(Some(
+            "protocol='responses'\nurl='x'\nmodel='m'\nmodel_input_modalities=['text']\n",
+        ))
         .err()
         .expect("应拒绝无效配置");
         let message = error.to_string();
-        assert!(
-            message.contains("FORMIC_LLM_CONTEXT_WINDOW_TOKENS"),
-            "{message}"
-        );
         assert!(message.contains("context_window_tokens"), "{message}");
     }
 
@@ -1009,47 +937,38 @@ model_input_modalities = ["text"]
     fn unknown_fields_and_zero_values_are_rejected() {
         let unknown = format!("{BASE_FILE}\nunknown = 1\n");
         assert!(matches!(
-            load_fixture(Some(&unknown), &[("FORMIC_LLM_PROTOCOL", "responses")]),
+            load_fixture(Some(&unknown)),
             Err(ConfigError::Parse { .. })
         ));
         let zero = format!("{BASE_FILE}\n[tools]\nmax_result_bytes = 0\n");
-        let error = load_fixture(Some(&zero), &[("FORMIC_LLM_PROTOCOL", "responses")])
-            .err()
-            .expect("应拒绝无效配置");
+        let error = load_fixture(Some(&zero)).err().expect("应拒绝无效配置");
         assert!(error.to_string().contains("tools.max_result_bytes"));
     }
 
     #[test]
     fn context_reserve_must_leave_input_room() {
-        let file = "url='x'\nmodel='m'\ncontext_window_tokens=100\nmodel_input_modalities=['text']\n[execution]\ncontext_safety_tokens=100\n";
-        let error = load_fixture(Some(file), &[("FORMIC_LLM_PROTOCOL", "responses")])
-            .err()
-            .expect("应拒绝无效配置");
+        let file = "protocol='responses'\nurl='x'\nmodel='m'\ncontext_window_tokens=100\nmodel_input_modalities=['text']\n[execution]\ncontext_safety_tokens=100\n";
+        let error = load_fixture(Some(file)).err().expect("应拒绝无效配置");
         assert!(error.to_string().contains("必须大于"));
     }
 
     #[test]
     fn anthropic_max_tokens_is_required_and_protocol_specific() {
-        let missing = load_fixture(Some(BASE_FILE), &[("FORMIC_LLM_PROTOCOL", "anthropic")])
+        let anthropic = BASE_FILE.replace("protocol = \"responses\"", "protocol = \"anthropic\"");
+        let missing = load_fixture(Some(&anthropic))
             .err()
             .expect("Anthropic 必须显式配置协议必填参数");
         assert!(
-            missing.to_string().contains("FORMIC_ANTHROPIC_MAX_TOKENS"),
+            missing.to_string().contains("anthropic_max_tokens"),
             "{missing}"
         );
 
-        let config = load_fixture(
-            Some(BASE_FILE),
-            &[
-                ("FORMIC_LLM_PROTOCOL", "anthropic"),
-                ("FORMIC_ANTHROPIC_MAX_TOKENS", "20000"),
-            ],
-        )
-        .unwrap();
+        let anthropic = format!("{anthropic}\nanthropic_max_tokens=20000\n");
+        let config = load_fixture(Some(&anthropic)).unwrap();
         assert_eq!(config.llm.anthropic_max_tokens, Some(20000));
 
         let file = format!("{BASE_FILE}\nanthropic_max_tokens=1000\n");
-        let error = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")])
+        let error = load_fixture(Some(&file))
             .err()
             .expect("其他协议不得携带 Anthropic 专属参数");
         assert!(error.to_string().contains("只允许用于 anthropic"));
@@ -1057,10 +976,8 @@ model_input_modalities = ["text"]
 
     #[test]
     fn anthropic_reserve_must_leave_input_room() {
-        let file = "url='x'\nmodel='m'\ncontext_window_tokens=100\nmodel_input_modalities=['text']\nanthropic_max_tokens=90\n[execution]\ncontext_safety_tokens=10\n";
-        let error = load_fixture(Some(file), &[("FORMIC_LLM_PROTOCOL", "anthropic")])
-            .err()
-            .expect("应拒绝无效配置");
+        let file = "protocol='anthropic'\nurl='x'\nmodel='m'\ncontext_window_tokens=100\nmodel_input_modalities=['text']\nanthropic_max_tokens=90\n[execution]\ncontext_safety_tokens=10\n";
+        let error = load_fixture(Some(file)).err().expect("应拒绝无效配置");
         assert!(error.to_string().contains("必须大于"));
     }
 
@@ -1068,8 +985,7 @@ model_input_modalities = ["text"]
     fn enabled_mcp_auto_discovers_tools_and_requires_one_transport() {
         let automatic =
             format!("{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\nurl='http://localhost/mcp'\n");
-        let config =
-            load_fixture(Some(&automatic), &[("FORMIC_LLM_PROTOCOL", "responses")]).unwrap();
+        let config = load_fixture(Some(&automatic)).unwrap();
         let automatic = &config.mcp_servers["demo"];
         assert!(automatic.enabled_tools.is_none());
         assert_eq!(automatic.session_scope, SessionScope::Job);
@@ -1083,44 +999,30 @@ model_input_modalities = ["text"]
         let explicit_no_reconnect = format!(
             "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\nurl='http://localhost/mcp'\nreconnect=false\n"
         );
-        let config = load_fixture(
-            Some(&explicit_no_reconnect),
-            &[("FORMIC_LLM_PROTOCOL", "responses")],
-        )
-        .unwrap();
+        let config = load_fixture(Some(&explicit_no_reconnect)).unwrap();
         assert!(!config.mcp_servers["demo"].reconnect);
 
         let conflict = format!(
             "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\nurl='http://localhost/mcp'\ncommand='server'\n"
         );
-        let error = load_fixture(Some(&conflict), &[("FORMIC_LLM_PROTOCOL", "responses")])
-            .err()
-            .expect("应拒绝无效配置");
+        let error = load_fixture(Some(&conflict)).err().expect("应拒绝无效配置");
         assert!(error.to_string().contains("互斥"));
 
         let empty = format!(
             "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\nurl='http://localhost/mcp'\nenabled_tools=[]\n"
         );
-        let error = load_fixture(Some(&empty), &[("FORMIC_LLM_PROTOCOL", "responses")])
+        let error = load_fixture(Some(&empty))
             .err()
             .expect("显式空允许列表没有可执行含义");
         assert!(error.to_string().contains("若配置则不能为空"));
     }
 
     #[test]
-    fn mcp_environment_secrets_override_plaintext() {
+    fn mcp_http_secrets_come_directly_from_toml() {
         let file = format!(
-            "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\nurl='http://localhost/mcp'\nbearer_token='plain'\nbearer_token_env='TOKEN'\nenabled_tools=['search']\n[mcp_servers.demo.header_env]\nx-key='HEADER_TOKEN'\n"
+            "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\nurl='http://localhost/mcp'\nbearer_token='toml-token'\nheaders={{x-key='toml-header'}}\nenabled_tools=['search']\n"
         );
-        let config = load_fixture(
-            Some(&file),
-            &[
-                ("FORMIC_LLM_PROTOCOL", "responses"),
-                ("TOKEN", "environment"),
-                ("HEADER_TOKEN", "header-secret"),
-            ],
-        )
-        .unwrap();
+        let config = load_fixture(Some(&file)).unwrap();
         let server = &config.mcp_servers["demo"];
         let McpTransportConfig::Http {
             bearer_token,
@@ -1130,8 +1032,25 @@ model_input_modalities = ["text"]
         else {
             panic!("应解析为 HTTP")
         };
-        assert_eq!(bearer_token.as_deref(), Some("environment"));
-        assert_eq!(headers["x-key"], "header-secret");
+        assert_eq!(bearer_token.as_deref(), Some("toml-token"));
+        assert_eq!(headers["x-key"], "toml-header");
+    }
+
+    #[test]
+    fn environment_indirection_fields_are_rejected() {
+        for legacy in [
+            "bearer_token_env='TOKEN'",
+            "header_env={x-key='TOKEN'}",
+            "env_vars={TOKEN='SOURCE_TOKEN'}",
+        ] {
+            let file = format!(
+                "{BASE_FILE}\n[mcp_servers.demo]\nenabled=false\nurl='http://localhost/mcp'\n{legacy}\n"
+            );
+            assert!(matches!(
+                load_fixture(Some(&file)),
+                Err(ConfigError::Parse { .. })
+            ));
+        }
     }
 
     #[test]
@@ -1139,7 +1058,7 @@ model_input_modalities = ["text"]
         let file = format!(
             "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\ncommand='server'\nenabled_tools=['search']\nmax_in_flight=7\nmax_result_bytes=4567\n[mcp_servers.demo.tool_limits.search]\n"
         );
-        let config = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")]).unwrap();
+        let config = load_fixture(Some(&file)).unwrap();
         let limit = &config.mcp_servers["demo"].tool_limits["search"];
         assert_eq!(limit.max_in_flight, 7);
     }
@@ -1149,8 +1068,7 @@ model_input_modalities = ["text"]
         let explicit = format!(
             "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\ncommand='server'\nmax_message_bytes=8388608\n"
         );
-        let config =
-            load_fixture(Some(&explicit), &[("FORMIC_LLM_PROTOCOL", "responses")]).unwrap();
+        let config = load_fixture(Some(&explicit)).unwrap();
         assert_eq!(
             config.mcp_servers["demo"].max_message_bytes,
             Some(8_388_608)
@@ -1159,7 +1077,7 @@ model_input_modalities = ["text"]
         let zero = format!(
             "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\ncommand='server'\nmax_message_bytes=0\n"
         );
-        let error = load_fixture(Some(&zero), &[("FORMIC_LLM_PROTOCOL", "responses")])
+        let error = load_fixture(Some(&zero))
             .err()
             .expect("MCP 原始消息上限必须是正整数");
         assert!(error.to_string().contains("max_message_bytes"));
@@ -1170,7 +1088,7 @@ model_input_modalities = ["text"]
         let file = format!(
             "{BASE_FILE}\n[mcp_servers.demo]\nenabled=true\ncommand='server'\nenabled_tools=['search']\nmax_result_bytes=1024\n[mcp_servers.demo.tool_limits.search]\nmax_result_bytes=512\n"
         );
-        let error = load_fixture(Some(&file), &[("FORMIC_LLM_PROTOCOL", "responses")])
+        let error = load_fixture(Some(&file))
             .err()
             .expect("公共 MCP 结果流无法提供互不相同的解码前上限");
         assert!(
@@ -1182,12 +1100,9 @@ model_input_modalities = ["text"]
 
     #[test]
     fn parse_error_does_not_expose_plaintext_api_key() {
-        let error = load_fixture(
-            Some("api_key = \"secret-value\"\nmodel = [\n"),
-            &[("FORMIC_LLM_PROTOCOL", "responses")],
-        )
-        .err()
-        .expect("应拒绝无效配置");
+        let error = load_fixture(Some("api_key = \"secret-value\"\nmodel = [\n"))
+            .err()
+            .expect("应拒绝无效配置");
 
         assert!(!error.to_string().contains("secret-value"));
         assert!(!format!("{error:?}").contains("secret-value"));

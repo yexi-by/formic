@@ -1079,18 +1079,13 @@ fn run_formic_with_capabilities(
 ) -> Output {
     let mut command =
         formic_command_with_access(concurrency, data, plan, task, out, worker_output_access);
-    command
-        .env("FORMIC_LLM_PROTOCOL", protocol)
-        .env("FORMIC_LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env("FORMIC_LLM_INPUT_MODALITIES", input_modalities)
-        .env_remove("FORMIC_LLM_API_KEY");
-    if protocol == "anthropic" {
-        command.env("FORMIC_ANTHROPIC_MAX_TOKENS", "16384");
-    } else {
-        command.env_remove("FORMIC_ANTHROPIC_MAX_TOKENS");
-    }
+    command.arg("--config").arg(write_mock_config(
+        plan.parent().expect("测试计划文件有父目录"),
+        protocol,
+        port,
+        131_072,
+        input_modalities,
+    ));
     command.output().unwrap()
 }
 
@@ -1106,12 +1101,14 @@ fn run_formic_resume(
     let mut command = formic_command(concurrency, data, plan, task, out);
     command
         .arg("--resume")
-        .env("FORMIC_LLM_PROTOCOL", protocol)
-        .env("FORMIC_LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS");
+        .arg("--config")
+        .arg(write_mock_config(
+            plan.parent().expect("测试计划文件有父目录"),
+            protocol,
+            port,
+            131_072,
+            "text",
+        ));
     command.output().unwrap()
 }
 
@@ -1136,7 +1133,6 @@ fn formic_command_with_access(
     let mut command = Command::new(env!("CARGO_BIN_EXE_formic"));
     command
         .current_dir(plan.parent().expect("测试计划文件有父目录"))
-        .env("FORMIC_LLM_INPUT_MODALITIES", "text")
         .arg("run")
         .arg("--data")
         .arg(data)
@@ -1151,6 +1147,51 @@ fn formic_command_with_access(
         .arg("--concurrency")
         .arg(concurrency.to_string());
     command
+}
+
+fn write_mock_config(
+    directory: &Path,
+    protocol: &str,
+    port: u16,
+    context_window_tokens: u64,
+    input_modalities: &str,
+) -> PathBuf {
+    let existing_path = directory.join("config.toml");
+    let existing = fs::read_to_string(&existing_path).unwrap_or_default();
+    if existing
+        .lines()
+        .any(|line| line.trim_start().starts_with("protocol"))
+    {
+        return existing_path;
+    }
+    let path = directory.join("formic-test.toml");
+    let modalities = match input_modalities {
+        "text" => "[\"text\"]",
+        "text,image" => "[\"text\", \"image\"]",
+        other => other,
+    };
+    let anthropic = if protocol == "anthropic" {
+        "anthropic_max_tokens = 16384\n"
+    } else {
+        ""
+    };
+    fs::write(
+        &path,
+        format!(
+            concat!(
+                "protocol = \"{}\"\n",
+                "url = \"http://127.0.0.1:{}/v1\"\n",
+                "model = \"test-model\"\n",
+                "context_window_tokens = {}\n",
+                "model_input_modalities = {}\n",
+                "{}",
+                "{}",
+            ),
+            protocol, port, context_window_tokens, modalities, anthropic, existing,
+        ),
+    )
+    .unwrap();
+    path
 }
 
 #[cfg(windows)]
@@ -1201,16 +1242,14 @@ fn run_structured_formic(
     command
         .arg("--output-schema")
         .arg(schema)
-        .env("FORMIC_LLM_PROTOCOL", protocol)
-        .env("FORMIC_LLM_BASE_URL", format!("http://127.0.0.1:{port}/v1"))
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env_remove("FORMIC_LLM_API_KEY");
-    if protocol == "anthropic" {
-        command.env("FORMIC_ANTHROPIC_MAX_TOKENS", "16384");
-    } else {
-        command.env_remove("FORMIC_ANTHROPIC_MAX_TOKENS");
-    }
+        .arg("--config")
+        .arg(write_mock_config(
+            plan.parent().expect("测试计划文件有父目录"),
+            protocol,
+            port,
+            131_072,
+            "text",
+        ));
     command.output().unwrap()
 }
 
@@ -1643,17 +1682,14 @@ fn initial_mixed_image_shards_reach_all_protocols_without_public_base64() {
         let mut resume = formic_command_with_access(1, &data, &plan, &task, &out, "none");
         resume
             .arg("--resume")
-            .env("FORMIC_LLM_PROTOCOL", protocol)
-            .env(
-                "FORMIC_LLM_BASE_URL",
-                format!("http://127.0.0.1:{}/v1", mock.port),
-            )
-            .env("FORMIC_LLM_MODEL", "test-model")
-            .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-            .env("FORMIC_LLM_INPUT_MODALITIES", "text");
-        if protocol == "anthropic" {
-            resume.env("FORMIC_ANTHROPIC_MAX_TOKENS", "16384");
-        }
+            .arg("--config")
+            .arg(write_mock_config(
+                dir.path(),
+                protocol,
+                mock.port,
+                131_072,
+                "text",
+            ));
         let resumed = resume.output().unwrap();
         assert_eq!(resumed.status.code(), Some(2), "{protocol}");
         assert!(stderr_of(&resumed).contains("模型输入模态"), "{protocol}");
@@ -1789,8 +1825,15 @@ fn mcp_images_are_archived_once_and_only_references_enter_public_audit() {
     fs::write(
         dir.path().join("config.toml"),
         format!(
-            "[mcp_servers.demo]\nenabled=true\nurl='http://127.0.0.1:{}/mcp'\n",
-            mcp.port
+            concat!(
+                "protocol='completions'\n",
+                "url='http://127.0.0.1:{}/v1'\n",
+                "model='test-model'\n",
+                "context_window_tokens=131072\n",
+                "model_input_modalities=['text','image']\n",
+                "[mcp_servers.demo]\nenabled=true\nurl='http://127.0.0.1:{}/mcp'\n",
+            ),
+            llm.port, mcp.port,
         ),
     )
     .unwrap();
@@ -1863,14 +1906,14 @@ fn mcp_media_archive_failure_fails_worker_without_replaying_remote_call() {
     .unwrap();
     let mut command = formic_command_with_access(1, &data, &plan, &task, &out, "none");
     command
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env(
-            "FORMIC_LLM_BASE_URL",
-            format!("http://127.0.0.1:{}/v1", llm.port),
-        )
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env("FORMIC_LLM_INPUT_MODALITIES", "text,image")
+        .arg("--config")
+        .arg(write_mock_config(
+            dir.path(),
+            "completions",
+            llm.port,
+            131_072,
+            "text,image",
+        ))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let child = command.spawn().unwrap();
@@ -1910,6 +1953,7 @@ fn worker_output_access_is_required_before_startup() {
     let dir = tempfile::tempdir().unwrap();
     let (data, plan, task, out) = write_job(dir.path(), None);
     let mock = start_mock();
+    let config = write_mock_config(dir.path(), "completions", mock.port, 131_072, "text");
     let output = Command::new(env!("CARGO_BIN_EXE_formic"))
         .current_dir(dir.path())
         .arg("run")
@@ -1921,14 +1965,8 @@ fn worker_output_access_is_required_before_startup() {
         .arg(&task)
         .arg("--out")
         .arg(&out)
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env(
-            "FORMIC_LLM_BASE_URL",
-            format!("http://127.0.0.1:{}/v1", mock.port),
-        )
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env("FORMIC_LLM_INPUT_MODALITIES", "text")
+        .arg("--config")
+        .arg(config)
         .output()
         .unwrap();
 
@@ -1943,20 +1981,19 @@ fn model_input_modalities_are_required_before_startup() {
     let dir = tempfile::tempdir().unwrap();
     let (data, plan, task, out) = write_job(dir.path(), None);
     let mock = start_mock();
+    let config = dir.path().join("missing-modalities.toml");
+    fs::write(
+        &config,
+        format!(
+            "protocol='completions'\nurl='http://127.0.0.1:{}/v1'\nmodel='test-model'\ncontext_window_tokens=131072\n",
+            mock.port
+        ),
+    )
+    .unwrap();
     let mut command = formic_command(1, &data, &plan, &task, &out);
-    let output = command
-        .env_remove("FORMIC_LLM_INPUT_MODALITIES")
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env(
-            "FORMIC_LLM_BASE_URL",
-            format!("http://127.0.0.1:{}/v1", mock.port),
-        )
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .output()
-        .unwrap();
+    let output = command.arg("--config").arg(config).output().unwrap();
     assert_eq!(output.status.code(), Some(2));
-    assert!(stderr_of(&output).contains("FORMIC_LLM_INPUT_MODALITIES"));
+    assert!(stderr_of(&output).contains("model_input_modalities"));
     assert!(mock.requests.lock().unwrap().is_empty());
     assert!(!out.exists());
 }
@@ -2051,13 +2088,14 @@ fn resume_rejects_changed_worker_output_access_before_request() {
     let mut command = formic_command_with_access(2, &data, &plan, &task, &out, "none");
     let resumed = command
         .arg("--resume")
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env(
-            "FORMIC_LLM_BASE_URL",
-            format!("http://127.0.0.1:{}/v1", mock.port),
-        )
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
+        .arg("--config")
+        .arg(write_mock_config(
+            dir.path(),
+            "completions",
+            mock.port,
+            131_072,
+            "text",
+        ))
         .output()
         .unwrap();
 
@@ -2218,25 +2256,25 @@ fn context_budget_compacts_complete_tool_group_then_continues() {
     )
     .unwrap();
     let out = dir.path().join("out");
+    let mock = start_mock();
     fs::write(
         dir.path().join("config.toml"),
-        "[execution]\ncontext_safety_tokens = 500\n[tools.read]\nmax_result_bytes = 30000\n",
+        format!(
+            concat!(
+                "protocol='completions'\n",
+                "url='http://127.0.0.1:{}/v1'\n",
+                "model='test-model'\n",
+                "context_window_tokens=5700\n",
+                "model_input_modalities=['text']\n",
+                "[execution]\ncontext_safety_tokens=500\n",
+                "[tools.read]\nmax_result_bytes=30000\n",
+            ),
+            mock.port,
+        ),
     )
     .unwrap();
-    let mock = start_mock();
     let mut command = formic_command(1, &data, &plan, &task, &out);
-    let output = command
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env(
-            "FORMIC_LLM_BASE_URL",
-            format!("http://127.0.0.1:{}/v1", mock.port),
-        )
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "5700")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .output()
-        .unwrap();
+    let output = command.output().unwrap();
     assert_eq!(
         output.status.code(),
         Some(0),
@@ -2354,7 +2392,7 @@ fn config_file_supplies_http_settings() {
     fs::write(
         &config_path,
         format!(
-            "url = \"http://127.0.0.1:{}/v1\"\napi_key = \"{}\"\nmodel = \"config-model\"\ncontext_window_tokens = 131072\nextra_body_json = '''{extra_body}'''\n",
+            "protocol = \"completions\"\nurl = \"http://127.0.0.1:{}/v1\"\napi_key = \"{}\"\nmodel = \"config-model\"\ncontext_window_tokens = 131072\nmodel_input_modalities = [\"text\"]\nextra_body_json = '''{extra_body}'''\n",
             mock.port, LLM_API_KEY_SECRET,
         ),
     )
@@ -2365,12 +2403,18 @@ fn config_file_supplies_http_settings() {
         .arg("--config")
         .arg(&config_path)
         .current_dir(dir.path())
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env_remove("FORMIC_LLM_BASE_URL")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_LLM_MODEL")
-        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
+        .env("FORMIC_LLM_PROTOCOL", "anthropic")
+        .env("FORMIC_LLM_BASE_URL", "http://127.0.0.1:1/wrong")
+        .env("FORMIC_LLM_API_KEY", "wrong-environment-key")
+        .env("FORMIC_LLM_MODEL", "wrong-environment-model")
+        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "1")
+        .env("FORMIC_LLM_INPUT_MODALITIES", "image")
+        .env("FORMIC_ANTHROPIC_MAX_TOKENS", "1")
+        .env("FORMIC_METRICS", "1")
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
         .output()
         .unwrap();
 
@@ -2421,6 +2465,12 @@ fn config_file_supplies_http_settings() {
     for secret in [LLM_API_KEY_SECRET, LLM_EXTRA_BODY_SECRET] {
         assert!(!public.contains(secret), "LLM 密钥不得进入任何作业产物");
     }
+    assert!(
+        !stderr_of(&output)
+            .lines()
+            .any(|line| line.starts_with("metrics ")),
+        "环境变量不能开启 metrics"
+    );
 }
 
 #[test]
@@ -2433,15 +2483,6 @@ fn explicitly_selected_missing_config_fails_before_any_request() {
     let output = formic_command(1, &data, &plan, &task, &out)
         .arg("--config")
         .arg(&missing)
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env(
-            "FORMIC_LLM_BASE_URL",
-            format!("http://127.0.0.1:{}/v1", mock.port),
-        )
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
         .output()
         .unwrap();
 
@@ -2466,9 +2507,11 @@ fn custom_stdio_mcp_auto_discovers_all_tools_and_is_audited() {
         dir.path().join("config.toml"),
         format!(
             concat!(
+                "protocol = \"completions\"\n",
                 "url = \"http://127.0.0.1:{}/v1\"\n",
                 "model = \"test-model\"\n",
                 "context_window_tokens = 131072\n",
+                "model_input_modalities = [\"text\"]\n",
                 "[tools.search]\nenabled = false\n",
                 "[tools.read]\nenabled = false\n",
                 "[mcp_servers.demo]\n",
@@ -2489,16 +2532,7 @@ fn custom_stdio_mcp_auto_discovers_all_tools_and_is_audited() {
     .unwrap();
 
     let mut command = formic_command(2, &data, &plan, &task, &out);
-    let output = command
-        .current_dir(dir.path())
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env_remove("FORMIC_LLM_BASE_URL")
-        .env_remove("FORMIC_LLM_MODEL")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
-        .output()
-        .unwrap();
+    let output = command.current_dir(dir.path()).output().unwrap();
 
     assert_eq!(
         output.status.code(),
@@ -2570,8 +2604,9 @@ fn job_scoped_stdio_transport_close_is_returned_to_all_waiters_without_replay() 
         dir.path().join("config.toml"),
         format!(
             concat!(
+                "protocol = \"completions\"\n",
                 "url = \"http://127.0.0.1:{}/v1\"\n",
-                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\nmodel_input_modalities = [\"text\"]\n",
                 "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
                 "[mcp_servers.demo]\nenabled = true\ncommand = {}\n",
                 "env = {{ FAKE_MCP_START_LOG = {}, FAKE_MCP_CALL_LOG = {}, FAKE_MCP_EXIT_AFTER_CALLS = \"2\" }}\n",
@@ -2587,15 +2622,7 @@ fn job_scoped_stdio_transport_close_is_returned_to_all_waiters_without_replay() 
     .unwrap();
 
     let mut command = formic_command(2, &data, &plan, &task, &out);
-    let output = command
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env_remove("FORMIC_LLM_BASE_URL")
-        .env_remove("FORMIC_LLM_MODEL")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
-        .output()
-        .unwrap();
+    let output = command.output().unwrap();
 
     assert_eq!(
         output.status.code(),
@@ -2664,8 +2691,9 @@ fn stdio_message_limit_can_exceed_result_limit_and_the_session_is_reused() {
         dir.path().join("config.toml"),
         format!(
             concat!(
+                "protocol = \"completions\"\n",
                 "url = \"http://127.0.0.1:{}/v1\"\n",
-                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\nmodel_input_modalities = [\"text\"]\n",
                 "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
                 "[mcp_servers.demo]\nenabled = true\ncommand = {}\n",
                 "env = {{ FAKE_MCP_START_LOG = {}, FAKE_MCP_CALL_LOG = {}, FAKE_MCP_RESULT_TEXT_BYTES = \"102400\" }}\n",
@@ -2682,15 +2710,7 @@ fn stdio_message_limit_can_exceed_result_limit_and_the_session_is_reused() {
     .unwrap();
 
     let mut command = formic_command(1, &data, &plan, &task, &out);
-    let output = command
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env_remove("FORMIC_LLM_BASE_URL")
-        .env_remove("FORMIC_LLM_MODEL")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
-        .output()
-        .unwrap();
+    let output = command.output().unwrap();
 
     assert_eq!(
         output.status.code(),
@@ -2756,8 +2776,9 @@ fn explicit_mcp_tool_error_is_returned_to_the_model() {
         dir.path().join("config.toml"),
         format!(
             concat!(
+                "protocol = \"completions\"\n",
                 "url = \"http://127.0.0.1:{}/v1\"\n",
-                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\nmodel_input_modalities = [\"text\"]\n",
                 "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
                 "[mcp_servers.demo]\nenabled = true\ncommand = {}\n",
                 "env = {{ FAKE_MCP_CALL_LOG = {} }}\n",
@@ -2772,15 +2793,7 @@ fn explicit_mcp_tool_error_is_returned_to_the_model() {
     .unwrap();
 
     let mut command = formic_command(1, &data, &plan, &task, &out);
-    let output = command
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env_remove("FORMIC_LLM_BASE_URL")
-        .env_remove("FORMIC_LLM_MODEL")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
-        .output()
-        .unwrap();
+    let output = command.output().unwrap();
 
     assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
     assert_eq!(fs::read_to_string(call_log).unwrap().lines().count(), 1);
@@ -2811,8 +2824,9 @@ fn one_worker_runs_same_turn_mcp_calls_concurrently() {
         dir.path().join("config.toml"),
         format!(
             concat!(
+                "protocol = \"completions\"\n",
                 "url = \"http://127.0.0.1:{}/v1\"\n",
-                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\nmodel_input_modalities = [\"text\"]\n",
                 "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
                 "[mcp_servers.left]\nenabled = true\ncommand = {}\n",
                 "env = {{ FAKE_MCP_CALL_LOG = {} }}\n",
@@ -2833,15 +2847,7 @@ fn one_worker_runs_same_turn_mcp_calls_concurrently() {
     .unwrap();
 
     let mut command = formic_command(1, &data, &plan, &task, &out);
-    let output = command
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env_remove("FORMIC_LLM_BASE_URL")
-        .env_remove("FORMIC_LLM_MODEL")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
-        .output()
-        .unwrap();
+    let output = command.output().unwrap();
 
     assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
     let call_started_ms = |path: &Path| {
@@ -2889,8 +2895,9 @@ fn parallel_mcp_timeout_keeps_call_order_then_uses_backup_and_publishes() {
         dir.path().join("config.toml"),
         format!(
             concat!(
+                "protocol = \"completions\"\n",
                 "url = \"http://127.0.0.1:{}/v1\"\n",
-                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\nmodel_input_modalities = [\"text\"]\n",
                 "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
                 "[mcp_servers.slow]\nenabled = true\ncommand = {}\n",
                 "env = {{ FAKE_MCP_CALL_LOG = {} }}\n",
@@ -2917,15 +2924,7 @@ fn parallel_mcp_timeout_keeps_call_order_then_uses_backup_and_publishes() {
     .unwrap();
 
     let mut command = formic_command(1, &data, &plan, &task, &out);
-    let output = command
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env_remove("FORMIC_LLM_BASE_URL")
-        .env_remove("FORMIC_LLM_MODEL")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
-        .output()
-        .unwrap();
+    let output = command.output().unwrap();
 
     assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
     let call_started_ms = |path: &Path| {
@@ -3028,8 +3027,9 @@ fn stdio_mcp_unit_scope_creates_and_reclaims_one_session_per_unit() {
         dir.path().join("config.toml"),
         format!(
             concat!(
+                "protocol = \"completions\"\n",
                 "url = \"http://127.0.0.1:{}/v1\"\n",
-                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\nmodel_input_modalities = [\"text\"]\n",
                 "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
                 "[mcp_servers.demo]\nenabled = true\ncommand = {}\n",
                 "env = {{ FAKE_MCP_START_LOG = {}, FAKE_MCP_CALL_LOG = {} }}\n",
@@ -3044,12 +3044,10 @@ fn stdio_mcp_unit_scope_creates_and_reclaims_one_session_per_unit() {
     .unwrap();
     let mut command = formic_command(2, &data, &plan, &task, &out);
     let output = command
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env_remove("FORMIC_LLM_BASE_URL")
-        .env_remove("FORMIC_LLM_MODEL")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
@@ -3074,8 +3072,9 @@ fn timed_out_mcp_call_is_returned_to_model_without_replay() {
         dir.path().join("config.toml"),
         format!(
             concat!(
+                "protocol = \"completions\"\n",
                 "url = \"http://127.0.0.1:{}/v1\"\n",
-                "model = \"test-model\"\ncontext_window_tokens = 131072\n",
+                "model = \"test-model\"\ncontext_window_tokens = 131072\nmodel_input_modalities = [\"text\"]\n",
                 "[tools.search]\nenabled = false\n[tools.read]\nenabled = false\n",
                 "[mcp_servers.demo]\nenabled = true\ncommand = {}\n",
                 "env = {{ FAKE_MCP_CALL_LOG = {} }}\n",
@@ -3089,12 +3088,6 @@ fn timed_out_mcp_call_is_returned_to_model_without_replay() {
     .unwrap();
     let mut command = formic_command(1, &data, &plan, &task, &out);
     let mut child = command
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env_remove("FORMIC_LLM_BASE_URL")
-        .env_remove("FORMIC_LLM_MODEL")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3156,9 +3149,11 @@ fn custom_streamable_http_mcp_uses_session_auth_and_frozen_catalog() {
         dir.path().join("config.toml"),
         format!(
             concat!(
+                "protocol = \"completions\"\n",
                 "url = \"http://127.0.0.1:{}/v1\"\n",
                 "model = \"test-model\"\n",
                 "context_window_tokens = 131072\n",
+                "model_input_modalities = [\"text\"]\n",
                 "[tools.search]\nenabled = false\n",
                 "[tools.read]\nenabled = false\n",
                 "[mcp_servers.demo]\n",
@@ -3176,12 +3171,10 @@ fn custom_streamable_http_mcp_uses_session_auth_and_frozen_catalog() {
     .unwrap();
     let mut command = formic_command(2, &data, &plan, &task, &out);
     let output = command
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env_remove("FORMIC_LLM_BASE_URL")
-        .env_remove("FORMIC_LLM_MODEL")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_LLM_CONTEXT_WINDOW_TOKENS")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("HTTPS_PROXY", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("NO_PROXY", "")
         .output()
         .unwrap();
     assert_eq!(
@@ -3586,15 +3579,14 @@ fn cancelled_run_resumes_in_the_same_output_directory() {
     let mock = start_mock_with_delay(1000);
     let mut command = formic_command(1, &data, &plan, &task, &out);
     command
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env(
-            "FORMIC_LLM_BASE_URL",
-            format!("http://127.0.0.1:{}/v1", mock.port),
-        )
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env_remove("FORMIC_LLM_API_KEY")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
+        .arg("--config")
+        .arg(write_mock_config(
+            dir.path(),
+            "completions",
+            mock.port,
+            131_072,
+            "text",
+        ))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     make_interruptible(&mut command);
@@ -3703,14 +3695,14 @@ fn wrong_structured_resume_is_read_only_and_correct_text_resume_still_succeeds()
         .arg("--resume")
         .arg("--output-schema")
         .arg(&schema)
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env(
-            "FORMIC_LLM_BASE_URL",
-            format!("http://127.0.0.1:{}/v1", mock.port),
-        )
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env_remove("FORMIC_LLM_API_KEY")
+        .arg("--config")
+        .arg(write_mock_config(
+            dir.path(),
+            "completions",
+            mock.port,
+            131_072,
+            "text",
+        ))
         .output()
         .unwrap();
 
@@ -3956,15 +3948,14 @@ fn concurrent_jobs_cannot_share_an_output_directory() {
 
     let mut first_command = formic_command(1, &data, &plan, &task, &out);
     first_command
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env(
-            "FORMIC_LLM_BASE_URL",
-            format!("http://127.0.0.1:{}/v1", mock.port),
-        )
-        .env("FORMIC_LLM_MODEL", "test-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env_remove("FORMIC_ANTHROPIC_MAX_TOKENS")
-        .env_remove("FORMIC_LLM_API_KEY")
+        .arg("--config")
+        .arg(write_mock_config(
+            dir.path(),
+            "completions",
+            mock.port,
+            131_072,
+            "text",
+        ))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut first = first_command.spawn().unwrap();

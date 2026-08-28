@@ -441,7 +441,7 @@ impl BoundedHttpClient {
     fn new(max_message_bytes: usize) -> Result<Self, reqwest_mcp::Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
         Ok(Self {
-            inner: reqwest_mcp::Client::builder().build()?,
+            inner: reqwest_mcp::Client::builder().no_proxy().build()?,
             max_message_bytes,
             in_flight: Arc::new(std::sync::Mutex::new(HashMap::new())),
             transport_cancel: tokio_util::sync::CancellationToken::new(),

@@ -2,7 +2,7 @@
 //! （检索「苹果」），携带工具结果的请求返回最终文本。按请求路径区分三种协议。
 //!
 //! 用法：`cargo run --example mock_llm -- [端口=18080]`，然后把
-//! FORMIC_LLM_BASE_URL 指向打印出的地址，并设置模型名、上下文和输入模态后即可跑通。
+//! 把打印出的地址与模型、上下文、输入模态一起写入 TOML 后即可跑通。
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -78,7 +78,7 @@ fn main() {
     let port: u16 = args.next().and_then(|s| s.parse().ok()).unwrap_or(18080);
     let delay_ms: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0);
     let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
-    println!("mock LLM 就绪，FORMIC_LLM_BASE_URL=http://127.0.0.1:{port}/v1（延迟 {delay_ms}ms）");
+    println!("mock LLM 就绪，TOML url=http://127.0.0.1:{port}/v1（延迟 {delay_ms}ms）");
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {

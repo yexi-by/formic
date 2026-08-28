@@ -165,7 +165,7 @@ llm_calls = llm_calls_with_provider_usage + llm_calls_without_provider_usage
 
 ## 8. 进程级 metrics
 
-设置 `FORMIC_METRICS=1` 后，Formic 每 250 毫秒向 stderr 输出一行：
+在 TOML 中设置 `metrics = true` 后，Formic 每 250 毫秒向 stderr 输出一行：
 
 ```text
 metrics rss_mb=... llm_in_flight=... tool_inflight=... history_kb=... search_avg_ms=... search_max_ms=... done=... failed=... cancelled=...

@@ -26,18 +26,14 @@ Windows 产物位于 `target/release/formic.exe`。仓库中的 `dist/` 是本�
 复制根目录的 `config.example.toml` 为自己的 `config.toml`，填写模型信息。不要提交真实密钥。
 
 ```toml
+protocol = "completions"
 url = "https://api.example.com/v1"
 api_key = ""
 model = "model-name"
 context_window_tokens = 131072
 
 model_input_modalities = ["text"]
-```
-
-运行前还必须设置协议：
-
-```text
-FORMIC_LLM_PROTOCOL=completions
+metrics = false
 ```
 
 协议可选值：
@@ -84,22 +80,14 @@ extra_body_json = '''{"temperature":0.2,"reasoning":{"effort":"high"}}'''
 
 如果透传参数会扩大供应商可能生成的输出长度，应相应增加 `execution.context_safety_tokens`。Formic 不会解释专有字段并自动推导新的输出预留。
 
-### 2.3 环境变量覆盖
+### 2.3 配置来源
 
-非空环境变量逐字段覆盖配置文件：
+Formic 的部署、模型、协议、密钥、MCP 和观测配置只来自一份 TOML。省略 `--config` 时读取当前
+工作目录的 `config.toml`，不会搜索父目录；显式路径与默认文件都必须存在并使用 `.toml`
+扩展名。进程环境中的 `FORMIC_*`、代理变量或其他同名值不会覆盖配置。
 
-| 环境变量 | 用途 |
-| --- | --- |
-| `FORMIC_LLM_PROTOCOL` | 必填；选择协议 |
-| `FORMIC_LLM_BASE_URL` | 覆盖 `url` |
-| `FORMIC_LLM_API_KEY` | 覆盖 `api_key` |
-| `FORMIC_LLM_MODEL` | 覆盖 `model` |
-| `FORMIC_LLM_CONTEXT_WINDOW_TOKENS` | 覆盖上下文大小 |
-| `FORMIC_LLM_INPUT_MODALITIES` | 使用 `text` 或 `text,image` |
-| `FORMIC_ANTHROPIC_MAX_TOKENS` | 仅 Anthropic 使用 |
-| `FORMIC_METRICS=1` | 每 250 毫秒向 stderr 输出规模观测值 |
-
-省略 `--config` 时，Formic 只查找当前工作目录的 `config.toml`，不会搜索父目录。显式指定的配置文件不存在时会失败。默认配置文件不存在时，可以完全使用环境变量提供 LLM 配置。
+HTTP MCP 的 bearer 与 header 直接写入对应 server；stdio MCP 的业务环境放在该 server 的
+`env` 表。Formic 只额外保留启动子进程所需的最小操作系统环境，不把这些系统值解释为产品配置。
 
 ### 2.4 资源与失败策略
 
@@ -113,6 +101,7 @@ extra_body_json = '''{"temperature":0.2,"reasoning":{"effort":"high"}}'''
 | `retry_delays_ms` | 网络临时失败后依次等待多久；空数组表示不重试 |
 | `max_retry_after_ms` | 供应商要求等待超过该值时停止接纳后续模型调用 |
 | `requests_per_minute` | 可选的真实模型请求频率限制 |
+| `metrics` | 是否每 250 毫秒向 stderr 输出规模观测 |
 | `execution.llm_attempts` | 模型工具参数或结构化结果无效后的修正次数 |
 | `execution.max_concurrent_units` | 同时活动的 worker 数；不限制计划总量 |
 | `execution.identical_tool_call_limit` | 单 worker 连续重复完全相同工具调用的停止线 |
@@ -346,7 +335,7 @@ Formic 用 o200k 估算文字与协议结构，按解码尺寸估算图片视觉
 
 ### 启动时提示缺少输入模态
 
-在配置中加入 `model_input_modalities`，或设置 `FORMIC_LLM_INPUT_MODALITIES=text`。只有确认模型支持图片时才使用 `text,image`。
+在 TOML 中加入 `model_input_modalities = ["text"]`。只有确认模型支持图片时才使用 `["text", "image"]`。
 
 ### 图片没有送到模型
 

@@ -1,5 +1,5 @@
-//! 规模观测：静态原子量 + FORMIC_METRICS=1 时的定期汇总（stderr，机器可 grep）。
-//! 附属证据，不参与任何业务状态与准入判断（见 docs/observability.md）；未设置环境变量时
+//! 规模观测：静态原子量 + TOML 开启后的定期汇总（stderr，机器可 grep）。
+//! 附属证据，不参与任何业务状态与准入判断（见 docs/observability.md）；TOML 未开启时
 //! 不启动汇总任务、不产生输出，原子量更新本身零分配。
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -61,7 +61,7 @@ pub fn report_once() {
     );
 }
 
-/// 每 250ms 一行汇总到 stderr。调用方负责仅在 FORMIC_METRICS=1 时启动。
+/// 每 250ms 一行汇总到 stderr。调用方负责仅在配置明确开启时启动。
 pub fn spawn_reporter() {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(250));

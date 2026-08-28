@@ -442,8 +442,8 @@ async fn run(args: RunArgs) -> Result<u8, StartupError> {
         instructions,
     });
 
-    // 规模观测：附属证据，不参与业务状态（FORMIC_METRICS=1 时定期汇总到 stderr）
-    let metrics_on = env::var("FORMIC_METRICS").ok().as_deref() == Some("1");
+    // 规模观测：附属证据，不参与业务状态；只由当前 TOML 明确开启。
+    let metrics_on = config.metrics_enabled;
     if metrics_on {
         metrics::spawn_reporter();
     }

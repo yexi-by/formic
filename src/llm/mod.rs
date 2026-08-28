@@ -49,7 +49,7 @@ impl InputModalities {
     }
 }
 
-/// 协议形状，由环境变量 FORMIC_LLM_PROTOCOL 选择。
+/// 协议形状，由 TOML 的 `protocol` 选择。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     Completions,
@@ -64,7 +64,7 @@ impl Protocol {
             "responses" => Ok(Self::Responses),
             "anthropic" => Ok(Self::Anthropic),
             other => Err(format!(
-                "未知协议 {other:?}，FORMIC_LLM_PROTOCOL 可选值：completions / responses / anthropic"
+                "未知 protocol {other:?}，可选值：completions / responses / anthropic"
             )),
         }
     }
@@ -754,6 +754,7 @@ impl LlmClient {
         let gate = Arc::new(RequestGate::new(config.requests_per_minute));
         Self {
             http: reqwest::Client::builder()
+                .no_proxy()
                 .connect_timeout(config.connect_timeout)
                 .timeout(config.request_timeout)
                 .build()

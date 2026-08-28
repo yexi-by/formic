@@ -29,6 +29,23 @@ fn main() {
     let formic = formic_binary();
     println!("formic：{}", formic.display());
 
+    let config = dir.path().join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            concat!(
+                "protocol = \"completions\"\n",
+                "url = \"http://127.0.0.1:{}/v1\"\n",
+                "model = \"scale-model\"\n",
+                "context_window_tokens = 131072\n",
+                "model_input_modalities = [\"text\"]\n",
+                "metrics = true\n",
+            ),
+            mock.port,
+        ),
+    )
+    .unwrap();
+
     let stderr_file = dir.path().join("formic-stderr.log");
     let started = Instant::now();
     let mut child = Command::new(&formic)
@@ -44,23 +61,10 @@ fn main() {
         .arg(&out)
         .arg("--worker-output-access")
         .arg("none")
+        .arg("--config")
+        .arg(&config)
         .arg("--concurrency")
         .arg(concurrency.to_string())
-        .env("FORMIC_LLM_PROTOCOL", "completions")
-        .env(
-            "FORMIC_LLM_BASE_URL",
-            format!("http://127.0.0.1:{}/v1", mock.port),
-        )
-        .env("FORMIC_LLM_MODEL", "scale-model")
-        .env("FORMIC_LLM_CONTEXT_WINDOW_TOKENS", "131072")
-        .env("FORMIC_LLM_INPUT_MODALITIES", "text")
-        .env("FORMIC_METRICS", "1")
-        .env_remove("FORMIC_LLM_API_KEY")
-        // 本地 mock 必须直连，避免开发机代理把规模实验变成代理压力测试。
-        .env("NO_PROXY", "127.0.0.1,localhost")
-        .env_remove("HTTP_PROXY")
-        .env_remove("HTTPS_PROXY")
-        .env_remove("ALL_PROXY")
         .stdout(Stdio::inherit())
         .stderr(Stdio::from(fs::File::create(&stderr_file).unwrap()))
         .spawn()

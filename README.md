@@ -46,18 +46,14 @@ cargo build --release
 复制 `config.example.toml` 为自己的 `config.toml`，填写服务地址、密钥、模型和真实上下文大小：
 
 ```toml
+protocol = "completions"
 url = "https://api.example.com/v1"
 api_key = ""
 model = "model-name"
 context_window_tokens = 131072
 
 model_input_modalities = ["text"]
-```
-
-设置模型协议：
-
-```text
-FORMIC_LLM_PROTOCOL=completions
+metrics = false
 ```
 
 可选值为 `completions`、`responses`、`anthropic`。只有确认模型支持图片时，才把输入模态改为：
@@ -72,7 +68,7 @@ model_input_modalities = ["text", "image"]
 extra_body_json = '''{"temperature":0.2,"reasoning":{"effort":"high"}}'''
 ```
 
-不要把真实密钥提交到 Git。
+Formic 只从这个 TOML 读取部署与服务配置，不接受环境变量覆盖。不要把真实密钥提交到 Git。
 
 ### 3. 准备作业
 
