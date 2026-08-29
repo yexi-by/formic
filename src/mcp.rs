@@ -93,12 +93,94 @@ pub struct McpRegistration {
     pub max_result_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpStartupStage {
+    StdioStart,
+    TransportSetup,
+    Initialize,
+    InitializeAndToolsListTimeout,
+    ToolsList,
+    Catalog,
+}
+
+impl McpStartupStage {
+    pub const fn safe_reason(self) -> &'static str {
+        match self {
+            Self::StdioStart => "stdio 启动失败",
+            Self::TransportSetup => "连接准备失败",
+            Self::Initialize => "initialize 失败",
+            Self::InitializeAndToolsListTimeout => "initialize 或 tools/list 超时",
+            Self::ToolsList => "tools/list 失败",
+            Self::Catalog => "工具目录筛选或校验失败",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum McpStartupError {
     #[error("MCP server {server} 启动失败：{reason}")]
-    Server { server: String, reason: String },
+    Server {
+        server: String,
+        stage: McpStartupStage,
+        reason: String,
+    },
     #[error("MCP 工具目录无效：{0}")]
     Catalog(String),
+}
+
+impl McpStartupError {
+    pub const fn safe_reason(&self) -> &'static str {
+        match self {
+            Self::Server { stage, .. } => stage.safe_reason(),
+            Self::Catalog(_) => "工具目录校验失败",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct McpCatalogError {
+    issue: McpCatalogIssue,
+    reason: String,
+    related_servers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpCatalogIssue {
+    InvalidName,
+    Collision,
+}
+
+impl McpCatalogError {
+    pub fn related_servers(&self) -> &[String] {
+        &self.related_servers
+    }
+
+    pub const fn safe_reason(&self) -> &'static str {
+        match self.issue {
+            McpCatalogIssue::InvalidName => "模型可见工具名无效",
+            McpCatalogIssue::Collision => "模型可见工具名发生碰撞",
+        }
+    }
+}
+
+impl std::fmt::Display for McpCatalogError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.reason)
+    }
+}
+
+struct McpInitializationFailure {
+    stage: McpStartupStage,
+    reason: String,
+}
+
+impl McpInitializationFailure {
+    fn new(stage: McpStartupStage, reason: impl Into<String>) -> Self {
+        Self {
+            stage,
+            reason: reason.into(),
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -116,6 +198,7 @@ pub enum McpCallError {
 struct McpServer {
     name: String,
     config: McpServerConfig,
+    diagnostics: bool,
     frozen: BTreeMap<String, FrozenTool>,
     job: Arc<SessionSlot>,
     units: Mutex<HashMap<u64, Arc<SessionSlot>>>,
@@ -165,6 +248,7 @@ enum AwaitCallError {
 /// 此 transport 在 JSON 解码前限制单条消息，同时保留原有的进程组或 Job Object 清理语义。
 struct BoundedChildProcess {
     server: String,
+    diagnostics: bool,
     child: Option<Box<dyn ChildWrapper>>,
     read: FramedRead<ChildStdout, JsonRpcMessageCodec<RxJsonRpcMessage<RoleClient>>>,
     write: Arc<Mutex<Option<StdioWriter>>>,
@@ -213,6 +297,7 @@ struct SseEventSizeLimiter {
 #[derive(Clone)]
 struct FormicClientHandler {
     server: String,
+    diagnostics: bool,
 }
 
 impl ClientHandler for FormicClientHandler {
@@ -220,10 +305,12 @@ impl ClientHandler for FormicClientHandler {
         &self,
         _context: NotificationContext<RoleClient>,
     ) -> impl std::future::Future<Output = ()> + Send + '_ {
-        eprintln!(
-            "MCP server {} 报告工具目录变化；当前作业继续使用启动时冻结的目录",
-            self.server
-        );
+        if self.diagnostics {
+            eprintln!(
+                "MCP server {} 报告工具目录变化；当前作业继续使用启动时冻结的目录",
+                self.server
+            );
+        }
         std::future::ready(())
     }
 
@@ -240,6 +327,7 @@ impl BoundedChildProcess {
         server: &str,
         mut command: CommandWrap,
         max_message_bytes: usize,
+        diagnostics: bool,
     ) -> io::Result<(Self, Option<ChildStderr>)> {
         command
             .command_mut()
@@ -262,6 +350,7 @@ impl BoundedChildProcess {
         Ok((
             Self {
                 server: server.to_string(),
+                diagnostics,
                 child: Some(child),
                 read: FramedRead::new(
                     stdout,
@@ -317,7 +406,7 @@ impl Transport<RoleClient> for BoundedChildProcess {
     async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
         let next = tokio::select! {
             _ = self.force_kill.cancelled() => {
-                if let Err(error) = self.close_child().await {
+                if let Err(error) = self.close_child().await && self.diagnostics {
                     eprintln!("MCP server {} 的 stdio 子进程终止失败：{error}", self.server);
                 }
                 return None;
@@ -327,10 +416,12 @@ impl Transport<RoleClient> for BoundedChildProcess {
         match next {
             Some(Ok(message)) => Some(message),
             Some(Err(error)) => {
-                eprintln!(
-                    "MCP server {} 的 stdio 消息无效或超过传输上限：{error}",
-                    self.server
-                );
+                if self.diagnostics {
+                    eprintln!(
+                        "MCP server {} 的 stdio 消息无效或超过传输上限：{error}",
+                        self.server
+                    );
+                }
                 None
             }
             None => None,
@@ -878,29 +969,44 @@ impl McpManager {
     pub async fn initialize(
         configs: &BTreeMap<String, McpServerConfig>,
     ) -> Result<Self, McpStartupError> {
+        Self::initialize_with_diagnostics(configs, true).await
+    }
+
+    pub async fn initialize_for_test(
+        configs: &BTreeMap<String, McpServerConfig>,
+    ) -> Result<Self, McpStartupError> {
+        Self::initialize_with_diagnostics(configs, false).await
+    }
+
+    async fn initialize_with_diagnostics(
+        configs: &BTreeMap<String, McpServerConfig>,
+        diagnostics: bool,
+    ) -> Result<Self, McpStartupError> {
         let mut servers = BTreeMap::new();
         for (name, config) in configs {
             let (session, frozen) = tokio::time::timeout(config.startup_timeout, async {
-                let session = connect(name, config).await?;
-                let tools = session
-                    .peer
-                    .list_all_tools()
-                    .await
-                    .map_err(|error| error.to_string())?;
-                let frozen = select_tools(name, config, tools)?;
-                Ok::<_, String>((session, frozen))
+                let session = connect(name, config, diagnostics).await?;
+                let tools = session.peer.list_all_tools().await.map_err(|error| {
+                    McpInitializationFailure::new(McpStartupStage::ToolsList, error.to_string())
+                })?;
+                let frozen = select_tools(name, config, tools).map_err(|reason| {
+                    McpInitializationFailure::new(McpStartupStage::Catalog, reason)
+                })?;
+                Ok::<_, McpInitializationFailure>((session, frozen))
             })
             .await
             .map_err(|_| McpStartupError::Server {
                 server: name.clone(),
+                stage: McpStartupStage::InitializeAndToolsListTimeout,
                 reason: format!(
                     "初始化和 tools/list 超过 {} 秒",
                     config.startup_timeout.as_secs()
                 ),
             })?
-            .map_err(|reason| McpStartupError::Server {
+            .map_err(|failure| McpStartupError::Server {
                 server: name.clone(),
-                reason,
+                stage: failure.stage,
+                reason: failure.reason,
             })?;
 
             let job = if config.session_scope == SessionScope::Job {
@@ -914,6 +1020,7 @@ impl McpManager {
                 Arc::new(McpServer {
                     name: name.clone(),
                     config: config.clone(),
+                    diagnostics,
                     frozen,
                     job,
                     units: Mutex::new(HashMap::new()),
@@ -936,7 +1043,6 @@ impl McpManager {
                     .get(remote_name)
                     .unwrap_or(remote_name);
                 let model_name = format!("{server_name}__{visible}");
-                validate_model_name(&model_name).map_err(McpStartupError::Catalog)?;
                 let limit = server.config.tool_limits.get(remote_name);
                 registrations.push(McpRegistration {
                     model_name: model_name.clone(),
@@ -959,15 +1065,8 @@ impl McpManager {
                 });
             }
         }
-        registrations.sort_by(|left, right| left.model_name.cmp(&right.model_name));
-        for pair in registrations.windows(2) {
-            if pair[0].model_name == pair[1].model_name {
-                return Err(McpStartupError::Catalog(format!(
-                    "模型可见名称 {} 发生碰撞",
-                    pair[0].model_name
-                )));
-            }
-        }
+        validate_registration_catalog(&mut registrations)
+            .map_err(|error| McpStartupError::Catalog(error.to_string()))?;
         Ok(registrations)
     }
 
@@ -1245,7 +1344,9 @@ impl McpServer {
         }
 
         let connected = tokio::time::timeout(self.config.startup_timeout, async {
-            let session = connect(&self.name, &self.config).await?;
+            let session = connect(&self.name, &self.config, self.diagnostics)
+                .await
+                .map_err(|failure| failure.reason)?;
             let tools = session
                 .peer
                 .list_all_tools()
@@ -1477,9 +1578,14 @@ fn is_stdio_system_variable(name: &OsStr) -> bool {
     name.to_str().is_some_and(|name| NAMES.contains(&name))
 }
 
-async fn connect(name: &str, config: &McpServerConfig) -> Result<Arc<ActiveSession>, String> {
+async fn connect(
+    name: &str,
+    config: &McpServerConfig,
+    diagnostics: bool,
+) -> Result<Arc<ActiveSession>, McpInitializationFailure> {
     let handler = FormicClientHandler {
         server: name.to_string(),
+        diagnostics,
     };
     let (service, stderr_task, http_client, force_stdio_kill) = match &config.transport {
         McpTransportConfig::Stdio { command, args, env } => {
@@ -1490,9 +1596,18 @@ async fn connect(name: &str, config: &McpServerConfig) -> Result<Arc<ActiveSessi
             command.wrap(JobObject);
             #[cfg(unix)]
             command.wrap(ProcessGroup::leader());
-            let (transport, stderr) =
-                BoundedChildProcess::spawn(name, command, mcp_transport_message_limit(config))
-                    .map_err(|error| format!("无法启动 stdio 子进程：{error}"))?;
+            let (transport, stderr) = BoundedChildProcess::spawn(
+                name,
+                command,
+                mcp_transport_message_limit(config),
+                diagnostics,
+            )
+            .map_err(|error| {
+                McpInitializationFailure::new(
+                    McpStartupStage::StdioStart,
+                    format!("无法启动 stdio 子进程：{error}"),
+                )
+            })?;
             let force_kill = transport.force_kill.clone();
             let attempt_guard = force_kill.clone().drop_guard();
             let task = stderr.map(|stderr| {
@@ -1501,21 +1616,27 @@ async fn connect(name: &str, config: &McpServerConfig) -> Result<Arc<ActiveSessi
                     let mut lines = bounded_stderr_lines(stderr);
                     while let Some(line) = lines.next().await {
                         match line {
-                            Ok(line) => eprintln!("MCP server {server} stderr：{line}"),
-                            Err(error) => {
+                            Ok(line) if diagnostics => {
+                                eprintln!("MCP server {server} stderr：{line}")
+                            }
+                            Ok(_) => {}
+                            Err(error) if diagnostics => {
                                 eprintln!(
                                     "MCP server {server} stderr 读取失败（单行上限 {MCP_STDERR_LINE_LIMIT} 字节）：{error}"
                                 );
                                 break;
                             }
+                            Err(_) => break,
                         }
                     }
                 })
             });
-            let service = handler
-                .serve(transport)
-                .await
-                .map_err(|error| format!("initialize 失败：{error}"))?;
+            let service = handler.serve(transport).await.map_err(|error| {
+                McpInitializationFailure::new(
+                    McpStartupStage::Initialize,
+                    format!("initialize 失败：{error}"),
+                )
+            })?;
             let _ = attempt_guard.disarm();
             (service, task, None, Some(force_kill))
         }
@@ -1527,11 +1648,18 @@ async fn connect(name: &str, config: &McpServerConfig) -> Result<Arc<ActiveSessi
             let mut custom_headers = HashMap::new();
             for (header, value) in headers {
                 custom_headers.insert(
-                    header
-                        .parse::<HeaderName>()
-                        .map_err(|error| format!("HTTP header 名无效：{error}"))?,
-                    HeaderValue::from_str(value)
-                        .map_err(|error| format!("HTTP header 值无效：{error}"))?,
+                    header.parse::<HeaderName>().map_err(|error| {
+                        McpInitializationFailure::new(
+                            McpStartupStage::TransportSetup,
+                            format!("HTTP header 名无效：{error}"),
+                        )
+                    })?,
+                    HeaderValue::from_str(value).map_err(|error| {
+                        McpInitializationFailure::new(
+                            McpStartupStage::TransportSetup,
+                            format!("HTTP header 值无效：{error}"),
+                        )
+                    })?,
                 );
             }
             let max_message_bytes = mcp_transport_message_limit(config);
@@ -1542,17 +1670,23 @@ async fn connect(name: &str, config: &McpServerConfig) -> Result<Arc<ActiveSessi
             if let Some(token) = bearer_token {
                 transport_config = transport_config.auth_header(token.clone());
             }
-            let client = BoundedHttpClient::new(max_message_bytes)
-                .map_err(|error| format!("无法创建 HTTP client：{error}"))?;
+            let client = BoundedHttpClient::new(max_message_bytes).map_err(|error| {
+                McpInitializationFailure::new(
+                    McpStartupStage::TransportSetup,
+                    format!("无法创建 HTTP client：{error}"),
+                )
+            })?;
             // 取消本地 initialize future 不保证 Hyper 立即关闭已经写完请求的 TCP
             // 连接；调用方期限与这条连接的最终回收语义见 docs/usage.md 的 MCP 说明。
             let attempt_guard = client.transport_cancel.clone().drop_guard();
             let transport =
                 StreamableHttpClientTransport::with_client(client.clone(), transport_config);
-            let service = handler
-                .serve(transport)
-                .await
-                .map_err(|error| format!("initialize 失败：{error}"))?;
+            let service = handler.serve(transport).await.map_err(|error| {
+                McpInitializationFailure::new(
+                    McpStartupStage::Initialize,
+                    format!("initialize 失败：{error}"),
+                )
+            })?;
             let _ = attempt_guard.disarm();
             (service, None, Some(client), None)
         }
@@ -1614,6 +1748,54 @@ fn select_tools(
         );
     }
     Ok(selected)
+}
+
+pub fn validate_registration_catalog(
+    registrations: &mut [McpRegistration],
+) -> Result<(), McpCatalogError> {
+    for registration in registrations.iter() {
+        if let Err(reason) = validate_model_name(&registration.model_name) {
+            return Err(McpCatalogError {
+                issue: McpCatalogIssue::InvalidName,
+                reason,
+                related_servers: vec![registration.server_name.clone()],
+            });
+        }
+    }
+    registrations.sort_by(|left, right| left.model_name.cmp(&right.model_name));
+
+    let mut first_collision = None;
+    let mut related_servers = Vec::new();
+    let mut start = 0usize;
+    while start < registrations.len() {
+        let mut end = start + 1;
+        while end < registrations.len()
+            && registrations[end].model_name == registrations[start].model_name
+        {
+            end += 1;
+        }
+        if end - start > 1 {
+            first_collision.get_or_insert_with(|| {
+                format!("模型可见名称 {} 发生碰撞", registrations[start].model_name)
+            });
+            related_servers.extend(
+                registrations[start..end]
+                    .iter()
+                    .map(|registration| registration.server_name.clone()),
+            );
+        }
+        start = end;
+    }
+    if let Some(reason) = first_collision {
+        related_servers.sort();
+        related_servers.dedup();
+        return Err(McpCatalogError {
+            issue: McpCatalogIssue::Collision,
+            reason,
+            related_servers,
+        });
+    }
+    Ok(())
 }
 
 fn validate_model_name(name: &str) -> Result<(), String> {

@@ -1,5 +1,5 @@
 //! 入口：CLI 解析、启动配置读取、错误的人性化呈现。
-//! 退出码：0 全部成功；1 存在未完成单元；2 启动失败；3 收到终止信号。
+//! 退出码：0 全部成功；1 作业或自检项失败；2 启动失败；3 收到终止信号。
 
 use std::collections::{BTreeMap, VecDeque};
 use std::env;
@@ -58,6 +58,15 @@ struct Cli {
 enum Commands {
     /// 运行一个批处理作业
     Run(RunArgs),
+    /// 检查配置中的 LLM 与 MCP 连接
+    Test(TestArgs),
+}
+
+#[derive(clap::Args)]
+struct TestArgs {
+    /// 配置文件；默认读取当前工作目录的 config.toml
+    #[arg(long)]
+    config: Option<PathBuf>,
 }
 
 #[derive(clap::Args)]
@@ -170,6 +179,252 @@ async fn main() -> ExitCode {
                 ExitCode::from(2)
             }
         },
+        Commands::Test(args) => ExitCode::from(run_tests(args).await),
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum LlmTestError {
+    #[error(transparent)]
+    Request(#[from] llm::LlmError),
+    #[error("LLM 响应在完成事件前结束")]
+    MissingFinish,
+    #[error("LLM 完成了请求，但未返回文本")]
+    MissingText,
+    #[error("LLM 响应达到输出上限")]
+    MaxTokens,
+    #[error("LLM 拒绝了最小自检请求")]
+    Refusal,
+    #[error("LLM 在未提供工具时返回了工具调用")]
+    ToolUse,
+}
+
+enum TestStep<T, E> {
+    Passed(T),
+    Failed(E),
+    Interrupted,
+}
+
+struct McpTestRecord {
+    name: String,
+    result: Result<usize, mcp::McpStartupError>,
+}
+
+async fn run_tests(args: TestArgs) -> u8 {
+    let cancel = CancellationToken::new();
+    let signal_task = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            termination_signal().await;
+            cancel.cancel();
+        })
+    };
+    let code = run_tests_with_cancel(args, cancel).await;
+    signal_task.abort();
+    let _ = signal_task.await;
+    code
+}
+
+async fn run_tests_with_cancel(args: TestArgs, cancel: CancellationToken) -> u8 {
+    let config = match config::load(args.config.as_deref()) {
+        Ok(config) => {
+            println!("配置：通过");
+            config
+        }
+        Err(error) => {
+            println!("配置：失败（{error}）");
+            println!("汇总：0/1 项通过");
+            return 2;
+        }
+    };
+
+    let total = 2usize.saturating_add(config.mcp_servers.len());
+    let mut passed = 1usize;
+    let mut failed = false;
+    let protocol = protocol_key(config.llm.protocol);
+
+    match test_llm(&config.llm, &cancel).await {
+        TestStep::Passed(()) => {
+            println!("LLM：通过（{protocol}，流式）");
+            passed += 1;
+        }
+        TestStep::Failed(error) => {
+            println!("LLM：失败（{error}）");
+            failed = true;
+        }
+        TestStep::Interrupted => {
+            println!("LLM：停止（收到终止信号）");
+            println!("汇总：{passed}/{total} 项通过，已停止后续项");
+            return 3;
+        }
+    }
+
+    let mut mcp_results = Vec::new();
+    let mut combined_registrations = Vec::new();
+    for (name, server_config) in &config.mcp_servers {
+        if cancel.is_cancelled() {
+            report_mcp_test_results(
+                mcp_results,
+                &mut combined_registrations,
+                &mut passed,
+                &mut failed,
+            );
+            println!("汇总：{passed}/{total} 项通过，已停止后续项");
+            return 3;
+        }
+        match test_mcp_server(name, server_config, &cancel).await {
+            TestStep::Passed(registrations) => {
+                let tool_count = registrations.len();
+                combined_registrations.extend(registrations);
+                mcp_results.push(McpTestRecord {
+                    name: name.clone(),
+                    result: Ok(tool_count),
+                });
+            }
+            TestStep::Failed(error) => {
+                mcp_results.push(McpTestRecord {
+                    name: name.clone(),
+                    result: Err(error),
+                });
+            }
+            TestStep::Interrupted => {
+                report_mcp_test_results(
+                    mcp_results,
+                    &mut combined_registrations,
+                    &mut passed,
+                    &mut failed,
+                );
+                println!("MCP {name}：停止（收到终止信号）");
+                println!("汇总：{passed}/{total} 项通过，已停止后续项");
+                return 3;
+            }
+        }
+    }
+    report_mcp_test_results(
+        mcp_results,
+        &mut combined_registrations,
+        &mut passed,
+        &mut failed,
+    );
+
+    println!("汇总：{passed}/{total} 项通过");
+    if failed { 1 } else { 0 }
+}
+
+async fn test_llm(
+    config: &llm::LlmConfig,
+    cancel: &CancellationToken,
+) -> TestStep<(), LlmTestError> {
+    if cancel.is_cancelled() {
+        return TestStep::Interrupted;
+    }
+    let client = LlmClient::new(config.clone());
+    let history = [llm::Message::User(
+        "请只回复 OK，用于 Formic 连接自检。".into(),
+    )];
+    let prepared = match client.prepare_call("执行最小连接自检。", &history, &[]) {
+        Ok(prepared) => prepared,
+        Err(error) => return TestStep::Failed(error.into()),
+    };
+    let observation = llm::RequestObservation::default();
+    let sent = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return TestStep::Interrupted,
+        result = client.send(prepared, &observation) => result,
+    };
+    let mut call = match sent {
+        Ok(call) => call,
+        Err(error) => return TestStep::Failed(error.into()),
+    };
+    let mut has_text = false;
+    let mut finish = None;
+    loop {
+        let event = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return TestStep::Interrupted,
+            result = call.next_event() => result,
+        };
+        match event {
+            Ok(Some(llm::LlmEvent::TextDelta(text))) => has_text |= !text.is_empty(),
+            Ok(Some(llm::LlmEvent::Finished(value))) => finish = Some(value),
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(error) => return TestStep::Failed(error.into()),
+        }
+    }
+    let result = match finish {
+        None => Err(LlmTestError::MissingFinish),
+        Some(llm::Finish::Stop) if has_text => Ok(()),
+        Some(llm::Finish::Stop) => Err(LlmTestError::MissingText),
+        Some(llm::Finish::MaxTokens) => Err(LlmTestError::MaxTokens),
+        Some(llm::Finish::Refusal) => Err(LlmTestError::Refusal),
+        Some(llm::Finish::ToolUse) => Err(LlmTestError::ToolUse),
+    };
+    match result {
+        Ok(()) => TestStep::Passed(()),
+        Err(error) => TestStep::Failed(error),
+    }
+}
+
+async fn test_mcp_server(
+    name: &str,
+    server_config: &config::McpServerConfig,
+    cancel: &CancellationToken,
+) -> TestStep<Vec<mcp::McpRegistration>, mcp::McpStartupError> {
+    let configs = BTreeMap::from([(name.to_string(), server_config.clone())]);
+    let initialized = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => return TestStep::Interrupted,
+        result = mcp::McpManager::initialize_for_test(&configs) => result,
+    };
+    let manager = match initialized {
+        Ok(manager) => manager,
+        Err(error) => return TestStep::Failed(error),
+    };
+    let result = manager.registrations();
+    manager.shutdown().await;
+    if cancel.is_cancelled() {
+        return TestStep::Interrupted;
+    }
+    match result {
+        Ok(registrations) => TestStep::Passed(registrations),
+        Err(error) => TestStep::Failed(error),
+    }
+}
+
+fn report_mcp_test_results(
+    results: Vec<McpTestRecord>,
+    registrations: &mut [mcp::McpRegistration],
+    passed: &mut usize,
+    failed: &mut bool,
+) {
+    let catalog_error = mcp::validate_registration_catalog(registrations).err();
+    for result in results {
+        match result.result {
+            Err(error) => {
+                println!("MCP {}：失败（{}）", result.name, error.safe_reason());
+                *failed = true;
+            }
+            Ok(_)
+                if catalog_error.as_ref().is_some_and(|error| {
+                    error
+                        .related_servers()
+                        .iter()
+                        .any(|server| server == &result.name)
+                }) =>
+            {
+                let reason = catalog_error
+                    .as_ref()
+                    .expect("分支已确认存在全局目录错误")
+                    .safe_reason();
+                println!("MCP {}：失败（{reason}）", result.name);
+                *failed = true;
+            }
+            Ok(tool_count) => {
+                println!("MCP {}：通过（可用 {tool_count} 个工具）", result.name);
+                *passed += 1;
+            }
+        }
     }
 }
 

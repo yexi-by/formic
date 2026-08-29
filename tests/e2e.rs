@@ -60,6 +60,7 @@ const RESPONSE_SECRET: &str = "SENSITIVE-RESPONSE-MARKER";
 const LLM_API_KEY_SECRET: &str = "SENSITIVE-LLM-API-KEY";
 const LLM_EXTRA_BODY_SECRET: &str = "SENSITIVE-LLM-EXTRA-BODY";
 const MCP_BEARER_SECRET: &str = "SENSITIVE-MCP-BEARER";
+const SELF_TEST_MARKER: &str = "Formic 连接自检";
 
 // ---- 罐装 SSE：文本最终帧（三协议）----
 
@@ -762,7 +763,12 @@ fn handle_conn(
         return;
     }
 
-    let (status, response_body) = if body_text.contains(NETWORK_CONTEXT_NETWORK_MARKER)
+    let (status, response_body) = if body_text.contains(SELF_TEST_MARKER) {
+        match sse_for(&path, false) {
+            Some(sse) => ("200 OK", sse.to_string()),
+            None => ("404 Not Found", "unknown path".to_string()),
+        }
+    } else if body_text.contains(NETWORK_CONTEXT_NETWORK_MARKER)
         && body_text.contains("此前历史的已验证压缩摘要")
         && scenario_step
             .compare_exchange(2, 3, Ordering::SeqCst, Ordering::SeqCst)
@@ -1146,6 +1152,12 @@ fn formic_command_with_access(
         .arg(worker_output_access)
         .arg("--concurrency")
         .arg(concurrency.to_string());
+    command
+}
+
+fn formic_test_command(config: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_formic"));
+    command.arg("test").arg("--config").arg(config);
     command
 }
 
@@ -2492,6 +2504,270 @@ fn explicitly_selected_missing_config_fails_before_any_request() {
     assert!(stderr.contains("missing-config.toml"), "{stderr}");
     assert!(stderr.contains("不存在"), "{stderr}");
     assert!(mock.requests.lock().unwrap().is_empty());
+
+    let test_output = formic_test_command(&missing)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert_eq!(test_output.status.code(), Some(2));
+    let stdout = stdout_of(&test_output);
+    assert!(stdout.contains("配置：失败（指定的配置文件"), "{stdout}");
+    assert!(stdout.contains("汇总：0/1 项通过"), "{stdout}");
+    assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn test_command_checks_llm_and_each_mcp_without_job_outputs() {
+    let dir = tempfile::tempdir().unwrap();
+    let llm = start_mock();
+    let fake_mcp = compile_fake_mcp(dir.path());
+    let alpha_start = dir.path().join("alpha-start.log");
+    let alpha_calls = dir.path().join("alpha-calls.log");
+    let zeta_start = dir.path().join("zeta-start.log");
+    let zeta_calls = dir.path().join("zeta-calls.log");
+    let config = dir.path().join("self-test.toml");
+    fs::write(
+        &config,
+        format!(
+            concat!(
+                "protocol = \"completions\"\n",
+                "url = \"http://127.0.0.1:{}/v1\"\n",
+                "model = \"test-model\"\n",
+                "context_window_tokens = 131072\n",
+                "model_input_modalities = [\"text\"]\n",
+                "[mcp_servers.zeta]\n",
+                "enabled = true\n",
+                "command = {}\n",
+                "env = {{ FAKE_MCP_START_LOG = {}, FAKE_MCP_CALL_LOG = {} }}\n",
+                "[mcp_servers.alpha]\n",
+                "enabled = true\n",
+                "command = {}\n",
+                "env = {{ FAKE_MCP_START_LOG = {}, FAKE_MCP_CALL_LOG = {} }}\n",
+            ),
+            llm.port,
+            toml_string(&fake_mcp),
+            toml_string(&zeta_start),
+            toml_string(&zeta_calls),
+            toml_string(&fake_mcp),
+            toml_string(&alpha_start),
+            toml_string(&alpha_calls),
+        ),
+    )
+    .unwrap();
+
+    let output = formic_test_command(&config)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
+    assert!(stderr_of(&output).is_empty(), "自检只输出类型化项目结果");
+    let stdout = stdout_of(&output);
+    let config_at = stdout.find("配置：通过").unwrap();
+    let llm_at = stdout.find("LLM：通过（completions，流式）").unwrap();
+    let alpha_at = stdout.find("MCP alpha：通过（可用 3 个工具）").unwrap();
+    let zeta_at = stdout.find("MCP zeta：通过（可用 3 个工具）").unwrap();
+    assert!(config_at < llm_at && llm_at < alpha_at && alpha_at < zeta_at);
+    assert!(stdout.contains("汇总：4/4 项通过"), "{stdout}");
+    let requests = llm.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1, "LLM 自检只发送一次请求");
+    assert!(requests[0].body.contains(SELF_TEST_MARKER));
+    drop(requests);
+    assert_eq!(fs::read_to_string(&alpha_start).unwrap().lines().count(), 1);
+    assert_eq!(fs::read_to_string(&zeta_start).unwrap().lines().count(), 1);
+    assert!(
+        fs::read_to_string(&alpha_calls)
+            .unwrap_or_default()
+            .is_empty()
+    );
+    assert!(
+        fs::read_to_string(&zeta_calls)
+            .unwrap_or_default()
+            .is_empty()
+    );
+    for name in [
+        "data",
+        "plan.jsonl",
+        "task.md",
+        "out",
+        "projects",
+        "runs",
+        "workers",
+    ] {
+        assert!(!dir.path().join(name).exists(), "test 命令不应创建 {name}");
+    }
+}
+
+#[test]
+fn test_command_rejects_cross_server_model_name_collisions() {
+    let dir = tempfile::tempdir().unwrap();
+    let llm = start_mock();
+    let fake_mcp = compile_fake_mcp(dir.path());
+    let call_log = dir.path().join("mcp-calls.log");
+    let config = dir.path().join("self-test.toml");
+    fs::write(
+        &config,
+        format!(
+            concat!(
+                "protocol = \"completions\"\n",
+                "url = \"http://127.0.0.1:{}/v1\"\n",
+                "model = \"test-model\"\n",
+                "context_window_tokens = 131072\n",
+                "model_input_modalities = [\"text\"]\n",
+                "[mcp_servers.alpha]\n",
+                "enabled = true\n",
+                "command = {}\n",
+                "enabled_tools = [\"echo\"]\n",
+                "tool_aliases = {{ echo = \"beta__echo\" }}\n",
+                "env = {{ FAKE_MCP_CALL_LOG = {} }}\n",
+                "[mcp_servers.alpha__beta]\n",
+                "enabled = true\n",
+                "command = {}\n",
+                "enabled_tools = [\"echo\"]\n",
+                "env = {{ FAKE_MCP_CALL_LOG = {} }}\n",
+            ),
+            llm.port,
+            toml_string(&fake_mcp),
+            toml_string(&call_log),
+            toml_string(&fake_mcp),
+            toml_string(&call_log),
+        ),
+    )
+    .unwrap();
+
+    let output = formic_test_command(&config)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    assert!(stderr_of(&output).is_empty());
+    let stdout = stdout_of(&output);
+    assert!(
+        stdout.contains("MCP alpha：失败（模型可见工具名发生碰撞）"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("MCP alpha__beta：失败（模型可见工具名发生碰撞）"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("汇总：2/4 项通过"), "{stdout}");
+    assert_eq!(llm.requests.lock().unwrap().len(), 1);
+    assert!(fs::read_to_string(&call_log).unwrap_or_default().is_empty());
+}
+
+#[test]
+fn test_command_continues_after_llm_and_mcp_failures() {
+    let dir = tempfile::tempdir().unwrap();
+    let unavailable = TcpListener::bind("127.0.0.1:0").unwrap();
+    let unavailable_port = unavailable.local_addr().unwrap().port();
+    drop(unavailable);
+    let fake_mcp = compile_fake_mcp(dir.path());
+    let good_start = dir.path().join("good-start.log");
+    let good_calls = dir.path().join("good-calls.log");
+    let config = dir.path().join("self-test.toml");
+    fs::write(
+        &config,
+        format!(
+            concat!(
+                "protocol = \"completions\"\n",
+                "url = \"http://127.0.0.1:{}/v1\"\n",
+                "model = \"test-model\"\n",
+                "context_window_tokens = 131072\n",
+                "model_input_modalities = [\"text\"]\n",
+                "connect_timeout_ms = 100\n",
+                "request_timeout_ms = 500\n",
+                "retry_delays_ms = [1, 2, 3]\n",
+                "[mcp_servers.alpha]\n",
+                "enabled = true\n",
+                "command = \"formic-missing-mcp-command\"\n",
+                "[mcp_servers.zeta]\n",
+                "enabled = true\n",
+                "command = {}\n",
+                "env = {{ FAKE_MCP_START_LOG = {}, FAKE_MCP_CALL_LOG = {} }}\n",
+            ),
+            unavailable_port,
+            toml_string(&fake_mcp),
+            toml_string(&good_start),
+            toml_string(&good_calls),
+        ),
+    )
+    .unwrap();
+
+    let output = formic_test_command(&config)
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    assert!(
+        stderr_of(&output).is_empty(),
+        "自检失败原因也由受控报告输出"
+    );
+    let stdout = stdout_of(&output);
+    let llm_at = stdout
+        .find("LLM：失败（LLM ")
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let alpha_at = stdout.find("MCP alpha：失败（stdio 启动失败）").unwrap();
+    let zeta_at = stdout.find("MCP zeta：通过（可用 3 个工具）").unwrap();
+    assert!(llm_at < alpha_at && alpha_at < zeta_at, "{stdout}");
+    assert!(stdout.contains("汇总：2/4 项通过"), "{stdout}");
+    assert_eq!(fs::read_to_string(&good_start).unwrap().lines().count(), 1);
+    assert!(
+        fs::read_to_string(&good_calls)
+            .unwrap_or_default()
+            .is_empty()
+    );
+}
+
+#[test]
+fn test_command_ctrl_c_stops_before_mcp_and_returns_three() {
+    let dir = tempfile::tempdir().unwrap();
+    let llm = start_mock_with_delay(1_000);
+    let fake_mcp = compile_fake_mcp(dir.path());
+    let start_log = dir.path().join("mcp-start.log");
+    let config = dir.path().join("self-test.toml");
+    fs::write(
+        &config,
+        format!(
+            concat!(
+                "protocol = \"completions\"\n",
+                "url = \"http://127.0.0.1:{}/v1\"\n",
+                "model = \"test-model\"\n",
+                "context_window_tokens = 131072\n",
+                "model_input_modalities = [\"text\"]\n",
+                "[mcp_servers.demo]\n",
+                "enabled = true\n",
+                "command = {}\n",
+                "env = {{ FAKE_MCP_START_LOG = {} }}\n",
+            ),
+            llm.port,
+            toml_string(&fake_mcp),
+            toml_string(&start_log),
+        ),
+    )
+    .unwrap();
+    let mut command = formic_test_command(&config);
+    command
+        .current_dir(dir.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    make_interruptible(&mut command);
+    let mut child = command.spawn().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while llm.requests.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
+        assert!(child.try_wait().unwrap().is_none());
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(!llm.requests.lock().unwrap().is_empty());
+    send_interrupt(&child);
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(output.status.code(), Some(3), "{}", stderr_of(&output));
+    let stdout = stdout_of(&output);
+    assert!(stdout.contains("LLM：停止（收到终止信号）"), "{stdout}");
+    assert!(stdout.contains("汇总：1/3 项通过，已停止后续项"));
+    assert!(!start_log.exists(), "LLM 中断后不再启动 MCP");
 }
 
 #[test]
