@@ -563,16 +563,15 @@ async fn drive_loop(
                         .map(|c| tokenize::count_tool_call(&c.req))
                         .sum::<u64>();
                 let has_submit = calls.iter().any(|call| call.req.name == SUBMIT_RESULT_TOOL);
-                let mixed_submit = has_submit && (calls.len() != 1 || !text.trim().is_empty());
+                let mixed_submit = ctx.output_contract.is_structured()
+                    && has_submit
+                    && (calls.len() != 1 || !text.is_empty());
                 let assistant = Message::Assistant {
                     text,
                     tool_calls: calls.iter().map(|c| c.req.clone()).collect(),
                 };
                 push_history(history, meter, assistant);
                 push_response_output_items(history, meter, response_output_items);
-                let mut submission_error = None;
-                let mut media_message = UserContent::new();
-                let mut executions = Vec::new();
                 for prepared in &calls {
                     let tc = &prepared.req;
                     audit.push(&AuditEntry::ToolCall {
@@ -590,6 +589,56 @@ async fn drive_loop(
                         },
                         arguments: prepared.raw_arguments.clone(),
                     })?;
+                }
+                if mixed_submit {
+                    let reason = "formic_submit_result 必须在不含文本和其他工具调用的回合中单独出现，本回合全部工具均未执行";
+                    audit.push(&AuditEntry::OutputValidation {
+                        valid: false,
+                        instance_path: None,
+                        schema_path: None,
+                        reason: reason.into(),
+                    })?;
+                    audit.push(&AuditEntry::State {
+                        state: WorkerState::CorrectingOutput,
+                        reason: reason.into(),
+                    })?;
+                    last_call = None;
+                    same_calls = 0;
+                    for prepared in calls {
+                        let tc = prepared.req;
+                        let result = if tc.name == SUBMIT_RESULT_TOOL {
+                            format!("错误：{reason}；请修正后单独提交")
+                        } else {
+                            format!(
+                                "错误：本回合包含混合结构化提交，工具 {} 未执行；请先在不含 formic_submit_result 的回合调用普通工具",
+                                tc.name
+                            )
+                        };
+                        audit.push(&AuditEntry::ToolResult(result.clone()))?;
+                        push_history(
+                            history,
+                            meter,
+                            Message::ToolResult {
+                                call_id: tc.call_id,
+                                content: result,
+                            },
+                        );
+                    }
+                    invalid_submissions += 1;
+                    meter.stats.structured_corrections += 1;
+                    if invalid_submissions >= ctx.execution.llm_attempts {
+                        return Err(UnitFailure::StructuredExhausted {
+                            attempts: invalid_submissions,
+                            last_error: reason.into(),
+                        });
+                    }
+                    continue;
+                }
+                let mut submission_error = None;
+                let mut media_message = UserContent::new();
+                let mut executions = Vec::new();
+                for prepared in &calls {
+                    let tc = &prepared.req;
                     if tc.name == SUBMIT_RESULT_TOOL && ctx.output_contract.is_structured() {
                         last_call = None;
                         same_calls = 0;
@@ -652,20 +701,26 @@ async fn drive_loop(
                 for prepared in calls {
                     let tc = prepared.req;
                     if tc.name == SUBMIT_RESULT_TOOL && ctx.output_contract.is_structured() {
-                        let (validation, validation_issue) = if mixed_submit {
-                            (
-                                Err(
-                                    "formic_submit_result 必须在不含文本和其他工具调用的回合中单独出现"
-                                        .to_string(),
-                                ),
-                                None,
-                            )
-                        } else if let Some(error) = &prepared.argument_error {
-                            (Err(error.clone()), None)
+                        let validation = if let Some(error) = &prepared.argument_error {
+                            Err((error.clone(), vec![(None, None, error.clone())]))
                         } else {
                             match ctx.output_contract.validate_submission(&prepared.arguments) {
-                                Ok(content) => (Ok(content), None),
-                                Err(issue) => (Err(issue.to_string()), Some(issue)),
+                                Ok(content) => Ok(content),
+                                Err(issues) => {
+                                    let reason = issues.to_string();
+                                    let audit_issues = issues
+                                        .issues()
+                                        .iter()
+                                        .map(|issue| {
+                                            (
+                                                Some(issue.instance_path.clone()),
+                                                Some(issue.schema_path.clone()),
+                                                issue.reason.clone(),
+                                            )
+                                        })
+                                        .collect();
+                                    Err((reason, audit_issues))
+                                }
                             }
                         };
                         match validation {
@@ -678,22 +733,15 @@ async fn drive_loop(
                                 })?;
                                 return Ok(LoopEnd::Published(content));
                             }
-                            Err(reason) => {
-                                let (instance_path, schema_path, audit_reason) = validation_issue
-                                    .map(|issue| {
-                                        (
-                                            Some(issue.instance_path),
-                                            Some(issue.schema_path),
-                                            issue.reason,
-                                        )
-                                    })
-                                    .unwrap_or_else(|| (None, None, reason.clone()));
-                                audit.push(&AuditEntry::OutputValidation {
-                                    valid: false,
-                                    instance_path,
-                                    schema_path,
-                                    reason: audit_reason,
-                                })?;
+                            Err((reason, audit_issues)) => {
+                                for (instance_path, schema_path, audit_reason) in audit_issues {
+                                    audit.push(&AuditEntry::OutputValidation {
+                                        valid: false,
+                                        instance_path,
+                                        schema_path,
+                                        reason: audit_reason,
+                                    })?;
+                                }
                                 audit.push(&AuditEntry::State {
                                     state: WorkerState::CorrectingOutput,
                                     reason: reason.clone(),

@@ -136,7 +136,7 @@ formic run \
   --output-schema result.schema.json
 ```
 
-Formic 会让模型通过内部提交工具交付 object，并在本地通过 schema 校验后发布 JSON。schema 负责形状，任务说明仍负责字段业务含义。
+Formic 会让模型通过内部提交工具交付 object，并在本地通过 schema 校验后发布 JSON。校验失败时，模型会一次收到本次提交的全部格式问题并修正；最终结果要么符合 schema，要么本单元失败且不发布 JSON。结构化模式支持 nullable 字段、固定值以及常用的字符串、数组和数值范围约束，具体子集和可复制示例见[结构化输出](docs/usage.md#9-结构化输出)。
 
 ### 6. 续跑
 

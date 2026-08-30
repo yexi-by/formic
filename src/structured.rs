@@ -33,6 +33,17 @@ pub struct ValidationIssue {
     pub reason: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ValidationIssues {
+    issues: Vec<ValidationIssue>,
+}
+
+impl ValidationIssues {
+    pub fn issues(&self) -> &[ValidationIssue] {
+        &self.issues
+    }
+}
+
 impl std::fmt::Display for ValidationIssue {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
@@ -44,6 +55,21 @@ impl std::fmt::Display for ValidationIssue {
         )
     }
 }
+
+impl std::fmt::Display for ValidationIssues {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.issues.len() == 1 {
+            return self.issues[0].fmt(formatter);
+        }
+        write!(formatter, "结果需要修正 {} 个格式问题：", self.issues.len())?;
+        for (index, issue) in self.issues.iter().enumerate() {
+            write!(formatter, "\n{}. {issue}", index + 1)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ValidationIssues {}
 
 #[derive(Debug, thiserror::Error)]
 pub enum OutputContractError {
@@ -143,16 +169,12 @@ impl OutputContract {
         })
     }
 
-    pub fn validate_submission(&self, value: &Value) -> Result<String, ValidationIssue> {
+    pub fn validate_submission(&self, value: &Value) -> Result<String, ValidationIssues> {
         let Self::Structured(contract) = self else {
             unreachable!("文本模式没有结构化提交")
         };
-        if let Some(error) = contract.validator.iter_errors(value).next() {
-            return Err(ValidationIssue {
-                instance_path: error.instance_path().to_string(),
-                schema_path: error.schema_path().to_string(),
-                reason: error.to_string(),
-            });
+        if let Some(issues) = validation_issues(&contract.validator, value) {
+            return Err(issues);
         }
         Ok(format!(
             "{}\n",
@@ -177,13 +199,32 @@ impl OutputContract {
             Self::Structured(contract) => {
                 let value: Value = serde_json::from_slice(bytes)
                     .map_err(|_| "完成记录不是合法 JSON".to_string())?;
-                if let Some(error) = contract.validator.iter_errors(&value).next() {
-                    return Err(format!("完成记录不符合当前 schema：{error}"));
+                if let Some(issues) = validation_issues(&contract.validator, &value) {
+                    return Err(format!("完成记录不符合当前 schema：{issues}"));
                 }
                 Ok(())
             }
         }
     }
+}
+
+fn validation_issues(validator: &jsonschema::Validator, value: &Value) -> Option<ValidationIssues> {
+    let mut issues: Vec<_> = validator
+        .iter_errors(value)
+        .map(|error| ValidationIssue {
+            instance_path: error.instance_path().to_string(),
+            schema_path: error.schema_path().to_string(),
+            reason: error.to_string(),
+        })
+        .collect();
+    issues.sort_by(|left, right| {
+        (&left.instance_path, &left.schema_path, &left.reason).cmp(&(
+            &right.instance_path,
+            &right.schema_path,
+            &right.reason,
+        ))
+    });
+    (!issues.is_empty()).then_some(ValidationIssues { issues })
 }
 
 fn validate_subset(schema: &Value) -> Result<(), String> {
@@ -194,6 +235,60 @@ fn validate_subset(schema: &Value) -> Result<(), String> {
         return Err("根 schema 的 type 必须是 object".into());
     }
     validate_node(schema, "#")
+}
+
+#[derive(Clone, Copy)]
+enum SchemaType {
+    Object,
+    Array,
+    String,
+    Number,
+    Integer,
+    Boolean,
+    Null,
+}
+
+impl SchemaType {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "object" => Some(Self::Object),
+            "array" => Some(Self::Array),
+            "string" => Some(Self::String),
+            "number" => Some(Self::Number),
+            "integer" => Some(Self::Integer),
+            "boolean" => Some(Self::Boolean),
+            "null" => Some(Self::Null),
+            _ => None,
+        }
+    }
+
+    fn accepts(self, value: &Value) -> bool {
+        match self {
+            Self::Object => value.is_object(),
+            Self::Array => value.is_array(),
+            Self::String => value.is_string(),
+            Self::Number => value.is_number(),
+            Self::Integer => value.as_number().is_some_and(|number| {
+                number.is_i64()
+                    || number.is_u64()
+                    || number.as_f64().is_some_and(|number| number.fract() == 0.0)
+            }),
+            Self::Boolean => value.is_boolean(),
+            Self::Null => value.is_null(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct DeclaredType {
+    base: SchemaType,
+    nullable: bool,
+}
+
+impl DeclaredType {
+    fn accepts(self, value: &Value) -> bool {
+        (self.nullable && value.is_null()) || self.base.accepts(value)
+    }
 }
 
 fn validate_node(schema: &Value, pointer: &str) -> Result<(), String> {
@@ -207,8 +302,15 @@ fn validate_node(schema: &Value, pointer: &str) -> Result<(), String> {
         "additionalProperties",
         "items",
         "enum",
+        "const",
         "description",
         "title",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+        "minimum",
+        "maximum",
     ];
     if let Some(keyword) = object
         .keys()
@@ -221,32 +323,44 @@ fn validate_node(schema: &Value, pointer: &str) -> Result<(), String> {
             return Err(format!("{pointer}/{keyword} 必须是字符串"));
         }
     }
-    let schema_type = object
-        .get("type")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("{pointer}/type 必须是基础类型字符串"))?;
-    if ![
-        "object", "array", "string", "number", "integer", "boolean", "null",
-    ]
-    .contains(&schema_type)
-    {
-        return Err(format!("{pointer}/type 的值 {schema_type:?} 不受支持"));
-    }
-    if let Some(values) = object.get("enum") {
+    let declared_type = parse_declared_type(
+        object
+            .get("type")
+            .ok_or_else(|| format!("{pointer}/type 是必填项"))?,
+        pointer,
+    )?;
+    let enum_values = if let Some(values) = object.get("enum") {
         let values = values
             .as_array()
             .filter(|values| !values.is_empty())
             .ok_or_else(|| format!("{pointer}/enum 必须是非空数组"))?;
-        if values
-            .iter()
-            .any(|value| value.is_array() || value.is_object())
-        {
-            return Err(format!("{pointer}/enum 只能包含基础值"));
+        for value in values {
+            validate_fixed_value(value, declared_type, &format!("{pointer}/enum"))?;
         }
+        Some(values.as_slice())
+    } else {
+        None
+    };
+    let constant = object.get("const");
+    if let Some(value) = constant {
+        validate_fixed_value(value, declared_type, &format!("{pointer}/const"))?;
     }
 
-    match schema_type {
-        "object" => {
+    match declared_type.base {
+        SchemaType::Object => {
+            reject_keywords(
+                object,
+                pointer,
+                &[
+                    "items",
+                    "minItems",
+                    "maxItems",
+                    "minLength",
+                    "maxLength",
+                    "minimum",
+                    "maximum",
+                ],
+            )?;
             if object.get("additionalProperties") != Some(&Value::Bool(false)) {
                 return Err(format!("{pointer}/additionalProperties 必须显式为 false"));
             }
@@ -275,35 +389,265 @@ fn validate_node(schema: &Value, pointer: &str) -> Result<(), String> {
                     &format!("{pointer}/properties/{}", escape_pointer(name)),
                 )?;
             }
-            if object.contains_key("items") {
-                return Err(format!("{pointer} 的 object 不能含 items"));
-            }
         }
-        "array" => {
+        SchemaType::Array => {
+            reject_keywords(
+                object,
+                pointer,
+                &[
+                    "properties",
+                    "required",
+                    "additionalProperties",
+                    "minLength",
+                    "maxLength",
+                    "minimum",
+                    "maximum",
+                ],
+            )?;
             let items = object
                 .get("items")
                 .ok_or_else(|| format!("{pointer}/items 对 array 是必填项"))?;
             validate_node(items, &format!("{pointer}/items"))?;
-            reject_object_keywords(object, pointer)?;
+            validate_ordered_nonnegative_integer_keywords(object, pointer, "minItems", "maxItems")?;
         }
+        SchemaType::String => {
+            reject_keywords(
+                object,
+                pointer,
+                &[
+                    "properties",
+                    "required",
+                    "additionalProperties",
+                    "items",
+                    "minItems",
+                    "maxItems",
+                    "minimum",
+                    "maximum",
+                ],
+            )?;
+            validate_ordered_nonnegative_integer_keywords(
+                object,
+                pointer,
+                "minLength",
+                "maxLength",
+            )?;
+        }
+        SchemaType::Number | SchemaType::Integer => {
+            reject_keywords(
+                object,
+                pointer,
+                &[
+                    "properties",
+                    "required",
+                    "additionalProperties",
+                    "items",
+                    "minItems",
+                    "maxItems",
+                    "minLength",
+                    "maxLength",
+                ],
+            )?;
+            validate_number_bounds(object, pointer)?;
+        }
+        SchemaType::Boolean | SchemaType::Null => {
+            reject_keywords(
+                object,
+                pointer,
+                &[
+                    "properties",
+                    "required",
+                    "additionalProperties",
+                    "items",
+                    "minItems",
+                    "maxItems",
+                    "minLength",
+                    "maxLength",
+                    "minimum",
+                    "maximum",
+                ],
+            )?;
+        }
+    }
+    validate_fixed_value_constraints(schema, pointer, enum_values, constant)?;
+    Ok(())
+}
+
+fn parse_declared_type(value: &Value, pointer: &str) -> Result<DeclaredType, String> {
+    if let Some(name) = value.as_str() {
+        let base = SchemaType::parse(name)
+            .ok_or_else(|| format!("{pointer}/type 的值 {name:?} 不受支持"))?;
+        return Ok(DeclaredType {
+            base,
+            nullable: false,
+        });
+    }
+    let Some(names) = value.as_array() else {
+        return Err(format!(
+            "{pointer}/type 必须是基础类型字符串，或一个非 null 类型与 null 组成的二元数组"
+        ));
+    };
+    if names.len() != 2 || names.iter().any(|name| !name.is_string()) {
+        return Err(format!(
+            "{pointer}/type 必须由一个非 null 类型与 null 组成二元字符串数组"
+        ));
+    }
+    let first = names[0].as_str().expect("已确认 type 数组元素是字符串");
+    let second = names[1].as_str().expect("已确认 type 数组元素是字符串");
+    let base_name = match (first, second) {
+        ("null", base) if base != "null" => base,
+        (base, "null") if base != "null" => base,
         _ => {
-            if object.contains_key("items") {
-                return Err(format!("{pointer} 的 {schema_type} 不能含 items"));
-            }
-            reject_object_keywords(object, pointer)?;
+            return Err(format!(
+                "{pointer}/type 必须恰好包含一个非 null 类型和 null"
+            ));
+        }
+    };
+    let base = SchemaType::parse(base_name)
+        .filter(|schema_type| !matches!(schema_type, SchemaType::Null))
+        .ok_or_else(|| format!("{pointer}/type 的值 {base_name:?} 不受支持"))?;
+    Ok(DeclaredType {
+        base,
+        nullable: true,
+    })
+}
+
+fn validate_fixed_value(
+    value: &Value,
+    declared_type: DeclaredType,
+    pointer: &str,
+) -> Result<(), String> {
+    if value.is_array() || value.is_object() {
+        return Err(format!("{pointer} 只能使用基础 JSON 值"));
+    }
+    if !declared_type.accepts(value) {
+        return Err(format!("{pointer} 的值 {value} 与声明的 type 不相容"));
+    }
+    Ok(())
+}
+
+fn reject_keywords(
+    object: &serde_json::Map<String, Value>,
+    pointer: &str,
+    keywords: &[&str],
+) -> Result<(), String> {
+    for keyword in keywords {
+        if object.contains_key(*keyword) {
+            return Err(format!("{pointer}/{} 只适用于对应的声明类型", keyword));
         }
     }
     Ok(())
 }
 
-fn reject_object_keywords(
+fn validate_ordered_nonnegative_integer_keywords(
+    object: &serde_json::Map<String, Value>,
+    pointer: &str,
+    minimum_keyword: &str,
+    maximum_keyword: &str,
+) -> Result<(), String> {
+    let minimum = nonnegative_integer_keyword(object, pointer, minimum_keyword)?;
+    let maximum = nonnegative_integer_keyword(object, pointer, maximum_keyword)?;
+    if minimum
+        .zip(maximum)
+        .is_some_and(|(minimum, maximum)| number_is_greater(minimum, maximum))
+    {
+        return Err(format!(
+            "{pointer}/{minimum_keyword} 必须小于或等于 {maximum_keyword}"
+        ));
+    }
+    Ok(())
+}
+
+fn nonnegative_integer_keyword<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    pointer: &str,
+    keyword: &str,
+) -> Result<Option<&'a serde_json::Number>, String> {
+    let Some(value) = object.get(keyword) else {
+        return Ok(None);
+    };
+    let number = value.as_number().filter(|number| {
+        number.as_i64().is_some_and(|number| number >= 0)
+            || number.as_u64().is_some()
+            || number
+                .as_f64()
+                .is_some_and(|number| number >= 0.0 && number.fract() == 0.0)
+    });
+    number
+        .map(Some)
+        .ok_or_else(|| format!("{pointer}/{keyword} 必须是非负整数"))
+}
+
+fn validate_number_bounds(
     object: &serde_json::Map<String, Value>,
     pointer: &str,
 ) -> Result<(), String> {
-    for keyword in ["properties", "required", "additionalProperties"] {
-        if object.contains_key(keyword) {
-            return Err(format!("{pointer} 的当前类型不能含 {keyword}"));
+    let minimum = number_keyword(object, pointer, "minimum")?;
+    let maximum = number_keyword(object, pointer, "maximum")?;
+    if minimum
+        .zip(maximum)
+        .is_some_and(|(minimum, maximum)| number_is_greater(minimum, maximum))
+    {
+        return Err(format!("{pointer}/minimum 必须小于或等于 maximum"));
+    }
+    Ok(())
+}
+
+fn number_keyword<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    pointer: &str,
+    keyword: &str,
+) -> Result<Option<&'a serde_json::Number>, String> {
+    let Some(value) = object.get(keyword) else {
+        return Ok(None);
+    };
+    value
+        .as_number()
+        .map(Some)
+        .ok_or_else(|| format!("{pointer}/{keyword} 必须是数字"))
+}
+
+fn number_is_greater(left: &serde_json::Number, right: &serde_json::Number) -> bool {
+    match (integer_value(left), integer_value(right)) {
+        (Some(left), Some(right)) => left > right,
+        _ => {
+            left.as_f64().expect("JSON 数字可表示为有限 f64")
+                > right.as_f64().expect("JSON 数字可表示为有限 f64")
         }
+    }
+}
+
+fn integer_value(number: &serde_json::Number) -> Option<i128> {
+    number
+        .as_i64()
+        .map(i128::from)
+        .or_else(|| number.as_u64().map(i128::from))
+        .or_else(|| {
+            let value = number.as_f64()?;
+            (value.fract() == 0.0 && value >= i128::MIN as f64 && value < i128::MAX as f64)
+                .then_some(value as i128)
+        })
+}
+
+fn validate_fixed_value_constraints(
+    schema: &Value,
+    pointer: &str,
+    enum_values: Option<&[Value]>,
+    constant: Option<&Value>,
+) -> Result<(), String> {
+    if enum_values.is_none() && constant.is_none() {
+        return Ok(());
+    }
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|error| format!("{pointer} 的固定值约束无法编译：{error}"))?;
+    if constant.is_some_and(|value| !validator.is_valid(value)) {
+        return Err(format!(
+            "{pointer}/const 必须同时满足当前节点的 type、enum 和范围约束"
+        ));
+    }
+    if enum_values.is_some_and(|values| !values.iter().any(|value| validator.is_valid(value))) {
+        return Err(format!(
+            "{pointer}/enum 至少需要一个能满足当前节点其他约束的值"
+        ));
     }
     Ok(())
 }
@@ -455,6 +799,25 @@ mod tests {
         })
     }
 
+    fn schema_with_property(property: Value) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"value": property},
+            "required": ["value"],
+            "additionalProperties": false
+        })
+    }
+
+    fn contract_for_schema(schema: &Value) -> OutputContract {
+        let directory = tempfile::tempdir().unwrap();
+        let schema_path = directory.path().join("schema.json");
+        fs::write(&schema_path, serde_json::to_vec(schema).unwrap()).unwrap();
+        let out = directory.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let out_root = OutputRoot::open(out).unwrap();
+        OutputContract::prepare(Some(&schema_path), &out_root).unwrap()
+    }
+
     #[test]
     fn common_subset_accepts_nested_objects_and_rejects_refs() {
         assert!(validate_subset(&valid_schema()).is_ok());
@@ -464,19 +827,243 @@ mod tests {
     }
 
     #[test]
-    fn validator_reports_both_paths() {
-        let directory = tempfile::tempdir().unwrap();
-        let schema_path = directory.path().join("schema.json");
-        fs::write(&schema_path, serde_json::to_vec(&valid_schema()).unwrap()).unwrap();
-        let out = directory.path().join("out");
-        fs::create_dir(&out).unwrap();
-        let out_root = OutputRoot::open(out).unwrap();
-        let contract = OutputContract::prepare(Some(&schema_path), &out_root).unwrap();
-        let issue = contract
-            .validate_submission(&serde_json::json!({"answer":1,"facts":[]}))
+    fn validator_reports_every_submission_issue_and_published_record_issue() {
+        let contract = contract_for_schema(&valid_schema());
+        let invalid = serde_json::json!({"answer":1,"extra":true});
+        let issues = contract.validate_submission(&invalid).unwrap_err();
+        assert_eq!(issues.issues().len(), 3);
+        assert!(issues.issues().iter().any(|issue| {
+            issue.instance_path.contains("answer") && issue.schema_path.contains("type")
+        }));
+        assert!(
+            issues
+                .issues()
+                .iter()
+                .any(|issue| issue.schema_path.contains("required"))
+        );
+        assert!(
+            issues
+                .issues()
+                .iter()
+                .any(|issue| { issue.schema_path.contains("additionalProperties") })
+        );
+        let display = issues.to_string();
+        assert!(display.contains("3 个格式问题"), "{display}");
+
+        let published_error = contract
+            .validate_published_record(&serde_json::to_vec(&invalid).unwrap())
             .unwrap_err();
-        assert!(issue.instance_path.contains("answer"));
-        assert!(issue.schema_path.contains("type"));
+        for issue in issues.issues() {
+            assert!(
+                published_error.contains(&issue.to_string()),
+                "{published_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn subset_accepts_nullable_types_const_and_common_ranges() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "const": "review"},
+                "title": {
+                    "type": ["null", "string"],
+                    "minLength": 1,
+                    "maxLength": 120
+                },
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "evidence": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 10
+                }
+            },
+            "required": ["kind", "title", "confidence", "evidence"],
+            "additionalProperties": false
+        });
+        assert!(validate_subset(&schema).is_ok());
+        let contract = contract_for_schema(&schema);
+        assert!(
+            contract
+                .validate_submission(&serde_json::json!({
+                    "kind": "review",
+                    "title": null,
+                    "confidence": 0.8,
+                    "evidence": ["source"]
+                }))
+                .is_ok()
+        );
+
+        let issues = contract
+            .validate_submission(&serde_json::json!({
+                "kind": "draft",
+                "title": "",
+                "confidence": 2,
+                "evidence": []
+            }))
+            .unwrap_err();
+        for keyword in ["const", "minLength", "maximum", "minItems"] {
+            assert!(
+                issues
+                    .issues()
+                    .iter()
+                    .any(|issue| issue.schema_path.contains(keyword)),
+                "缺少 {keyword} 校验问题：{issues}"
+            );
+        }
+    }
+
+    #[test]
+    fn nullable_type_requires_one_supported_non_null_type_and_null() {
+        let nullable_nodes = [
+            serde_json::json!({
+                "type": ["object", "null"],
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }),
+            serde_json::json!({
+                "type": ["null", "array"],
+                "items": {"type": "string"}
+            }),
+            serde_json::json!({"type": ["string", "null"]}),
+            serde_json::json!({"type": ["null", "number"]}),
+            serde_json::json!({"type": ["integer", "null"]}),
+            serde_json::json!({"type": ["null", "boolean"]}),
+        ];
+        for node in nullable_nodes {
+            assert!(validate_subset(&schema_with_property(node)).is_ok());
+        }
+
+        for node in [
+            serde_json::json!({"type": ["string"]}),
+            serde_json::json!({"type": ["null", "null"]}),
+            serde_json::json!({"type": ["string", "number"]}),
+            serde_json::json!({"type": ["string", "null", "number"]}),
+            serde_json::json!({"type": ["unknown", "null"]}),
+            serde_json::json!({"type": ["string", 1]}),
+        ] {
+            let error = validate_subset(&schema_with_property(node)).unwrap_err();
+            assert!(error.contains("/type"), "{error}");
+        }
+
+        let nullable_root = serde_json::json!({
+            "type": ["object", "null"],
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        });
+        assert!(
+            validate_subset(&nullable_root)
+                .unwrap_err()
+                .contains("根 schema")
+        );
+    }
+
+    #[test]
+    fn subset_checks_range_keyword_placement_types_and_order() {
+        let invalid_nodes = [
+            (
+                serde_json::json!({"type": "string", "minItems": 1}),
+                "minItems",
+            ),
+            (
+                serde_json::json!({
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minLength": 1
+                }),
+                "minLength",
+            ),
+            (
+                serde_json::json!({"type": "number", "minimum": "0"}),
+                "minimum",
+            ),
+            (
+                serde_json::json!({"type": "string", "minLength": -1}),
+                "minLength",
+            ),
+            (
+                serde_json::json!({
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "maxItems": 1.5
+                }),
+                "maxItems",
+            ),
+            (
+                serde_json::json!({"type": "string", "minLength": 2, "maxLength": 1}),
+                "minLength",
+            ),
+            (
+                serde_json::json!({
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 2,
+                    "maxItems": 1
+                }),
+                "minItems",
+            ),
+            (
+                serde_json::json!({"type": "integer", "minimum": 2, "maximum": 1}),
+                "minimum",
+            ),
+            (
+                serde_json::json!({
+                    "type": "number",
+                    "minimum": 9_007_199_254_740_993_u64,
+                    "maximum": 9_007_199_254_740_992_u64
+                }),
+                "minimum",
+            ),
+            (
+                serde_json::json!({
+                    "type": "number",
+                    "minimum": 9_007_199_254_740_993_u64,
+                    "maximum": 9_007_199_254_740_992.0
+                }),
+                "minimum",
+            ),
+        ];
+        for (node, keyword) in invalid_nodes {
+            let error = validate_subset(&schema_with_property(node)).unwrap_err();
+            assert!(error.contains(keyword), "{error}");
+        }
+    }
+
+    #[test]
+    fn subset_checks_enum_and_const_against_type_and_other_constraints() {
+        for valid in [
+            serde_json::json!({
+                "type": ["string", "null"],
+                "enum": ["ready", null],
+                "minLength": 2
+            }),
+            serde_json::json!({"type": "integer", "const": 1.0}),
+            serde_json::json!({"type": "number", "enum": [-1, 2], "minimum": 0}),
+            serde_json::json!({
+                "type": ["object", "null"],
+                "properties": {},
+                "required": [],
+                "additionalProperties": false,
+                "const": null
+            }),
+        ] {
+            assert!(validate_subset(&schema_with_property(valid)).is_ok());
+        }
+
+        for invalid in [
+            serde_json::json!({"type": "string", "enum": ["ready", 1]}),
+            serde_json::json!({"type": "integer", "const": 1.5}),
+            serde_json::json!({"type": "string", "const": []}),
+            serde_json::json!({"type": "string", "enum": ["draft"], "const": "review"}),
+            serde_json::json!({"type": "string", "const": "x", "minLength": 2}),
+            serde_json::json!({"type": "number", "enum": [-2, -1], "minimum": 0}),
+        ] {
+            assert!(validate_subset(&schema_with_property(invalid)).is_err());
+        }
     }
 
     #[test]

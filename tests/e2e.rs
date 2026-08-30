@@ -342,6 +342,135 @@ fn tools_value(body: &str) -> serde_json::Value {
     serde_json::from_str::<serde_json::Value>(body).unwrap()["tools"].clone()
 }
 
+#[derive(Default)]
+struct MixedRejectionHistory {
+    sequence: Vec<String>,
+    calls: Vec<(String, String)>,
+    results: Vec<(String, String)>,
+}
+
+fn assert_mixed_rejection_history(protocol: &str, body: &str) {
+    let value: serde_json::Value = serde_json::from_str(body).unwrap();
+    let history = match protocol {
+        "completions" => {
+            let messages = value["messages"].as_array().unwrap();
+            let mut history = MixedRejectionHistory::default();
+            for message in messages {
+                if let Some(tool_calls) = message["tool_calls"].as_array() {
+                    history.sequence.push("assistant".to_string());
+                    history.calls.extend(tool_calls.iter().map(|call| {
+                        (
+                            call["id"].as_str().unwrap().to_string(),
+                            call["function"]["name"].as_str().unwrap().to_string(),
+                        )
+                    }));
+                } else if message["role"] == "tool" {
+                    history.sequence.push("tool_result".to_string());
+                    history.results.push((
+                        message["tool_call_id"].as_str().unwrap().to_string(),
+                        message["content"].as_str().unwrap().to_string(),
+                    ));
+                }
+            }
+            history
+        }
+        "responses" => {
+            let input = value["input"].as_array().unwrap();
+            let mut history = MixedRejectionHistory::default();
+            for item in input {
+                match item["type"].as_str() {
+                    Some("function_call") => {
+                        history.sequence.push("function_call".to_string());
+                        history.calls.push((
+                            item["call_id"].as_str().unwrap().to_string(),
+                            item["name"].as_str().unwrap().to_string(),
+                        ));
+                    }
+                    Some("function_call_output") => {
+                        history.sequence.push("function_call_output".to_string());
+                        history.results.push((
+                            item["call_id"].as_str().unwrap().to_string(),
+                            item["output"].as_str().unwrap().to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            history
+        }
+        "anthropic" => {
+            let messages = value["messages"].as_array().unwrap();
+            let mut history = MixedRejectionHistory::default();
+            for part in messages
+                .iter()
+                .filter_map(|message| message["content"].as_array())
+                .flatten()
+            {
+                match part["type"].as_str() {
+                    Some("tool_use") => {
+                        history.sequence.push("tool_use".to_string());
+                        history.calls.push((
+                            part["id"].as_str().unwrap().to_string(),
+                            part["name"].as_str().unwrap().to_string(),
+                        ));
+                    }
+                    Some("tool_result") => {
+                        history.sequence.push("tool_result".to_string());
+                        history.results.push((
+                            part["tool_use_id"].as_str().unwrap().to_string(),
+                            part["content"].as_str().unwrap().to_string(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            history
+        }
+        other => panic!("未知测试协议 {other}"),
+    };
+
+    let expected_sequence: &[&str] = match protocol {
+        "completions" => &["assistant", "tool_result", "tool_result"],
+        "responses" => &[
+            "function_call",
+            "function_call",
+            "function_call_output",
+            "function_call_output",
+        ],
+        "anthropic" => &["tool_use", "tool_use", "tool_result", "tool_result"],
+        _ => unreachable!(),
+    };
+    assert_eq!(history.sequence, expected_sequence, "{protocol}: {body}");
+    assert_eq!(
+        history.calls,
+        [
+            ("search_1".to_string(), "search".to_string()),
+            ("submit_1".to_string(), "formic_submit_result".to_string()),
+        ],
+        "{protocol}: {body}"
+    );
+    assert_eq!(
+        history
+            .results
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+        ["search_1", "submit_1"],
+        "{protocol}: {body}"
+    );
+    assert!(
+        history.results[0].1.contains("工具 search 未执行"),
+        "{protocol}: {body}"
+    );
+    assert!(
+        history.results[1]
+            .1
+            .contains("必须在不含文本和其他工具调用的回合中单独出现"),
+        "{protocol}: {body}"
+    );
+    assert!(!body.contains("a.txt:1:"), "{protocol}: {body}");
+}
+
 fn assert_minimal_llm_body(protocol: &str, body: &str) {
     let value: serde_json::Value = serde_json::from_str(body).unwrap();
     let allowed: &[&str] = match protocol {
@@ -2196,16 +2325,48 @@ fn structured_invalid_and_mixed_turns_are_corrected_for_all_protocols() {
                 let report = worker_report(&out, unit);
                 assert!(report.contains("校验通过：`false`"), "{report}");
                 assert!(report.contains("校验通过：`true`"), "{report}");
+                if mixed {
+                    assert!(report.contains("工具 search 未执行"), "{report}");
+                    assert!(
+                        report.contains(
+                            "formic_submit_result 必须在不含文本和其他工具调用的回合中单独出现"
+                        ),
+                        "{report}"
+                    );
+                    assert!(
+                        report.contains("工具：`search`；来源：`builtin`"),
+                        "{report}"
+                    );
+                    assert!(
+                        report.contains("工具：`formic\\_submit\\_result`；来源：`internal`"),
+                        "{report}"
+                    );
+                    assert!(!report.contains("工具执行事实"), "{report}");
+                }
             }
             let stats = stats_lines(&out);
             for unit in [1, 2] {
                 let value = stats_of(&stats, unit);
                 assert_eq!(value["structured_corrections"], 1, "{value}");
                 if mixed {
-                    assert_eq!(value["tool_calls"]["search"], 1, "{value}");
+                    assert!(
+                        value["tool_calls"].as_object().unwrap().is_empty(),
+                        "{value}"
+                    );
                 }
             }
-            assert_eq!(mock.requests.lock().unwrap().len(), 4);
+            let requests = mock.requests.lock().unwrap();
+            assert_eq!(requests.len(), 4);
+            if mixed {
+                let corrected: Vec<_> = requests
+                    .iter()
+                    .filter(|request| request.body.contains(tool_result_marker(&request.path)))
+                    .collect();
+                assert_eq!(corrected.len(), 2, "{protocol}");
+                for request in corrected {
+                    assert_mixed_rejection_history(protocol, &request.body);
+                }
+            }
         }
     }
 }

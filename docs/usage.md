@@ -278,9 +278,46 @@ formic run \
   --output-schema result.schema.json
 ```
 
-当前支持根 object、基础类型、`properties`、`required`、`additionalProperties=false`、数组 `items` 和基础值 `enum`。外部 `$ref`、组合、条件和未知关键字会在启动时失败。
+Formic 接受一个明确的 JSON Schema 子集：
 
-Formic 为模型增加内部 `formic_submit_result`。提交 object 经过本地 schema 校验后才会发布。schema 负责形状，`task.md` 仍需解释字段含义、证据要求和何时允许空值。
+- 根 schema 使用 `type: "object"`；
+- 类型支持 `object`、`array`、`string`、`number`、`integer`、`boolean` 和 `null`；字段需要显式空值时，可用一个非 null 类型与 `null` 组成的二元 `type` 数组，例如 `["string", "null"]`；
+- object 支持 `properties`、`required` 和显式的 `additionalProperties: false`；
+- array 支持 `items`、`minItems` 和 `maxItems`；
+- string 支持 `minLength` 和 `maxLength`；
+- number 与 integer 支持 `minimum` 和 `maximum`；
+- 基础值支持 `enum` 和 `const`，各节点也可使用字符串 `title` 和 `description`。
+
+下面的内容可以直接保存为 `result.schema.json`：
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "kind": { "type": "string", "const": "review" },
+    "title": {
+      "type": ["string", "null"],
+      "minLength": 1,
+      "maxLength": 120
+    },
+    "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+    "evidence": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 1,
+      "maxItems": 10
+    }
+  },
+  "required": ["kind", "title", "confidence", "evidence"],
+  "additionalProperties": false
+}
+```
+
+`$ref`、组合 schema、条件 schema 和其余未知关键字会在 worker 启动前失败；当前子集不等同于完整 JSON Schema。
+
+Formic 为模型增加内部 `formic_submit_result`，并以本地校验作为发布门。一次提交包含多处错误时，模型会在同一次修正反馈中收到全部问题；修正次数耗尽后，本单元失败且不发布 JSON。提交工具与普通工具出现在同一回合时，整个回合会在工具调度前被拒绝，因此该回合的普通工具也不会执行。
+
+当前请求不发送供应商原生 `strict: true`。最终结果仍由 Formic 本地校验保证：模型提交和续跑时读取的现有 JSON 都必须符合当前 schema。schema 负责可机械检查的形状和范围，`task.md` 仍需解释字段含义、证据要求和何时使用空值。
 
 文本模式发布 `results/<unit>.md`；结构化模式发布 `results/<unit>.json`，并保存一份 `results/output-schema.json`。同一输出目录不能混用两种模式或更换 schema。
 
