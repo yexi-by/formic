@@ -1,8 +1,8 @@
 # Formic 可观测性与排错
 
-Formic 为每个实际启动的 worker 生成事后运行档案，用来回答：模型收到了什么、调用了哪些工具、为什么进入下一步，以及最终为何发布、失败或停止。
+Formic 在 worker 结束后生成运行档案，记录模型输入、工具往返、状态变化和最终结局。排错时先从终端找到未完成单元，再打开对应档案核对原因。
 
-档案只记录 Formic 能观察到的控制流和输入输出，不声称还原模型不可见的内部思维。
+档案描述 Formic 能观察到的控制流和输入输出，模型内部思维不属于可观察证据。
 
 ## 1. 输出布局
 
@@ -22,7 +22,7 @@ out/
       └─ summary.json
 ```
 
-结构化模式的完成记录为 `results/<unit>.json`。每次运行创建新的自然序号 `run-N`；续跑不会覆盖旧档案。
+结构化模式的完成记录为 `results/<unit>.json`。完成启动准备后，每次执行创建新的自然序号 `run-N`；续跑保留旧档案。启动失败可能发生在创建 run 之前，见[作业启动失败](#71-作业启动失败)。
 
 worker ID 就是计划中的 `unit`。运行序号把多次续跑的现场分开，因此旧档案不会指向新一轮媒体或统计。
 
@@ -75,7 +75,7 @@ worker ID 就是计划中的 `unit`。运行序号把多次续跑的现场分开
 | `stopped` | 收到取消或全局停发，未发布结果被丢弃 |
 | `failed` | worker 已确定无法继续 |
 
-状态之外还有事实事件，例如 `context_budget`、`retry`、`tool_execution`、`tool_media`、`output_validation` 和 `context_compaction`。状态说明“正在做什么”，事实事件说明“什么条件导致了这个状态”。
+状态之外还有事实事件，例如 `context_budget`、`retry`、`tool_execution`、`tool_media`、`output_validation` 和 `context_compaction`。状态说明当前执行阶段，事实事件补充预算、等待时间、工具结果和校验依据。档案中的最终结局为已发布（`published`）、失败（`failed`）或已停止（`stopped`）。
 
 ## 5. 生成与失败语义
 
@@ -122,16 +122,15 @@ llm_calls = llm_calls_with_provider_usage + llm_calls_without_provider_usage
 
 ### 7.1 作业启动失败
 
-先读终端。启动失败通常没有 worker 档案，常见原因包括：
+先读终端指出的对象、原因和处理办法。启动失败退出码为 `2`，通常没有 worker 档案，恢复动作取决于失败阶段：
 
-- 配置缺失或字段冲突；
-- 计划、任务或 schema 无效；
-- input 与 output 重叠；
-- 输出目录已被其他作业占用；
-- 续跑身份变化或结果现场损坏；
-- MCP initialize 或工具目录冻结失败。
+| 失败位置 | 已发生的动作 | 处理办法 |
+| --- | --- | --- |
+| 本地配置、计划、任务、schema、目录或续跑身份校验 | 尚未初始化 MCP，也未发送 LLM 请求；输出目录可能已建立 | 修正指出的字段、文件或目录问题；续跑身份变化时恢复原输入，需要改变作业则另建输出目录 |
+| MCP 初始化或工具目录冻结 | 作业身份和状态已经建立，可能已经发送 `initialize`、`tools/list`；尚未启动 worker 或发送 LLM 请求 | 修复服务、连接或工具配置，保留输出目录和作业输入，再用同一命令加 `--resume` 继续 |
+| 本地 I/O 或运行档案创建 | 以终端指出的文件和失败阶段为准，作业状态可能已经存在 | 恢复目录权限、空间或可用性；保留现场，已有作业状态时用 `--resume` 继续 |
 
-启动错误退出码为 2。确认问题发生在 MCP/LLM 请求前，不要用重试掩盖输入错误。
+不要删除状态文件或覆盖已发布结果来绕过续跑校验。状态与结果无法恢复一致时，保留原现场并用新输出目录重新运行。
 
 ### 7.2 单个 worker 失败
 
@@ -185,7 +184,7 @@ metrics rss_mb=... llm_in_flight=... tool_inflight=... history_kb=... search_avg
 | `search_max_ms` | search 最大耗时 |
 | `done` | 已完成单元数 |
 | `failed` | 已失败单元数 |
-| `cancelled` | 已取消单元数 |
+| `cancelled` | 已停止单元数，包括用户取消和全局停发 |
 
 ## 9. `scale-metrics.csv`
 

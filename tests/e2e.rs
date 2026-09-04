@@ -2338,7 +2338,7 @@ fn structured_invalid_and_mixed_turns_are_corrected_for_all_protocols() {
                         "{report}"
                     );
                     assert!(
-                        report.contains("工具：`formic\\_submit\\_result`；来源：`internal`"),
+                        report.contains("工具：`formic_submit_result`；来源：`internal`"),
                         "{report}"
                     );
                     assert!(!report.contains("工具执行事实"), "{report}");
@@ -4059,6 +4059,11 @@ fn cancelled_run_resumes_in_the_same_output_directory() {
     assert_summary_identities(&first_summary);
     assert_eq!(first_summary["stopped"], 1);
     assert_eq!(first_summary["not_started"], 0);
+    let stopped_report = fs::read_to_string(first_runs[0].join("workers/1.md")).unwrap();
+    assert!(
+        stopped_report.contains("结局：`stopped`（已停止）"),
+        "{stopped_report}"
+    );
 
     let resumed = run_formic_resume("completions", mock.port, 1, &data, &plan, &task, &out);
     assert_eq!(resumed.status.code(), Some(0), "{}", stderr_of(&resumed));

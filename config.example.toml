@@ -34,7 +34,9 @@ max_retry_after_ms = 60000
 # requests_per_minute = 600
 
 [execution]
-# 依次控制格式修正次数、同时处理的任务数、重复调用停止线和上下文预留空间。
+# llm_attempts 分别限制 worker 的结构化无效结果提交次数与每次上下文压缩的提交次数，均包含首次。
+# 两项独立计数；设为 1 时首次无效即失败。普通工具参数错误和网络重试不计入这两项。
+# 其余字段控制同时处理的任务数、重复调用停止线和上下文预留空间。
 llm_attempts = 5
 max_concurrent_units = 64
 identical_tool_call_limit = 16

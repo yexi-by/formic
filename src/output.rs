@@ -1109,8 +1109,12 @@ fn write_report_header(
     }
 
     writeln!(writer, "\n## 冻结配置\n")?;
-    writeln!(writer, "- 协议：`{}`", markdown_inline(&run.facts.protocol))?;
-    writeln!(writer, "- 模型：`{}`", markdown_inline(&run.facts.model))?;
+    writeln!(
+        writer,
+        "- 协议：{}",
+        markdown_code_span(&run.facts.protocol)
+    )?;
+    writeln!(writer, "- 模型：{}", markdown_code_span(&run.facts.model))?;
     writeln!(
         writer,
         "- 上下文窗口：`{}` token",
@@ -1750,8 +1754,8 @@ fn render_audit_entry(
                 .unwrap_or("");
             writeln!(
                 writer,
-                "完成类别：`{}`；工具调用：`{tool_calls}`；助手正文：`{}` bytes。\n",
-                markdown_inline(finish),
+                "完成类别：{}；工具调用：`{tool_calls}`；助手正文：`{}` bytes。\n",
+                markdown_code_span(finish),
                 text.len(),
             )?;
             if !text.is_empty() {
@@ -1797,9 +1801,9 @@ fn render_audit_entry(
                 .unwrap_or("unknown");
             writeln!(
                 writer,
-                "工具：`{}`；来源：`{}`。\n",
-                markdown_inline(name),
-                markdown_inline(source)
+                "工具：{}；来源：{}。\n",
+                markdown_code_span(name),
+                markdown_code_span(source)
             )?;
             let data = value
                 .get("data")
@@ -1810,14 +1814,14 @@ fn render_audit_entry(
         "tool_execution" => {
             writeln!(
                 writer,
-                "工具：`{}`；缓存：`{}`；排队 `{}` ms；执行 `{}` ms；结果 `{}` bytes；MCP server：`{}`。\n",
-                markdown_inline(
+                "工具：{}；缓存：{}；排队 `{}` ms；执行 `{}` ms；结果 `{}` bytes；MCP server：{}。\n",
+                markdown_code_span(
                     value
                         .get("name")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("unknown")
                 ),
-                markdown_inline(
+                markdown_code_span(
                     value
                         .get("cache")
                         .and_then(serde_json::Value::as_str)
@@ -1835,7 +1839,7 @@ fn render_audit_entry(
                     .get("result_bytes")
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(0),
-                markdown_inline(
+                markdown_code_span(
                     value
                         .get("mcp_server")
                         .and_then(serde_json::Value::as_str)
@@ -1862,9 +1866,9 @@ fn render_audit_entry(
                 .unwrap_or("");
             writeln!(
                 writer,
-                "来源：`{}`；类型：`{}`；尺寸：`{}`×`{}`；原始字节：`{}`；视觉 token 估算：`{}`。",
-                markdown_inline(source),
-                markdown_inline(
+                "来源：{}；类型：{}；尺寸：`{}`×`{}`；原始字节：`{}`；视觉 token 估算：`{}`。",
+                markdown_code_span(source),
+                markdown_code_span(
                     value
                         .get("mime_type")
                         .and_then(serde_json::Value::as_str)
@@ -1895,7 +1899,7 @@ fn render_audit_entry(
                     path
                 )?;
             } else {
-                writeln!(writer, "input 相对路径：`{}`\n", markdown_inline(path))?;
+                writeln!(writer, "input 相对路径：{}\n", markdown_code_span(path))?;
             }
         }
         "retry" => {
@@ -1923,18 +1927,18 @@ fn render_audit_entry(
         "output_validation" => {
             writeln!(
                 writer,
-                "校验通过：`{}`；实例位置：`{}`；schema 位置：`{}`。\n",
+                "校验通过：`{}`；实例位置：{}；schema 位置：{}。\n",
                 value
                     .get("valid")
                     .and_then(serde_json::Value::as_bool)
                     .unwrap_or(false),
-                markdown_inline(
+                markdown_code_span(
                     value
                         .get("instance_path")
                         .and_then(serde_json::Value::as_str)
                         .unwrap_or("无")
                 ),
-                markdown_inline(
+                markdown_code_span(
                     value
                         .get("schema_path")
                         .and_then(serde_json::Value::as_str)
@@ -1996,14 +2000,14 @@ fn audit_title(direction: &str, value: &serde_json::Value) -> String {
         "output_validation" => "结构化结果校验".into(),
         "compaction_request" => "上下文压缩请求".into(),
         "context_compaction" => "上下文压缩结果".into(),
-        other => format!("审计事件 `{}`", markdown_inline(other)),
+        other => format!("审计事件 {}", markdown_code_span(other)),
     }
 }
 
 fn outcome_label(outcome: &str) -> &'static str {
     match outcome {
         "published" => "已发布",
-        "cancelled" => "已取消",
+        "stopped" => "已停止",
         "failed" => "失败",
         _ => "未知",
     }
@@ -2095,6 +2099,21 @@ fn markdown_inline(text: &str) -> String {
         }
     }
     escaped
+}
+
+fn markdown_code_span(text: &str) -> String {
+    let text = text.replace(['\r', '\n'], " ");
+    let fence = "`".repeat(longest_backtick_run(&text).saturating_add(1));
+    // 首尾反引号需要与围栏分开；首尾都有空格时补齐 Markdown 会移除的一层空格。
+    let padding = if text.starts_with('`')
+        || text.ends_with('`')
+        || (text.starts_with(' ') && text.ends_with(' ') && text.chars().any(|c| c != ' '))
+    {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{padding}{text}{padding}{fence}")
 }
 
 #[cfg(test)]
@@ -2356,9 +2375,38 @@ mod tests {
         audit.push_llm_request(1, &first_request).unwrap();
         audit
             .push(&AuditEntry::ModelResponse {
-                finish: "stop".into(),
+                finish: "tool_use".into(),
                 text: "甲乙".into(),
-                tool_calls: 0,
+                tool_calls: 1,
+            })
+            .unwrap();
+        audit
+            .push(&AuditEntry::ToolCall {
+                name: "read_image".into(),
+                source: Some("builtin".into()),
+                arguments: r#"{"path":"images/my_`photo`.png"}"#.into(),
+            })
+            .unwrap();
+        audit
+            .push(&AuditEntry::ToolResult("已读取图片".into()))
+            .unwrap();
+        audit
+            .push(&AuditEntry::ToolMedia {
+                source: "input".into(),
+                path: "images/my_`photo`.png".into(),
+                mime_type: "image/png".into(),
+                bytes: 12,
+                width: 1,
+                height: 1,
+                estimated_tokens: 85,
+            })
+            .unwrap();
+        audit
+            .push(&AuditEntry::OutputValidation {
+                valid: false,
+                instance_path: Some("/detail\n\nname".into()),
+                schema_path: Some("/properties/detail\r\nname/type".into()),
+                reason: "字段必须是字符串".into(),
             })
             .unwrap();
         audit.push_llm_request(1, &second_request).unwrap();
@@ -2441,6 +2489,20 @@ mod tests {
             "解析后的响应只生成一个标题：{markdown}"
         );
         assert!(markdown.contains("甲乙"), "{markdown}");
+        assert!(
+            markdown.contains("工具：`read_image`；来源：`builtin`"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains("input 相对路径：``images/my_`photo`.png``"),
+            "{markdown}"
+        );
+        assert!(
+            markdown.contains(
+                "实例位置：`/detail  name`；schema 位置：`/properties/detail  name/type`"
+            ),
+            "{markdown}"
+        );
         assert!(!markdown.contains("response.completed"), "{markdown}");
         assert!(markdown.contains("结局：`failed`"), "{markdown}");
         assert!(markdown.contains("模型拒绝执行"), "{markdown}");
