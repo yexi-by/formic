@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 
 use crate::llm::{InputModalities, LlmConfig, Protocol};
@@ -123,6 +123,7 @@ struct FileConfig {
     protocol: Option<String>,
     url: Option<String>,
     api_key: Option<String>,
+    headers: BTreeMap<String, String>,
     model: Option<String>,
     context_window_tokens: Option<u64>,
     model_input_modalities: Option<Vec<String>>,
@@ -312,6 +313,7 @@ fn resolve(file: FileConfig) -> Result<AppConfig, ConfigError> {
     let protocol_name = non_empty(file.protocol).ok_or(ConfigError::MissingProtocol)?;
     let protocol = Protocol::parse(&protocol_name).map_err(ConfigError::InvalidProtocol)?;
     let extra_body = parse_extra_body_json(file.extra_body_json.as_deref(), protocol)?;
+    let headers = parse_llm_headers(file.headers)?;
     let context_window_tokens = file
         .context_window_tokens
         .ok_or(ConfigError::MissingContextWindow)?;
@@ -439,6 +441,7 @@ fn resolve(file: FileConfig) -> Result<AppConfig, ConfigError> {
             base_url: non_empty(file.url).ok_or(ConfigError::MissingUrl)?,
             model: non_empty(file.model).ok_or(ConfigError::MissingModel)?,
             api_key: non_empty(file.api_key),
+            headers,
             context_window_tokens,
             anthropic_max_tokens,
             input_modalities,
@@ -475,6 +478,40 @@ fn resolve(file: FileConfig) -> Result<AppConfig, ConfigError> {
         cache,
         mcp_servers,
     })
+}
+
+fn parse_llm_headers(raw: BTreeMap<String, String>) -> Result<HeaderMap, ConfigError> {
+    let invalid = || {
+        ConfigError::Invalid(
+            "headers 必须包含合法且不重复的 HTTP 请求头，不能覆盖认证、正文类型、分帧或协议固定头"
+                .into(),
+        )
+    };
+    let mut headers = HeaderMap::new();
+    for (name, value) in raw {
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| invalid())?;
+        if matches!(
+            name.as_str(),
+            "authorization"
+                | "proxy-authorization"
+                | "content-type"
+                | "content-length"
+                | "host"
+                | "transfer-encoding"
+                | "connection"
+                | "trailer"
+                | "upgrade"
+                | "x-api-key"
+                | "anthropic-version"
+        ) || headers.contains_key(&name)
+        {
+            return Err(invalid());
+        }
+        let mut value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| invalid())?;
+        value.set_sensitive(true);
+        headers.insert(name, value);
+    }
+    Ok(headers)
 }
 
 fn parse_input_modalities(file: Option<Vec<String>>) -> Result<InputModalities, ConfigError> {
@@ -780,6 +817,7 @@ metrics = false
         assert!(!config.metrics_enabled);
         assert_eq!(config.llm.anthropic_max_tokens, None);
         assert!(config.llm.extra_body.is_empty());
+        assert!(config.llm.headers.is_empty());
         assert_eq!(config.llm.connect_timeout, Duration::from_millis(30_000));
         assert_eq!(config.llm.read_timeout, Duration::from_millis(600_000));
         assert_eq!(config.llm.request_timeout, Duration::from_millis(1_800_000));
@@ -803,6 +841,40 @@ metrics = false
         assert_eq!(config.tools.read.max_result_bytes, 1024 * 1024);
         assert_eq!(config.tools.read.max_in_flight, 64);
         assert_eq!(config.cache.max_bytes, 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn llm_headers_validate_names_values_duplicates_and_owned_fields() {
+        let file = format!(
+            "{BASE_FILE}\nheaders = {{ user-agent = 'Formic/0.3.0', x-opencode-session = 'session-sentinel' }}\n"
+        );
+        let config = load_fixture(Some(&file)).unwrap();
+        assert_eq!(config.llm.headers["user-agent"], "Formic/0.3.0");
+        assert_eq!(config.llm.headers["x-opencode-session"], "session-sentinel");
+        assert!(!format!("{:?}", config.llm.headers).contains("session-sentinel"));
+        for headers in [
+            "{ 'bad name' = 'value' }",
+            "{ 'x-session' = \"bad\\r\\nvalue\" }",
+            "{ 'User-Agent' = 'first', 'user-agent' = 'second' }",
+            "{ Authorization = 'owned-field-sentinel' }",
+            "{ 'Proxy-Authorization' = 'owned-field-sentinel' }",
+            "{ 'Content-Type' = 'owned-field-sentinel' }",
+            "{ 'Content-Length' = 'owned-field-sentinel' }",
+            "{ Host = 'owned-field-sentinel' }",
+            "{ 'Transfer-Encoding' = 'owned-field-sentinel' }",
+            "{ Connection = 'owned-field-sentinel' }",
+            "{ Trailer = 'owned-field-sentinel' }",
+            "{ Upgrade = 'owned-field-sentinel' }",
+            "{ 'x-api-key' = 'owned-field-sentinel' }",
+            "{ 'Anthropic-Version' = 'owned-field-sentinel' }",
+        ] {
+            let file = format!("{BASE_FILE}\nheaders = {headers}\n");
+            let error = load_fixture(Some(&file))
+                .err()
+                .expect("无效或冲突头必须拒绝");
+            assert!(matches!(error, ConfigError::Invalid(_)));
+            assert!(!error.to_string().contains("owned-field-sentinel"));
+        }
     }
 
     #[test]

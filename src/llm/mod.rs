@@ -557,13 +557,15 @@ impl PreparedLlmCall {
     }
 }
 
-/// LLM 调用配置，由启动边界合并环境变量和配置文件，缺失必填项时明确失败。
+/// LLM 调用配置，由启动边界解析唯一 TOML，缺失必填项时明确失败。
 #[derive(Clone)]
 pub struct LlmConfig {
     pub protocol: Protocol,
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
+    /// 配置边界已校验的自定义请求头，统一用于全部模型协议与调用。
+    pub headers: reqwest::header::HeaderMap,
     /// 模型声明的完整上下文窗口，用于调用前预算。
     pub context_window_tokens: u64,
     /// Anthropic Messages 协议要求的 max_tokens；其他协议必须为 None。
@@ -587,6 +589,7 @@ impl LlmConfig {
             base_url: "http://127.0.0.1".into(),
             model: "test-model".into(),
             api_key: None,
+            headers: reqwest::header::HeaderMap::new(),
             context_window_tokens: 100_000,
             anthropic_max_tokens: None,
             input_modalities: InputModalities::Text,
@@ -840,6 +843,7 @@ impl LlmClient {
         let mut req = self
             .http
             .post(&prepared.url)
+            .headers(self.config.headers.clone())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(prepared.body);
         for (name, value) in prepared.headers {

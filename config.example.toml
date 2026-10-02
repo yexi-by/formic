@@ -4,6 +4,8 @@
 protocol = "completions"
 url = "https://api.example.com/v1"
 api_key = ""
+# 需要客户端身份或会话路由时填写；会话标识在同一作业内保持稳定。
+# headers = { "user-agent" = "Formic/0.3.0", "x-opencode-session" = "formic-current-job" }
 model = "model-name"
 context_window_tokens = 131072
 

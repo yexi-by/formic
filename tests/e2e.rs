@@ -501,6 +501,8 @@ struct Recorded {
     path: String,
     body: String,
     authorization: Option<String>,
+    user_agent: Option<String>,
+    opencode_session: Option<String>,
 }
 
 struct MockServer {
@@ -722,6 +724,8 @@ fn handle_conn(
 
     let mut content_length = 0usize;
     let mut authorization = None;
+    let mut user_agent = None;
+    let mut opencode_session = None;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).is_err() {
@@ -735,6 +739,8 @@ fn handle_conn(
             match name.to_ascii_lowercase().as_str() {
                 "content-length" => content_length = value.trim().parse().unwrap_or(0),
                 "authorization" => authorization = Some(value.trim().to_string()),
+                "user-agent" => user_agent = Some(value.trim().to_string()),
+                "x-opencode-session" => opencode_session = Some(value.trim().to_string()),
                 _ => {}
             }
         }
@@ -748,6 +754,8 @@ fn handle_conn(
         path: path.clone(),
         body: body_text.clone(),
         authorization,
+        user_agent,
+        opencode_session,
     });
 
     if body_text.contains(SLOW_QUOTA_MARKER) && !flaky_seen.swap(true, Ordering::SeqCst) {
@@ -2675,6 +2683,66 @@ fn explicitly_selected_missing_config_fails_before_any_request() {
     assert!(stdout.contains("配置：失败（指定的配置文件"), "{stdout}");
     assert!(stdout.contains("汇总：0/1 项通过"), "{stdout}");
     assert!(mock.requests.lock().unwrap().is_empty());
+}
+
+#[test]
+fn configured_llm_headers_reach_test_and_worker_on_all_protocols() {
+    for protocol in ["completions", "responses", "anthropic"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (data, plan, task, out) = write_job(dir.path(), None);
+        let mock = start_mock();
+        let config = write_mock_config(dir.path(), protocol, mock.port, 131072, "text");
+        let original = fs::read_to_string(&config).unwrap();
+        fs::write(
+            &config,
+            format!(
+                "headers = {{ user-agent = 'Formic/0.3.0', x-opencode-session = 'session-sentinel' }}\n{original}"
+            ),
+        )
+        .unwrap();
+        let check = formic_test_command(&config).output().unwrap();
+        assert_eq!(check.status.code(), Some(0), "{}", stderr_of(&check));
+        let run = formic_command(2, &data, &plan, &task, &out)
+            .arg("--config")
+            .arg(&config)
+            .output()
+            .unwrap();
+        assert_eq!(run.status.code(), Some(0), "{}", stderr_of(&run));
+        let requests = mock.requests.lock().unwrap();
+        assert!(requests.len() >= 5, "必须覆盖自检和 worker 多轮调用");
+        for request in requests.iter() {
+            assert_eq!(request.user_agent.as_deref(), Some("Formic/0.3.0"));
+            assert_eq!(
+                request.opencode_session.as_deref(),
+                Some("session-sentinel")
+            );
+        }
+        for output in [&check, &run] {
+            assert!(!stdout_of(output).contains("session-sentinel"));
+            assert!(!stderr_of(output).contains("session-sentinel"));
+        }
+        for unit in [1, 2] {
+            assert!(!worker_report(&out, unit).contains("session-sentinel"));
+        }
+    }
+}
+
+#[test]
+fn invalid_llm_headers_stop_before_http_send() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = start_mock();
+    let config = write_mock_config(dir.path(), "completions", mock.port, 131072, "text");
+    let original = fs::read_to_string(&config).unwrap();
+    fs::write(
+        &config,
+        format!("headers = {{ Authorization = 'header-secret' }}\n{original}"),
+    )
+    .unwrap();
+    let output = formic_test_command(&config).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(mock.requests.lock().unwrap().is_empty());
+    assert!(!stdout_of(&output).contains("header-secret"));
+    assert!(!stderr_of(&output).contains("header-secret"));
 }
 
 #[test]

@@ -89,6 +89,19 @@ Formic 的部署、模型、协议、密钥、MCP 和观测配置只来自一份
 HTTP MCP 的 bearer 与 header 直接写入对应 server；stdio MCP 的业务环境放在该 server 的
 `env` 表。Formic 只额外保留启动子进程所需的最小操作系统环境，不把这些系统值解释为产品配置。
 
+模型服务需要客户端身份或会话路由时，在 TOML 顶层填写可选 `headers` 字符串表：
+
+```toml
+headers = { "user-agent" = "Formic/0.3.0", "x-opencode-session" = "formic-current-job" }
+```
+
+省略时不添加自定义请求头。该表用于三种模型协议的全部普通、重试、上下文压缩和自检请求，
+与 MCP server 的 `headers` 分别配置。Header 名称和值必须合法，名称按大小写不敏感判重；
+Authorization、Proxy-Authorization、Content-Type、Content-Length、Host、Transfer-Encoding、
+Connection、Trailer、Upgrade、x-api-key 和 anthropic-version 由运行根或协议拥有，不能覆盖。
+无效配置在发送前拒绝，诊断不回显 Header 值；请求头不进入终端、stats 或 worker 档案。
+User-Agent 使用 Formic 的实际身份，会话标识由操作者指定，并在同一作业与续跑中保持稳定。
+
 ### 2.4 资源与失败策略
 
 配置文件还可以调整当前活动资源和失败处理：
