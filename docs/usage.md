@@ -46,6 +46,18 @@ metrics = false
 
 `anthropic` 还必须配置正整数 `anthropic_max_tokens`。其他协议出现该字段会直接失败。
 
+Chat Completions 流中的 `delta.tool_calls` 缺失或为 `null` 时，表示当前帧没有工具调用增量；
+数组中的调用按 `index` 拼接。每条调用的 `id`、`type`、`function`，以及 `function.name` 和
+`function.arguments` 都允许缺失或为 `null`，此时不追加也不清空已经收到的内容。这些字段的
+可空类型以 [OpenAI 官方协议定义](https://github.com/openai/openai-python/blob/main/src/openai/types/chat/chat_completion_chunk.py)为依据。
+
+非 `null` 值仍须符合字段类型，数组元素必须是 object，`index` 必须是非负整数；错误类型、跳号或
+同帧重复索引都会被拒绝。工具回合结束时，每条调用仍须具备非空 `id`、非空 `function.name`
+和实际收到的字符串 `function.arguments`；`null` 不能代替完整参数。
+
+Completions 必须收到明确的 `finish_reason` 才能完成回合。单独的 `[DONE]` 或连接结束不能
+代替完成事件，也不会使半截正文或未完成的工具调用成为可发布结果。
+
 ### 2.1 模型输入能力
 
 `model_input_modalities` 是操作者对远端模型能力的明确声明，只接受两种写法：

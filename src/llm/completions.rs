@@ -142,8 +142,8 @@ fn user_content(
     Ok(serde_json::Value::Array(parts))
 }
 
-/// 每个 index 一条在组装的工具调用。`arguments_seen` 区分供应商实际发送了空字符串，
-/// 还是从未发送 arguments 字段；参数 JSON 的语义校验仍由 worker 统一负责。
+/// 每个 index 一条在组装的工具调用。`arguments_seen` 区分供应商实际发送了字符串
+/// （包括空字符串），还是 arguments 缺失或为 null；参数 JSON 的语义校验仍由 worker 负责。
 #[derive(Default)]
 struct PartialToolCall {
     call_id: String,
@@ -218,10 +218,11 @@ impl super::Transform for Transform {
 
         let mut events = Vec::new();
         if let Some(delta) = choice.get("delta") {
-            if let Some(tool_calls_value) = delta.get("tool_calls") {
-                let tool_calls = tool_calls_value
-                    .as_array()
-                    .ok_or_else(|| LlmError::protocol("delta.tool_calls 必须是数组", payload))?;
+            if let Some(tool_calls_value) = delta.get("tool_calls").filter(|value| !value.is_null())
+            {
+                let tool_calls = tool_calls_value.as_array().ok_or_else(|| {
+                    LlmError::protocol("delta.tool_calls 必须是数组或 null", payload)
+                })?;
                 let mut frame_indices = std::collections::HashSet::with_capacity(tool_calls.len());
                 for part in tool_calls {
                     let part = part.as_object().ok_or_else(|| {
@@ -254,33 +255,38 @@ impl super::Transform for Transform {
                     if index == self.partial.len() {
                         self.partial.push(PartialToolCall::default());
                     }
-                    if let Some(call_type) = part.get("type")
+                    if let Some(call_type) = part.get("type").filter(|value| !value.is_null())
                         && call_type.as_str() != Some("function")
                     {
                         return Err(LlmError::protocol(
-                            "tool_calls.type 必须是 function",
+                            "tool_calls.type 必须是 function 或 null",
                             payload,
                         ));
                     }
                     let slot = &mut self.partial[index];
-                    if let Some(id) = part.get("id") {
+                    if let Some(id) = part.get("id").filter(|value| !value.is_null()) {
                         slot.call_id.push_str(id.as_str().ok_or_else(|| {
-                            LlmError::protocol("tool_calls.id 必须是字符串", payload)
+                            LlmError::protocol("tool_calls.id 必须是字符串或 null", payload)
                         })?);
                     }
-                    if let Some(function) = part.get("function") {
+                    if let Some(function) = part.get("function").filter(|value| !value.is_null()) {
                         let function = function.as_object().ok_or_else(|| {
-                            LlmError::protocol("tool_calls.function 必须是 object", payload)
+                            LlmError::protocol("tool_calls.function 必须是 object 或 null", payload)
                         })?;
-                        if let Some(name) = function.get("name") {
+                        if let Some(name) = function.get("name").filter(|value| !value.is_null()) {
                             slot.name.push_str(name.as_str().ok_or_else(|| {
-                                LlmError::protocol("tool_calls.function.name 必须是字符串", payload)
+                                LlmError::protocol(
+                                    "tool_calls.function.name 必须是字符串或 null",
+                                    payload,
+                                )
                             })?);
                         }
-                        if let Some(args) = function.get("arguments") {
+                        if let Some(args) =
+                            function.get("arguments").filter(|value| !value.is_null())
+                        {
                             slot.arguments.push_str(args.as_str().ok_or_else(|| {
                                 LlmError::protocol(
-                                    "tool_calls.function.arguments 必须是字符串",
+                                    "tool_calls.function.arguments 必须是字符串或 null",
                                     payload,
                                 )
                             })?);
@@ -370,17 +376,19 @@ mod tests {
 
     const TEXT_SAMPLE: &str = concat!(
         "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\",\"tool_calls\":null},\"finish_reason\":null}]}\n\n",
         "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"世界\"},\"finish_reason\":null}]}\n\n",
-        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"tool_calls\":null},\"finish_reason\":\"stop\"}]}\n\n",
         "data: [DONE]\n\n",
     );
 
     const TOOL_SAMPLE: &str = concat!(
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":null,\"type\":null,\"function\":null}]},\"finish_reason\":null}]}\n\n",
         "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
-        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"pattern\\\":\\\"苹果\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":null,\"type\":null,\"function\":{\"name\":null,\"arguments\":\"{\\\"pattern\\\":\\\"苹果\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+        "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":null,\"arguments\":null}}]},\"finish_reason\":null}]}\n\n",
         "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\",\\\"scope\\\":\\\"input\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
-        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":null},\"finish_reason\":\"tool_calls\"}]}\n\n",
         "data: [DONE]\n\n",
     );
 
@@ -443,6 +451,9 @@ mod tests {
             r#"{"index":0,"id":"","type":"function","function":{"name":"search","arguments":"{}"}}"#,
             r#"{"index":0,"id":"call_1","type":"function","function":{"name":"","arguments":"{}"}}"#,
             r#"{"index":0,"id":"call_1","type":"function","function":{"name":"search"}}"#,
+            r#"{"index":0,"id":null,"type":null,"function":{"name":"search","arguments":"{}"}}"#,
+            r#"{"index":0,"id":"call_1","function":{"name":null,"arguments":"{}"}}"#,
+            r#"{"index":0,"id":"call_1","function":{"name":"search","arguments":null}}"#,
         ] {
             let mut transform = Transform::new();
             transform
@@ -528,12 +539,22 @@ mod tests {
 
     #[test]
     fn tool_call_fields_with_wrong_json_types_are_protocol_errors() {
+        for value in [r#"{}"#, r#""bad""#, "1", "true", "[null]"] {
+            let mut transform = Transform::new();
+            let result = transform.push(&format!(
+                r#"{{"choices":[{{"delta":{{"tool_calls":{value}}},"finish_reason":null}}]}}"#
+            ));
+            assert!(matches!(result, Err(LlmError::Protocol { .. })), "{value}");
+        }
         for part in [
+            r#"{"index":null}"#,
             r#"{"index":"0"}"#,
             r#"{"index":0,"id":1}"#,
+            r#"{"index":0,"function":[]}"#,
             r#"{"index":0,"function":{"name":1}}"#,
             r#"{"index":0,"function":{"arguments":{}}}"#,
             r#"{"index":0,"type":"custom"}"#,
+            r#"{"index":0,"type":1}"#,
         ] {
             let mut transform = Transform::new();
             let result = transform.push(&format!(

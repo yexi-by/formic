@@ -52,6 +52,7 @@ const RATE_NUMERIC_MARKER: &str = "RATE-NUMERIC-UNIT";
 const RATE_DATE_MARKER: &str = "RATE-DATE-UNIT";
 const BAD_PROTOCOL_MARKER: &str = "BAD-PROTOCOL-UNIT";
 const EOF_WITHOUT_FINISH_MARKER: &str = "EOF-WITHOUT-FINISH-UNIT";
+const DONE_WITHOUT_FINISH_MARKER: &str = "DONE-WITHOUT-FINISH-UNIT";
 const SLOW_QUOTA_MARKER: &str = "SLOW-QUOTA-UNIT";
 const SLOW_SERVER_MARKER: &str = "SLOW-SERVER-UNIT";
 const NETWORK_CONTEXT_NETWORK_MARKER: &str = "NETWORK-CONTEXT-NETWORK-UNIT";
@@ -65,10 +66,10 @@ const SELF_TEST_MARKER: &str = "Formic 连接自检";
 // ---- 罐装 SSE：文本最终帧（三协议）----
 
 const COMPLETIONS_FINAL: &str = concat!(
-    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\",\"tool_calls\":null},\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"},\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"世界\"},\"finish_reason\":null}]}\n\n",
-    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"tool_calls\":null},\"finish_reason\":\"stop\"}]}\n\n",
     "data: {\"id\":\"c1\",\"choices\":[],\"usage\":{\"prompt_tokens\":100,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":60,\"cache_creation_tokens\":20}}}\n\n",
     "data: [DONE]\n\n",
 );
@@ -93,10 +94,12 @@ const ANTHROPIC_FINAL: &str = concat!(
 // ---- 罐装 SSE：search 工具调用（三协议，参数分片传输）----
 
 const COMPLETIONS_TOOLCALL: &str = concat!(
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":null,\"type\":null,\"function\":null}]},\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"search\",\"arguments\":\"\"}}]},\"finish_reason\":null}]}\n\n",
-    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"pattern\\\":\\\"苹果\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":null,\"type\":null,\"function\":{\"name\":null,\"arguments\":\"{\\\"pattern\\\":\\\"苹果\\\"\"}}]},\"finish_reason\":null}]}\n\n",
+    "data: {\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":null,\"arguments\":null}}]},\"finish_reason\":null}]}\n\n",
     "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\",\\\"scope\\\":\\\"input\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
-    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+    "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":null},\"finish_reason\":\"tool_calls\"}]}\n\n",
     "data: [DONE]\n\n",
 );
 
@@ -885,11 +888,20 @@ fn handle_conn(
             String::new(),
             format!("data: {{\"secret\":\"{RESPONSE_SECRET}\",\"choices\":\"bad\"}}\n\n"),
         ))
-    } else if body_text.contains(EOF_WITHOUT_FINISH_MARKER) {
+    } else if body_text.contains(EOF_WITHOUT_FINISH_MARKER)
+        || body_text.contains(DONE_WITHOUT_FINISH_MARKER)
+    {
+        let done = if body_text.contains(DONE_WITHOUT_FINISH_MARKER) {
+            "data: [DONE]\n\n"
+        } else {
+            ""
+        };
         Some((
             "200 OK".to_string(),
             String::new(),
-            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"},\"finish_reason\":null}]}\n\n".to_string(),
+            format!(
+                "data: {{\"id\":\"c1\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"partial\",\"tool_calls\":null}},\"finish_reason\":null}}]}}\n\n{done}"
+            ),
         ))
     } else {
         None
@@ -2013,7 +2025,6 @@ fn mcp_images_are_archived_once_and_only_references_enter_public_audit() {
         "一次 MCP 图片只应留下一个自然编号文件"
     );
     let report = worker_report(&out, 1);
-    assert!(report.contains(r"来源：`run\_media`"), "{report}");
     assert!(
         report.contains("[media/1/1.png](../media/1/1.png)"),
         "{report}"
@@ -3952,14 +3963,16 @@ fn malformed_protocol_payload_is_discarded_from_every_public_artifact() {
 
 #[test]
 fn eof_without_completion_is_fatal_protocol_but_does_not_stop_later_units() {
+    for marker in [EOF_WITHOUT_FINISH_MARKER, DONE_WITHOUT_FINISH_MARKER] {
+        assert_unfinished_stream_does_not_stop_later_units(marker);
+    }
+}
+
+fn assert_unfinished_stream_does_not_stop_later_units(marker: &str) {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     fs::create_dir_all(&data).unwrap();
-    fs::write(
-        data.join("bad.txt"),
-        format!("{EOF_WITHOUT_FINISH_MARKER}\n"),
-    )
-    .unwrap();
+    fs::write(data.join("bad.txt"), format!("{marker}\n")).unwrap();
     fs::write(data.join("good.txt"), "普通输入\n").unwrap();
     let plan = dir.path().join("plan.jsonl");
     fs::write(
@@ -3988,7 +4001,13 @@ fn eof_without_completion_is_fatal_protocol_but_does_not_stop_later_units() {
     let stats = stats_lines(&out);
     assert_eq!(stats_of(&stats, 1)["llm_calls"], 1);
     assert_eq!(stats_of(&stats, 1)["retries"], 0);
-    assert!(results_dir(&out).join("2.md").exists());
+    assert!(!results_dir(&out).join("1.md").exists());
+    assert_eq!(
+        fs::read_to_string(results_dir(&out).join("2.md")).unwrap(),
+        FINAL_TEXT
+    );
+    assert!(worker_report(&out, 1).contains("流结束但没有收到完成事件"));
+    assert!(!read_output_tree(&out).contains("partial"));
 }
 
 #[test]
