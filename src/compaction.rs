@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ExecutionConfig;
 use crate::llm::{
-    Finish, LlmClient, LlmError, LlmEvent, Message, ProviderUsage, RequestObservation, ToolCallReq,
-    ToolSpec, UserContent,
+    ContentPart, Finish, LlmClient, LlmError, LlmEvent, Message, ProviderUsage, RequestObservation,
+    ToolCallReq, ToolSpec, UserContent,
 };
 use crate::output::{AuditEntry, AuditLog, WorkerState};
 use crate::structured::SUBMIT_RESULT_TOOL;
@@ -53,6 +53,11 @@ pub enum CompactionError {
     NoCompleteGroup,
     #[error("上下文无法压缩：压缩请求本身超过安全预算")]
     CompactionRequestTooLarge,
+    #[error("上下文无法压缩：提交修正所需的反馈超过安全预算")]
+    CompactionFeedbackTooLarge {
+        invalid_submissions: u32,
+        reason: String,
+    },
     #[error("上下文压缩调用失败：{0}")]
     Llm(#[from] LlmError),
     #[error("上下文压缩结果连续 {attempts} 次无效：{reason}")]
@@ -126,7 +131,7 @@ pub async fn compact_if_needed(
     let overflow = before_tokens.saturating_sub(budget);
     let mut chosen = None;
     let mut largest_fitting = None;
-    for end in ends {
+    for &end in &ends {
         let transcript = render_transcript(&history[1..end]);
         let compact_history = vec![Message::User(render_compaction_input(
             normal_instructions,
@@ -149,30 +154,93 @@ pub async fn compact_if_needed(
             break;
         }
     }
-    let Some((cut, compact_history)) = chosen.or(largest_fitting) else {
-        return Err(CompactionError::CompactionRequestTooLarge);
+    let last_cut = *ends.last().expect("已确认至少存在一个完整工具组");
+    let fixed_input = || {
+        render_compaction_input(
+            normal_instructions,
+            &history[0],
+            output_contract,
+            &UserContent::new(),
+        )
     };
-
-    let submission = request_compaction(
-        llm,
-        compact_history,
-        &tools,
-        execution.llm_attempts,
-        budget,
-        audit,
-        cancel,
-        call_usage,
-    )
-    .await?;
-    let summary = format!(
-        "{}\n",
-        serde_json::to_string_pretty(&submission).expect("压缩结果可序列化")
-    );
-    let mut candidate = Vec::with_capacity(history.len() - cut + 2);
-    candidate.push(history[0].clone());
-    candidate.push(Message::Compaction(summary));
-    candidate.extend_from_slice(&history[cut..]);
-    let after_tokens = llm.estimate_request_tokens(normal_instructions, &candidate, normal_tools);
+    let (mut cut, mut submission) = if let Some((cut, compact_history)) = chosen.or(largest_fitting)
+    {
+        let result = request_compaction(
+            llm,
+            compact_history,
+            &tools,
+            execution.llm_attempts,
+            budget,
+            audit,
+            cancel,
+            call_usage,
+        )
+        .await;
+        let submission = match result {
+            Ok(submission) => submission,
+            Err(CompactionError::CompactionFeedbackTooLarge {
+                invalid_submissions,
+                reason,
+            }) => {
+                request_segmented_compaction(
+                    llm,
+                    &fixed_input(),
+                    &render_transcript(&history[1..cut]),
+                    None,
+                    Some((invalid_submissions, reason)),
+                    &tools,
+                    execution.llm_attempts,
+                    budget,
+                    audit,
+                    cancel,
+                    call_usage,
+                )
+                .await?
+            }
+            Err(error) => return Err(error),
+        };
+        (cut, submission)
+    } else {
+        let submission = request_segmented_compaction(
+            llm,
+            &fixed_input(),
+            &render_transcript(&history[1..last_cut]),
+            None,
+            None,
+            &tools,
+            execution.llm_attempts,
+            budget,
+            audit,
+            cancel,
+            call_usage,
+        )
+        .await?;
+        (last_cut, submission)
+    };
+    let mut candidate = replacement_history(history, cut, &submission);
+    let mut after_tokens =
+        llm.estimate_request_tokens(normal_instructions, &candidate, normal_tools);
+    // 先前的小组可以一次压缩，但后面的单个大组仍可能超预算。沿用已验收摘要，
+    // 分段处理尚未读入的完整组；原历史直到整个候选通过验收才替换。
+    if after_tokens > budget && cut < last_cut {
+        submission = request_segmented_compaction(
+            llm,
+            &fixed_input(),
+            &render_transcript(&history[cut..last_cut]),
+            Some(submission),
+            None,
+            &tools,
+            execution.llm_attempts,
+            budget,
+            audit,
+            cancel,
+            call_usage,
+        )
+        .await?;
+        cut = last_cut;
+        candidate = replacement_history(history, cut, &submission);
+        after_tokens = llm.estimate_request_tokens(normal_instructions, &candidate, normal_tools);
+    }
     audit.push(&AuditEntry::ContextCompaction {
         valid: after_tokens < before_tokens && after_tokens <= budget,
         before_tokens,
@@ -191,6 +259,220 @@ pub async fn compact_if_needed(
         before_tokens,
         after_tokens,
     })
+}
+
+fn replacement_history(
+    history: &[Message],
+    cut: usize,
+    submission: &CompactionSubmission,
+) -> Vec<Message> {
+    let summary = format!(
+        "{}\n",
+        serde_json::to_string_pretty(submission).expect("压缩结果可序列化")
+    );
+    let mut candidate = Vec::with_capacity(history.len() - cut + 2);
+    candidate.push(history[0].clone());
+    candidate.push(Message::Compaction(summary));
+    candidate.extend_from_slice(&history[cut..]);
+    candidate
+}
+
+/// 分段只发生在压缩投影中，不拆开对话中的工具调用和结果，也不重放任何工具。
+/// 每段结合上段的已验收摘要继续读取，最后仍作为一个完整前缀接受原子替换。
+#[allow(clippy::too_many_arguments)]
+async fn request_segmented_compaction(
+    llm: &LlmClient,
+    fixed_input: &UserContent,
+    transcript: &UserContent,
+    mut previous: Option<CompactionSubmission>,
+    mut feedback: Option<(u32, String)>,
+    tools: &[ToolSpec],
+    attempts: u32,
+    budget: u64,
+    audit: &mut AuditLog,
+    cancel: &CancellationToken,
+    call_usage: &mut Vec<CompactionCallUsage>,
+) -> Result<CompactionSubmission, CompactionError> {
+    for part in transcript.parts() {
+        let mut remaining = match part {
+            ContentPart::Text(text) => text.as_str(),
+            ContentPart::Image(_) => "",
+        };
+        let mut text_limit = remaining.len();
+        loop {
+            if cancel.is_cancelled() {
+                return Err(CompactionError::Cancelled);
+            }
+            let mut input = fixed_input.clone();
+            input.push_text("\n## 分段压缩规则\n这是完整工具历史的连续片段。结合前序摘要更新全部已确认事实、证据关联和剩余工作；片段边界不表示工具结果截断，不补写尚未读到的内容。\n");
+            if let Some(submission) = &previous {
+                input.push_text(format!(
+                    "\n## 已验证的前序摘要\n{}\n",
+                    serde_json::to_string_pretty(submission).expect("压缩结果可序列化")
+                ));
+            }
+            let used_submissions = feedback.as_ref().map_or(0, |(used, _)| *used);
+            if let Some((_, reason)) = &feedback {
+                input.push_text(format!("\n## 上次提交的校验问题\n{reason}；请按内部工具 schema 重新提交当前片段的摘要。\n"));
+            }
+            input.push_text("\n## 本段原始历史\n");
+            let (consumed, request) = match part {
+                ContentPart::Text(_) => fitting_text_prefix(
+                    llm,
+                    input,
+                    &remaining[..text_limit],
+                    tools,
+                    budget,
+                    cancel,
+                )?,
+                ContentPart::Image(image) => {
+                    // 图片不可按字节或像素分割；完整图片及固定上下文必须能够进入预算。
+                    input.push_image(image.clone());
+                    let request = vec![Message::User(input)];
+                    if llm.estimate_request_tokens(INSTRUCTIONS, &request, tools) > budget {
+                        return Err(CompactionError::CompactionRequestTooLarge);
+                    }
+                    (0, request)
+                }
+            };
+            let result = request_compaction(
+                llm,
+                request,
+                tools,
+                attempts - used_submissions,
+                budget,
+                audit,
+                cancel,
+                call_usage,
+            )
+            .await;
+            match result {
+                Ok(submission) => previous = Some(submission),
+                Err(CompactionError::CompactionFeedbackTooLarge {
+                    invalid_submissions,
+                    reason,
+                }) if consumed > remaining.chars().next().map_or(0, char::len_utf8) => {
+                    // 反馈尚未发送时缩小同一文字段，重新请求；不消费未验收的字节，
+                    // 也不重置这个分段已经消耗的无效提交次数。
+                    text_limit = consumed / 2;
+                    while !remaining.is_char_boundary(text_limit) {
+                        text_limit -= 1;
+                    }
+                    text_limit =
+                        text_limit.max(remaining.chars().next().expect("尚有未读文字").len_utf8());
+                    feedback = Some((used_submissions + invalid_submissions, reason));
+                    continue;
+                }
+                Err(CompactionError::InvalidResult { attempts, reason }) => {
+                    return Err(CompactionError::InvalidResult {
+                        attempts: used_submissions + attempts,
+                        reason,
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+            feedback = None;
+            remaining = &remaining[consumed..];
+            text_limit = remaining.len();
+            if remaining.is_empty() {
+                break;
+            }
+        }
+    }
+    previous.ok_or(CompactionError::NoCompleteGroup)
+}
+
+/// 以实际协议请求的估算值调整文字前缀；每次只探测预算附近的大小，不反复编码全部余文。
+fn fitting_text_prefix(
+    llm: &LlmClient,
+    prefix: UserContent,
+    text: &str,
+    tools: &[ToolSpec],
+    budget: u64,
+    cancel: &CancellationToken,
+) -> Result<(usize, Vec<Message>), CompactionError> {
+    let fixed_tokens =
+        llm.estimate_request_tokens(INSTRUCTIONS, &[Message::User(prefix.clone())], tools);
+    let available = budget.saturating_sub(fixed_tokens).max(1);
+    let first_char = text
+        .chars()
+        .next()
+        .ok_or(CompactionError::NoCompleteGroup)?
+        .len_utf8();
+    let mut trial = usize::try_from(available)
+        .unwrap_or(usize::MAX)
+        .min(text.len())
+        .max(first_char);
+    let mut lower = 0;
+    let mut upper = None;
+    let mut best = None;
+    loop {
+        if cancel.is_cancelled() {
+            return Err(CompactionError::Cancelled);
+        }
+        while !text.is_char_boundary(trial) {
+            trial -= 1;
+        }
+        let mut input = prefix.clone();
+        input.push_text(&text[..trial]);
+        let request = vec![Message::User(input)];
+        let tokens = llm.estimate_request_tokens(INSTRUCTIONS, &request, tools);
+        if tokens <= budget {
+            lower = trial;
+            best = Some((trial, request));
+            if trial == text.len() {
+                break;
+            }
+        } else {
+            upper = Some(trial);
+        }
+        let used = tokens.saturating_sub(fixed_tokens).max(1);
+        let projected = usize::try_from((trial as u128) * u128::from(available) / u128::from(used))
+            .unwrap_or(usize::MAX)
+            .min(text.len());
+        let next = if let Some(upper) = upper {
+            let next_char = lower
+                + text[lower..]
+                    .chars()
+                    .next()
+                    .expect("尚有未读文字")
+                    .len_utf8();
+            if next_char >= upper {
+                break;
+            }
+            let projected = if projected <= lower || projected >= upper {
+                lower + (upper - lower) / 2
+            } else {
+                projected
+            };
+            projected.max(next_char)
+        } else {
+            if projected <= lower {
+                break;
+            }
+            projected
+        };
+        trial = next;
+        while !text.is_char_boundary(trial) {
+            trial -= 1;
+        }
+        if trial <= lower {
+            break;
+        }
+    }
+    let (consumed, request) = best.ok_or(CompactionError::CompactionRequestTooLarge)?;
+    // 优先让记录的完整行留在同一片段；单行本身过长时才使用 UTF-8 字符边界。
+    if consumed < text.len()
+        && let Some(line_end) = text[..consumed].rfind('\n').map(|index| index + 1)
+    {
+        let mut input = prefix;
+        input.push_text(&text[..line_end]);
+        let line_request = vec![Message::User(input)];
+        if llm.estimate_request_tokens(INSTRUCTIONS, &line_request, tools) <= budget {
+            return Ok((line_end, line_request));
+        }
+    }
+    Ok((consumed, request))
 }
 
 fn complete_prefix_ends(history: &[Message]) -> Vec<usize> {
@@ -313,6 +595,12 @@ async fn request_compaction(
         loop {
             let estimated_input_tokens = llm.estimate_request_tokens(INSTRUCTIONS, &history, tools);
             if estimated_input_tokens > budget {
+                if correction_attempt > 1 {
+                    return Err(CompactionError::CompactionFeedbackTooLarge {
+                        invalid_submissions: correction_attempt - 1,
+                        reason: last_reason,
+                    });
+                }
                 return Err(CompactionError::CompactionRequestTooLarge);
             }
             call_number += 1;
@@ -451,7 +739,14 @@ async fn request_compaction(
                 })?;
             }
             match validation {
-                Ok(submission) => return Ok(submission),
+                Ok(submission) => {
+                    audit.push(&AuditEntry::ToolCall {
+                        name: SUBMIT_COMPACTION_TOOL.into(),
+                        source: Some("internal".into()),
+                        arguments: serde_json::to_string(&submission).expect("压缩结果可序列化"),
+                    })?;
+                    return Ok(submission);
+                }
                 Err(reason) => {
                     last_reason = reason.clone();
                     audit.push(&AuditEntry::ContextCompaction {
@@ -708,5 +1003,48 @@ mod tests {
         assert!(validate_turn("", std::slice::from_ref(&valid), Some(Finish::ToolUse)).is_ok());
         assert!(validate_turn("", &[valid], Some(Finish::Stop)).is_err());
         assert!(validate_turn("extra", &[], Some(Finish::Stop)).is_err());
+    }
+
+    #[test]
+    fn text_fragments_preserve_every_byte_within_each_protocol_budget() {
+        let text = "中文😀 \"引号\" \\换行\n\u{0001} alpha beta gamma\n".repeat(600);
+        for protocol in [
+            crate::llm::Protocol::Completions,
+            crate::llm::Protocol::Responses,
+            crate::llm::Protocol::Anthropic,
+        ] {
+            let llm = LlmClient::new(crate::llm::LlmConfig {
+                protocol,
+                anthropic_max_tokens: (protocol == crate::llm::Protocol::Anthropic).then_some(256),
+                ..crate::llm::LlmConfig::test_defaults()
+            });
+            let tools = [compaction_spec()];
+            let cancel = CancellationToken::new();
+            let mut remaining = text.as_str();
+            let mut reconstructed = String::new();
+            let prefix = "保留当前任务、先前摘要和证据关联。\n";
+            let mut fragments = 0;
+            while !remaining.is_empty() {
+                let (consumed, request) =
+                    fitting_text_prefix(&llm, prefix.into(), remaining, &tools, 1500, &cancel)
+                        .unwrap();
+                assert!(consumed > 0);
+                assert!(llm.estimate_request_tokens(INSTRUCTIONS, &request, &tools) <= 1500);
+                let Message::User(content) = &request[0] else {
+                    panic!("压缩请求必须是用户内容")
+                };
+                let received = content.as_text().unwrap().strip_prefix(prefix).unwrap();
+                reconstructed.push_str(received);
+                remaining = &remaining[consumed..];
+                fragments += 1;
+            }
+            assert!(fragments > 1);
+            assert_eq!(reconstructed, text, "文字不能在 UTF-8 或转义边界丢失");
+            cancel.cancel();
+            assert!(matches!(
+                fitting_text_prefix(&llm, prefix.into(), &text, &tools, 1500, &cancel),
+                Err(CompactionError::Cancelled)
+            ));
+        }
     }
 }

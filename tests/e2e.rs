@@ -41,6 +41,13 @@ const EXHAUST_STRUCTURED_MARKER: &str = "EXHAUST-SCHEMA-UNIT";
 const REFUSAL_MARKER: &str = "REFUSAL-UNIT";
 const TRUNCATION_MARKER: &str = "TRUNCATION-UNIT";
 const COMPACTION_MARKER: &str = "COMPACTION-UNIT";
+const SEGMENTED_COMPACTION_MARKER: &str = "SEGMENTED-HISTORY-UNIT";
+const COMPACTION_PROOFS: [&str; 4] = [
+    "HEAD_PROOF",
+    "MIDDLE_PROOF",
+    "TAIL_PROOF",
+    "SECOND_RESULT_PROOF",
+];
 const MCP_TIMEOUT_MARKER: &str = "MCP-TIMEOUT-UNIT";
 const AUTH_MARKER: &str = "AUTH-STATUS-UNIT";
 const FORBIDDEN_MARKER: &str = "FORBIDDEN-STATUS-UNIT";
@@ -256,6 +263,55 @@ fn structured_sse_with_validity(path: &str, valid: bool) -> Option<String> {
     } else {
         response.replace("{\\\"answer\\\":\\\"ok\\\"}", "{}")
     })
+}
+
+fn tool_calls_sse(path: &str, calls: &[(&str, &str, serde_json::Value)]) -> String {
+    let mut events = Vec::new();
+    if path.ends_with("/chat/completions") {
+        let calls: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, (id, name, arguments))| {
+                serde_json::json!({"index":index,"id":id,"type":"function",
+                "function":{"name":name,"arguments":arguments.to_string()}})
+            })
+            .collect();
+        events.push(serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":calls},"finish_reason":"tool_calls"}]}));
+    } else if path.ends_with("/responses") {
+        for (index, (id, name, arguments)) in calls.iter().enumerate() {
+            events.push(
+                serde_json::json!({"type":"response.output_item.done","output_index":index,
+                "item":{"type":"function_call","id":format!("fc{index}"),"call_id":id,
+                "name":name,"arguments":arguments.to_string()}}),
+            );
+        }
+        events.push(
+            serde_json::json!({"type":"response.completed","response":{"status":"completed"}}),
+        );
+    } else {
+        assert!(path.ends_with("/messages"));
+        for (index, (id, name, arguments)) in calls.iter().enumerate() {
+            events.push(
+                serde_json::json!({"type":"content_block_start","index":index,
+                "content_block":{"type":"tool_use","id":id,"name":name}}),
+            );
+            events.push(
+                serde_json::json!({"type":"content_block_delta","index":index,
+                "delta":{"type":"input_json_delta","partial_json":arguments.to_string()}}),
+            );
+            events.push(serde_json::json!({"type":"content_block_stop","index":index}));
+        }
+        events.push(serde_json::json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}));
+        events.push(serde_json::json!({"type":"message_stop"}));
+    }
+    let mut sse: String = events
+        .iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect();
+    if path.ends_with("/chat/completions") {
+        sse.push_str("data: [DONE]\n\n");
+    }
+    sse
 }
 
 fn terminal_sse(path: &str, refusal: bool) -> Option<String> {
@@ -928,6 +984,82 @@ fn handle_conn(
         ("500 Internal Server Error", "boom".to_string())
     } else if body_text.contains(FLAKY_MARKER) && !flaky_seen.swap(true, Ordering::SeqCst) {
         ("500 Internal Server Error", "transient".to_string())
+    } else if body_text.contains(SEGMENTED_COMPACTION_MARKER) {
+        if body_text.contains("formic_submit_compaction") {
+            if body_text.contains("FAIL-FRAGMENT-UNIT")
+                && scenario_step.fetch_add(1, Ordering::SeqCst) > 0
+            {
+                ("404 Not Found", "{}".to_string())
+            } else if body_text.contains("INVALID-ALL-FRAGMENTS")
+                || (body_text.contains("CORRECT-FIRST-FRAGMENT")
+                    && scenario_step.fetch_add(1, Ordering::SeqCst) == 0)
+            {
+                (
+                    "200 OK",
+                    tool_calls_sse(
+                        &path,
+                        &[("compact", "formic_submit_compaction", serde_json::json!({}))],
+                    ),
+                )
+            } else {
+                let facts: Vec<_> = COMPACTION_PROOFS
+                    .iter()
+                    .filter(|proof| body_text.contains(**proof))
+                    .collect();
+                (
+                    "200 OK",
+                    tool_calls_sse(
+                        &path,
+                        &[(
+                            "compact",
+                            "formic_submit_compaction",
+                            serde_json::json!({"summary":"已核对收到的历史片段","verified_facts":facts,
+                        "evidence":facts,"remaining_work":["完成当前任务"]}),
+                        )],
+                    ),
+                )
+            }
+        } else if body_text.contains("此前历史的已验证压缩摘要") {
+            if COMPACTION_PROOFS
+                .iter()
+                .all(|proof| body_text.contains(proof))
+            {
+                ("200 OK", sse_for(&path, false).unwrap().to_string())
+            } else {
+                ("404 Not Found", "{}".to_string())
+            }
+        } else if body_text.contains("PREVIOUS-TURN-UNIT") && !body_text.contains("prelude-read") {
+            (
+                "200 OK",
+                tool_calls_sse(
+                    &path,
+                    &[(
+                        "prelude-read",
+                        "read",
+                        serde_json::json!({"scope":"input","path":"a.txt"}),
+                    )],
+                ),
+            )
+        } else {
+            (
+                "200 OK",
+                tool_calls_sse(
+                    &path,
+                    &[
+                        (
+                            "big-read",
+                            "read",
+                            serde_json::json!({"scope":"input","path":"big.txt"}),
+                        ),
+                        (
+                            "tail-read",
+                            "read",
+                            serde_json::json!({"scope":"input","path":"tail.txt"}),
+                        ),
+                    ],
+                ),
+            )
+        }
     } else if body_text.contains(COMPACTION_MARKER)
         || body_text.contains("formic_submit_compaction")
         || body_text.contains("此前历史的已验证压缩摘要")
@@ -2508,6 +2640,195 @@ fn context_budget_compacts_complete_tool_group_then_continues() {
         "两轮完整工具组后压缩，再继续正常调用：{kinds:?}"
     );
     assert_eq!(kinds, ["normal", "normal", "compaction", "after"]);
+}
+
+fn segmented_evidence_text(lines: usize) -> String {
+    let mut large = String::from("HEAD_PROOF\n");
+    for line in 0..lines {
+        if line == lines / 2 {
+            large.push_str("MIDDLE_PROOF\n");
+        }
+        large.push_str(&format!(
+            "record-{line:04} 中文😀 quote=\"value-{line:04}\" backslash=\\ 保留全部证据\n"
+        ));
+    }
+    large.push_str("TAIL_PROOF\n");
+    large
+}
+
+fn write_segmented_compaction_job(
+    dir: &Path,
+    protocol: &str,
+    port: u16,
+    extra: &str,
+) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let data = dir.join("data");
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("a.txt"), "小分片\n").unwrap();
+    fs::write(data.join("big.txt"), segmented_evidence_text(1400)).unwrap();
+    fs::write(data.join("tail.txt"), "SECOND_RESULT_PROOF\n").unwrap();
+    let plan = dir.join("plan.jsonl");
+    fs::write(&plan, "{\"unit\":1,\"files\":[\"a.txt\"]}\n").unwrap();
+    let task = dir.join("task.md");
+    fs::write(
+        &task,
+        format!("读取工具证据后完成任务。{SEGMENTED_COMPACTION_MARKER} {extra}\n"),
+    )
+    .unwrap();
+    let anthropic = if protocol == "anthropic" {
+        "anthropic_max_tokens=1000\n"
+    } else {
+        ""
+    };
+    fs::write(dir.join("config.toml"), format!(
+        "protocol='{protocol}'\nurl='http://127.0.0.1:{port}/v1'\nmodel='test-model'\ncontext_window_tokens=7500\nmodel_input_modalities=['text']\n{anthropic}[execution]\ncontext_safety_tokens=500\n" ,
+    )).unwrap();
+    (data, plan, task, dir.join("out"))
+}
+
+#[test]
+fn oversized_tool_groups_compact_on_all_protocols_without_losing_tail_evidence() {
+    let bpe = tiktoken_rs::o200k_base().unwrap();
+    for protocol in ["completions", "responses", "anthropic"] {
+        for extra in ["", "PREVIOUS-TURN-UNIT", "CORRECT-FIRST-FRAGMENT"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mock = start_mock();
+            let (data, plan, task, out) =
+                write_segmented_compaction_job(dir.path(), protocol, mock.port, extra);
+            let output = run_formic(protocol, mock.port, 1, &data, &plan, &task, &out);
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{protocol} {extra}: {}\n{}",
+                stderr_of(&output),
+                worker_report(&out, 1)
+            );
+            assert_eq!(
+                fs::read_to_string(results_dir(&out).join("1.md")).unwrap(),
+                FINAL_TEXT
+            );
+            let stats = stats_lines(&out);
+            let stats = stats_of(&stats, 1);
+            assert_eq!(stats["compactions"], 1);
+            assert_eq!(
+                stats["tool_calls"]["read"],
+                if extra == "PREVIOUS-TURN-UNIT" { 3 } else { 2 }
+            );
+            assert_eq!(stats["retries"], 0);
+            let requests = mock.requests.lock().unwrap();
+            let compactions: Vec<_> = requests
+                .iter()
+                .filter(|request| request.body.contains("formic_submit_compaction"))
+                .collect();
+            assert!(compactions.len() > 1, "{protocol}: 大工具回合必须分段");
+            let budget = if protocol == "anthropic" { 6000 } else { 7000 };
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| bpe.encode_ordinary(&request.body).len() <= budget)
+            );
+            assert_eq!(stats["llm_calls"], requests.len() as u64);
+        }
+    }
+}
+
+#[test]
+fn later_compaction_fragment_failure_does_not_publish_partial_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = start_mock();
+    let (data, plan, task, out) =
+        write_segmented_compaction_job(dir.path(), "completions", mock.port, "FAIL-FRAGMENT-UNIT");
+    let output = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
+    assert!(!results_dir(&out).join("1.md").exists());
+    let stats = stats_lines(&out);
+    let stats = stats_of(&stats, 1);
+    assert_eq!(stats["compactions"], 0, "片段成功不能冒充已替换完整历史");
+    assert_eq!(stats["tool_calls"]["read"], 2);
+    assert_eq!(
+        mock.requests.lock().unwrap().len(),
+        3,
+        "读取一次，压缩首段成功，次段失败"
+    );
+}
+
+#[test]
+fn segmented_compaction_handles_the_recorded_peak_with_default_tool_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = start_mock();
+    let (data, plan, task, out) =
+        write_segmented_compaction_job(dir.path(), "completions", mock.port, "");
+    fs::write(data.join("big.txt"), segmented_evidence_text(9500)).unwrap();
+    fs::write(
+        data.join("tail.txt"),
+        format!("SECOND_RESULT_PROOF\n{}", segmented_evidence_text(9500)),
+    )
+    .unwrap();
+    let config = fs::read_to_string(dir.path().join("config.toml"))
+        .unwrap()
+        .replace("context_window_tokens=7500", "context_window_tokens=131072")
+        .replace("context_safety_tokens=500", "context_safety_tokens=2048");
+    fs::write(dir.path().join("config.toml"), config).unwrap();
+    let started = std::time::Instant::now();
+    let output = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}\n{}",
+        stderr_of(&output),
+        worker_report(&out, 1)
+    );
+    assert_eq!(
+        fs::read_to_string(results_dir(&out).join("1.md")).unwrap(),
+        FINAL_TEXT
+    );
+    let stats = stats_lines(&out);
+    let stats = stats_of(&stats, 1);
+    assert!(
+        stats["compaction_before_tokens"].as_u64().unwrap() >= 464_525,
+        "{stats}"
+    );
+    assert_eq!(stats["compactions"], 1);
+    assert_eq!(stats["tool_calls"]["read"], 2);
+    let bpe = tiktoken_rs::o200k_base().unwrap();
+    let requests = mock.requests.lock().unwrap();
+    assert!(
+        requests
+            .iter()
+            .all(|request| bpe.encode_ordinary(&request.body).len() <= 129024)
+    );
+    println!(
+        "peak_before_tokens={} after_tokens={} llm_calls={} elapsed_ms={}",
+        stats["compaction_before_tokens"],
+        stats["compaction_after_tokens"],
+        stats["llm_calls"],
+        started.elapsed().as_millis()
+    );
+}
+
+#[test]
+fn shrinking_a_fragment_preserves_the_invalid_submission_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mock = start_mock();
+    let (data, plan, task, out) = write_segmented_compaction_job(
+        dir.path(),
+        "completions",
+        mock.port,
+        "INVALID-ALL-FRAGMENTS",
+    );
+    let output = run_formic("completions", mock.port, 1, &data, &plan, &task, &out);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(worker_report(&out, 1).contains("连续 5 次无效"));
+    assert!(!results_dir(&out).join("1.md").exists());
+    let stats = stats_lines(&out);
+    let stats = stats_of(&stats, 1);
+    assert_eq!(stats["compactions"], 0);
+    assert_eq!(stats["tool_calls"]["read"], 2);
+    assert_eq!(
+        mock.requests.lock().unwrap().len(),
+        6,
+        "首次读取和默认五次无效提交，不能因重新分段重置"
+    );
 }
 
 #[test]
