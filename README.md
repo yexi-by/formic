@@ -1,5 +1,13 @@
 # Formic
 
+> **Formic 已迁入 [ATT](https://github.com/yexi-by/att)，由 ATT workspace 统一维护、构建和发行。**
+>
+> - [当前源码与开发入口](https://github.com/yexi-by/att/tree/main/crates/formic)
+> - [当前使用文档](https://github.com/yexi-by/att/tree/main/tools/formic)
+> - [问题反馈与后续开发](https://github.com/yexi-by/att/issues)
+>
+> 本仓库保留迁入前的源码与历史，不再独立维护或发布。以下内容是迁入前的项目说明。
+
 Formic 是面向大量独立语义任务的 Rust CLI。调用方提供输入目录、JSONL 分片计划和共同任务说明；Formic 为每个单元运行一个独立的多轮 `LLM ↔ 工具` worker，并负责并发、限流、缓存、取消、上下文压缩、续跑、原子发布和运行档案。
 
 它适合“同一套判断规则执行很多次”的工作，例如逐文件抽取、逐对象核验、结构化元数据补全、分类审阅和证据查证。
